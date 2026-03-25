@@ -1,0 +1,62 @@
+{
+  "version": "7",
+  "dialect": "sqlite",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "6",
+      "when": 1771881688219,
+      "tag": "0000_steep_terrax",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1771996805532,
+      "tag": "0001_sad_quasar",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1772278938803,
+      "tag": "0002_quiet_blizzard",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1772525468445,
+      "tag": "0003_easy_valeria_richards",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "6",
+      "when": 1773260331102,
+      "tag": "0004_perpetual_natasha_romanoff",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "6",
+      "when": 1773319244203,
+      "tag": "0005_powerful_omega_red",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "6",
+      "when": 1773464013903,
+      "tag": "0006_closed_quicksilver",
+      "breakpoints": true
+    },
+    {
+      "idx": 7,
+      "version": "6",
+      "when": 1774268427977,
+      "tag": "0007_tough_omega_red",
+      "breakpoints": true
+    }
+  ]
+}

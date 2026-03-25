@@ -1,0 +1,1 @@
+ALTER TABLE `fee_structures` ADD `section_id` integer REFERENCES sections(id);
