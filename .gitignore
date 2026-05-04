@@ -21,7 +21,8 @@ node_modules/
 .dev.vars
 
 # jsonc
-wrangler.jsonc
+# Later make this file visible on github
+wrangler.jsonc 
 
 # logs
 logs/

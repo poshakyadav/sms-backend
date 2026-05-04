@@ -1,83 +1,192 @@
-// src/modules/users/routes.ts
-import { Hono } from 'hono';
-import { zValidator } from '@hono/zod-validator';
-import { z } from 'zod';
-import { getUsers, getUserById, createUser, updateUser, deleteUser } from './services';
-import { jwtMiddleware, permissionMiddleware } from '../../../middleware/super-auth';
-import { Env } from '../../../types/common-types';
-import { SuperRole } from '../../../types/super-role';
-import { getCommonDB } from '../../../db';
+import { Hono } from "hono";
+import { zValidator } from "@hono/zod-validator";
+import { z } from "zod";
+import { Env } from "../../../types/common-types";
+import { getCommonDB } from "../../../db";
+import {
+  jwtMiddleware,
+  superTokenValidationMiddleware,
+  requireSuperPermission,
+} from "../../../middleware/super-auth";
+import {
+  getSuperUsers,
+  getSuperUserById,
+  createSuperUser,
+  updateSuperUser,
+  assignRolesToSuperUser,
+  getSuperUserDirectPermissions,
+  assignDirectPermissionsToSuperUser,
+  deleteSuperUser,
+} from "./services";
 
 const usersRouter = new Hono<Env>();
 
-usersRouter.use('*', jwtMiddleware);
+usersRouter.use("*", jwtMiddleware, superTokenValidationMiddleware);
 
-usersRouter.get('/', permissionMiddleware(['canViewUsers']), async (c) => {
+// List
+usersRouter.get("/", requireSuperPermission("users.list"), async (c) => {
   try {
-    const db = getCommonDB(c.env);
-    const users = await getUsers(db);
-    return c.json(users);
-  } catch (error: any) {
-    return c.json({ error: error.message }, 500);
+    const users = await getSuperUsers(getCommonDB(c.env));
+    return c.json({ success: true, users });
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-usersRouter.get('/:id', permissionMiddleware(['canViewUsers']), async (c) => {
+// Get by ID
+usersRouter.get("/:id", requireSuperPermission("users.list"), async (c) => {
   try {
-    const id = parseInt(c.req.param('id'));
-    const db = getCommonDB(c.env);
-    const user = await getUserById(db, id);
-    if (!user) return c.json({ error: 'User not found' }, 404);
-    return c.json(user);
-  } catch (error: any) {
-    return c.json({ error: error.message }, 500);
+    const user = await getSuperUserById(
+      getCommonDB(c.env),
+      parseInt(c.req.param("id"))
+    );
+    if (!user) return c.json({ error: "User not found" }, 404);
+    return c.json({ success: true, user });
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500);
   }
 });
 
-const createSchema = z.object({
-  name: z.string(),
-  email: z.string().email(),
-  password: z.string().min(8),
-  role: z.enum(Object.values(SuperRole)),
-});
-usersRouter.post('/', permissionMiddleware(['canCreateUsers']), zValidator('json', createSchema), async (c) => {
-  try {
-    const data = c.req.valid('json');
-    const db = getCommonDB(c.env);
-    const newUser = await createUser(db, data);
-    return c.json(newUser, 201);
-  } catch (error: any) {
-    return c.json({ error: error.message }, 400);
+// Create
+usersRouter.post(
+  "/",
+  requireSuperPermission("users.create"),
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(2),
+      email: z.string().email(),
+      password: z.string().min(8),
+      roleIds: z.array(z.number().int().positive()).min(1),
+    })
+  ),
+  async (c) => {
+    try {
+      const user = await createSuperUser(
+        getCommonDB(c.env),
+        c.req.valid("json")
+      );
+      return c.json({ success: true, user }, 201);
+    } catch (e: any) {
+      return c.json({ error: e.message }, 400);
+    }
   }
-});
+);
 
-const updateSchema = z.object({
-  name: z.string().optional(),
-  email: z.string().email().optional(),
-  password: z.string().min(8).optional(),
-  role: z.enum(Object.values(SuperRole)).optional(),
-});
-usersRouter.put('/:id', permissionMiddleware(['canUpdateUsers']), zValidator('json', updateSchema), async (c) => {
-  try {
-    const id = parseInt(c.req.param('id'));
-    const data = c.req.valid('json');
-    const db = getCommonDB(c.env);
-    const updatedUser = await updateUser(db, id, data);
-    return c.json(updatedUser);
-  } catch (error: any) {
-    return c.json({ error: error.message }, 400);
+// Update
+usersRouter.put(
+  "/:id",
+  requireSuperPermission("users.edit"),
+  zValidator(
+    "json",
+    z.object({
+      name: z.string().min(2).optional(),
+      email: z.string().email().optional(),
+      newPassword: z.string().min(8).optional(),
+      isActive: z.boolean().optional(),
+    })
+  ),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      const user = await updateSuperUser(
+        getCommonDB(c.env),
+        id,
+        c.req.valid("json")
+      );
+      return c.json({ success: true, user });
+    } catch (e: any) {
+      return c.json({ error: e.message }, 400);
+    }
   }
-});
+);
 
-usersRouter.delete('/:id', permissionMiddleware(['canDeleteUsers']), async (c) => {
-  try {
-    const id = parseInt(c.req.param('id'));
-    const db = getCommonDB(c.env);
-    const deleted = await deleteUser(db, id);
-    return c.json({ message: 'User deleted', user: deleted });
-  } catch (error: any) {
-    return c.json({ error: error.message }, 400);
+// Assign roles
+usersRouter.put(
+  "/:id/roles",
+  requireSuperPermission("roles.manage"),
+  zValidator(
+    "json",
+    z.object({ roleIds: z.array(z.number().int().positive()).min(1) })
+  ),
+  async (c) => {
+    try {
+      const userId = parseInt(c.req.param("id"));
+      await assignRolesToSuperUser(
+        getCommonDB(c.env),
+        userId,
+        c.req.valid("json").roleIds
+      );
+      return c.json({
+        success: true,
+        message: "Roles updated. User must log in again.",
+      });
+    } catch (e: any) {
+      return c.json({ error: e.message }, 400);
+    }
   }
-});
+);
+
+// Get user direct permissions
+usersRouter.get(
+  "/:id/permissions",
+  requireSuperPermission("permissions.manage"),
+  async (c) => {
+    try {
+      const perms = await getSuperUserDirectPermissions(
+        getCommonDB(c.env),
+        parseInt(c.req.param("id"))
+      );
+      return c.json({ success: true, permissions: perms });
+    } catch (e: any) {
+      return c.json({ error: e.message }, 500);
+    }
+  }
+);
+
+// Assign direct permissions
+usersRouter.put(
+  "/:id/permissions",
+  requireSuperPermission("permissions.manage"),
+  zValidator(
+    "json",
+    z.object({ permissionIds: z.array(z.number().int().positive()) })
+  ),
+  async (c) => {
+    try {
+      const userId = parseInt(c.req.param("id"));
+      await assignDirectPermissionsToSuperUser(
+        getCommonDB(c.env),
+        userId,
+        c.req.valid("json").permissionIds
+      );
+      return c.json({ success: true, message: "Permissions updated." });
+    } catch (e: any) {
+      return c.json({ error: e.message }, 400);
+    }
+  }
+);
+
+// Delete — has TWO layers of protection:
+//   1. Route level: cannot delete yourself
+//   2. Service level: cannot delete any user with SUPERADMIN role
+usersRouter.delete(
+  "/:id",
+  requireSuperPermission("users.delete"),
+  async (c) => {
+    try {
+      const deleter = c.get("superUser")!;
+      const id = parseInt(c.req.param("id"));
+      if (id === deleter.id)
+        return c.json({ error: "Cannot delete your own account" }, 403);
+      await deleteSuperUser(getCommonDB(c.env), id);
+      return c.json({ success: true, message: "User deleted" });
+    } catch (e: any) {
+      // Service throws a descriptive error for SUPERADMIN protection
+      const status = e.message.includes("cannot be deleted") ? 403 : 400;
+      return c.json({ error: e.message }, status);
+    }
+  }
+);
 
 export default usersRouter;

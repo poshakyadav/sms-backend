@@ -12,6 +12,14 @@ export const schoolCardTemplatesSchema = sqliteTable("card_templates", {
   type: text("type").notNull(), // "ADMIT_CARD" or "REPORT_CARD"
   name: text("name").notNull(), // e.g. "Official Mid-Term Admit Card 2026"
 
+  /**
+   * NEW: Key referencing a pre-built template in card-templates.ts
+   * e.g. "ADMIT_CLASSIC", "REPORT_MODERN", "ADMIT_MINIMAL"
+   * When this is set, htmlContent is ignored — the HTML is served from constants.
+   * NULL for legacy records that stored raw HTML.
+   */
+  templateKey: text("template_key"),
+  
   // Full HTML + Tailwind template with {{placeholders}}
   htmlContent: text("html_content").notNull(),
 

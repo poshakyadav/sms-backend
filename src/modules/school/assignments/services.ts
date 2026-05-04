@@ -72,7 +72,9 @@ export async function createAssignment(
 
   // Validate teacher assignment exists
   const teacherAssignment = await db
-    .select({ classSubjectId: schoolTeacherAssignmentsSchema.classSubjectId })
+    .select({
+      classSubjectId: schoolTeacherAssignmentsSchema.classSectionSubjectId,
+    })
     .from(schoolTeacherAssignmentsSchema)
     .where(eq(schoolTeacherAssignmentsSchema.id, data.teacherAssignmentId))
     .get();
@@ -210,7 +212,7 @@ export async function getAssignments(
     );
   if (classSubjectId)
     whereClause.push(
-      eq(schoolTeacherAssignmentsSchema.classSubjectId, classSubjectId)
+      eq(schoolTeacherAssignmentsSchema.classSectionSubjectId, classSubjectId)
     );
   if (teacherId)
     whereClause.push(eq(schoolTeacherAssignmentsSchema.teacherId, teacherId));
@@ -218,7 +220,7 @@ export async function getAssignments(
     whereClause.push(gte(schoolAssignmentsSchema.createdAt, dateFrom));
   if (dateTo) whereClause.push(lte(schoolAssignmentsSchema.createdAt, dateTo));
 
-  const assignments = await db
+  return (await db
     .select({
       id: schoolAssignmentsSchema.id,
       teacherAssignmentId: schoolAssignmentsSchema.teacherAssignmentId,
@@ -246,11 +248,10 @@ export async function getAssignments(
         schoolTeacherAssignmentsSchema.id
       )
     )
-    // === FIXED JOIN CHAIN (new schema) ===
     .innerJoin(
       schoolClassSectionSubjectsSchema,
       eq(
-        schoolTeacherAssignmentsSchema.classSubjectId,
+        schoolTeacherAssignmentsSchema.classSectionSubjectId,
         schoolClassSectionSubjectsSchema.id
       )
     )
@@ -277,12 +278,10 @@ export async function getAssignments(
       schoolUsersSchema,
       eq(schoolTeacherAssignmentsSchema.teacherId, schoolUsersSchema.id)
     )
-    .where(and(...whereClause))
+    .where(whereClause.length ? and(...whereClause) : undefined)
     .orderBy(desc(schoolAssignmentsSchema.createdAt))
     .limit(limit)
-    .offset(offset);
-
-  return assignments as EnrichedAssignment[];
+    .offset(offset)) as EnrichedAssignment[];
 }
 
 /**
@@ -328,7 +327,7 @@ export async function getAssignmentById(
     .innerJoin(
       schoolClassSectionSubjectsSchema,
       eq(
-        schoolTeacherAssignmentsSchema.classSubjectId,
+        schoolTeacherAssignmentsSchema.classSectionSubjectId,
         schoolClassSectionSubjectsSchema.id
       )
     )
@@ -382,12 +381,12 @@ export async function getStudentAssignments(
   const where = [eq(schoolStudentEnrollmentsSchema.studentId, studentId)];
   if (classSubjectId)
     where.push(
-      eq(schoolTeacherAssignmentsSchema.classSubjectId, classSubjectId)
+      eq(schoolTeacherAssignmentsSchema.classSectionSubjectId, classSubjectId)
     );
   if (dateFrom) where.push(gte(schoolAssignmentsSchema.createdAt, dateFrom));
   if (dateTo) where.push(lte(schoolAssignmentsSchema.createdAt, dateTo));
 
-  const assignments = await db
+  return await db
     .select({
       id: schoolAssignmentsSchema.id,
       teacherAssignmentId: schoolAssignmentsSchema.teacherAssignmentId,
@@ -411,7 +410,14 @@ export async function getStudentAssignments(
       marksObtained: schoolAssignmentSubmissionsSchema.marksObtained,
       receivedAt: schoolAssignmentSubmissionsSchema.receivedAt,
     })
-    .from(schoolAssignmentsSchema)
+    .from(schoolStudentEnrollmentsSchema)
+    .innerJoin(
+      schoolAssignmentsSchema,
+      eq(
+        schoolAssignmentsSchema.classSectionId,
+        schoolStudentEnrollmentsSchema.classSectionId
+      )
+    )
     .innerJoin(
       schoolTeacherAssignmentsSchema,
       eq(
@@ -419,18 +425,17 @@ export async function getStudentAssignments(
         schoolTeacherAssignmentsSchema.id
       )
     )
-    // === FIXED JOIN CHAIN (new schema) ===
     .innerJoin(
       schoolClassSectionSubjectsSchema,
       eq(
-        schoolTeacherAssignmentsSchema.classSubjectId,
+        schoolTeacherAssignmentsSchema.classSectionSubjectId,
         schoolClassSectionSubjectsSchema.id
       )
     )
     .innerJoin(
       schoolClassSectionsSchema,
       eq(
-        schoolClassSectionSubjectsSchema.classSectionId,
+        schoolStudentEnrollmentsSchema.classSectionId,
         schoolClassSectionsSchema.id
       )
     )
@@ -450,21 +455,6 @@ export async function getStudentAssignments(
       schoolUsersSchema,
       eq(schoolTeacherAssignmentsSchema.teacherId, schoolUsersSchema.id)
     )
-    .innerJoin(
-      schoolClassSectionsSchema,
-      eq(schoolAssignmentsSchema.classSectionId, schoolClassSectionsSchema.id)
-    )
-    .innerJoin(
-      schoolSectionsSchema,
-      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
-    )
-    .leftJoin(
-      schoolStudentEnrollmentsSchema,
-      eq(
-        schoolStudentEnrollmentsSchema.classSectionId,
-        schoolAssignmentsSchema.classSectionId
-      )
-    )
     .leftJoin(
       schoolAssignmentSubmissionsSchema,
       and(
@@ -480,13 +470,6 @@ export async function getStudentAssignments(
     )
     .where(and(...where))
     .orderBy(desc(schoolAssignmentsSchema.createdAt));
-
-  return assignments as (EnrichedAssignment & {
-    studentStatus?: string;
-    teacherStatus?: string;
-    marksObtained?: number | null;
-    receivedAt?: string;
-  })[];
 }
 
 /**
@@ -803,4 +786,139 @@ export async function getSubmissionsReport(
       avgMarks: Math.round(avgMarks),
     },
   };
+}
+
+/**
+ * GET STUDENT OWN ASSIGNMENTS (Student Portal / Parent Portal)
+ *
+ * Purpose:
+ *   - Used by the dedicated student portal route  GET /assignments/student/my
+ *   - Used by the dedicated parent portal route   GET /assignments/parent/child
+ *
+ * The studentId comes from either:
+ *   - JWT `user.id` (student viewing own assignments)
+ *   - X-Active-Child-Id header parsed in the route (parent viewing child)
+ *
+ * Differences from the staff getStudentAssignments:
+ *   1. Supports `type` filter (CLASS_WORK | HOME_WORK | ASSIGNMENT)
+ *   2. No `teacherId` filter — consumer-scoped only
+ *   3. Returns ALL assignment types in one call (UI groups them)
+ *
+ * @param filters.studentId  - Required; always scoped to one student
+ * @param filters.type       - Optional; filter by assignment type
+ * @returns Array of EnrichedAssignment with per-student submission status
+ */
+export async function getStudentOwnAssignments(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  filters: {
+    studentId: number;
+    dateFrom?: string;
+    dateTo?: string;
+    classSubjectId?: number;
+    type?: "CLASS_WORK" | "HOME_WORK" | "ASSIGNMENT";
+  }
+): Promise<EnrichedAssignment[]> {
+  const db = await getSchoolDB(env, schoolCode);
+  const { studentId, dateFrom, dateTo, classSubjectId, type } = filters;
+
+  const where = [eq(schoolStudentEnrollmentsSchema.studentId, studentId)];
+
+  if (classSubjectId) {
+    where.push(
+      eq(schoolTeacherAssignmentsSchema.classSectionSubjectId, classSubjectId)
+    );
+  }
+  if (dateFrom) where.push(gte(schoolAssignmentsSchema.createdAt, dateFrom));
+  if (dateTo) where.push(lte(schoolAssignmentsSchema.createdAt, dateTo));
+  if (type) where.push(eq(schoolAssignmentsSchema.type, type));
+
+  return (
+    (await db
+      .select({
+        id: schoolAssignmentsSchema.id,
+        teacherAssignmentId: schoolAssignmentsSchema.teacherAssignmentId,
+        classSectionId: schoolAssignmentsSchema.classSectionId,
+        type: schoolAssignmentsSchema.type,
+        title: schoolAssignmentsSchema.title,
+        description: schoolAssignmentsSchema.description,
+        dueDate: schoolAssignmentsSchema.dueDate,
+        targetDate: schoolAssignmentsSchema.targetDate,
+        maxMarks: schoolAssignmentsSchema.maxMarks,
+        isMandatory: schoolAssignmentsSchema.isMandatory,
+        enteredBy: schoolAssignmentsSchema.enteredBy,
+        createdAt: schoolAssignmentsSchema.createdAt,
+        updatedAt: schoolAssignmentsSchema.updatedAt,
+        className: schoolClassesSchema.name,
+        sectionName: schoolSectionsSchema.name,
+        subjectName: schoolSubjectsSchema.name,
+        teacherName: schoolUsersSchema.name,
+        // Per-student submission status (only present for ASSIGNMENT type rows)
+        studentStatus: schoolAssignmentSubmissionsSchema.studentStatus,
+        teacherStatus: schoolAssignmentSubmissionsSchema.teacherStatus,
+        marksObtained: schoolAssignmentSubmissionsSchema.marksObtained,
+        receivedAt: schoolAssignmentSubmissionsSchema.receivedAt,
+      })
+      .from(schoolStudentEnrollmentsSchema)
+      .innerJoin(
+        schoolAssignmentsSchema,
+        eq(
+          schoolAssignmentsSchema.classSectionId,
+          schoolStudentEnrollmentsSchema.classSectionId
+        )
+      )
+      .innerJoin(
+        schoolTeacherAssignmentsSchema,
+        eq(
+          schoolAssignmentsSchema.teacherAssignmentId,
+          schoolTeacherAssignmentsSchema.id
+        )
+      )
+      .innerJoin(
+        schoolClassSectionSubjectsSchema,
+        eq(
+          schoolTeacherAssignmentsSchema.classSectionSubjectId,
+          schoolClassSectionSubjectsSchema.id
+        )
+      )
+      .innerJoin(
+        schoolClassSectionsSchema,
+        eq(
+          schoolStudentEnrollmentsSchema.classSectionId,
+          schoolClassSectionsSchema.id
+        )
+      )
+      .innerJoin(
+        schoolClassesSchema,
+        eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id)
+      )
+      .innerJoin(
+        schoolSectionsSchema,
+        eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+      )
+      .innerJoin(
+        schoolSubjectsSchema,
+        eq(schoolClassSectionSubjectsSchema.subjectId, schoolSubjectsSchema.id)
+      )
+      .innerJoin(
+        schoolUsersSchema,
+        eq(schoolTeacherAssignmentsSchema.teacherId, schoolUsersSchema.id)
+      )
+      .leftJoin(
+        schoolAssignmentSubmissionsSchema,
+        and(
+          eq(
+            schoolAssignmentSubmissionsSchema.assignmentId,
+            schoolAssignmentsSchema.id
+          ),
+          eq(
+            schoolAssignmentSubmissionsSchema.enrollmentId,
+            schoolStudentEnrollmentsSchema.id
+          )
+        )
+      )
+      // Only active enrollments — unenrolled students shouldn't see old data
+      .where(and(...where, eq(schoolStudentEnrollmentsSchema.isActive, true)))
+      .orderBy(desc(schoolAssignmentsSchema.createdAt))) as EnrichedAssignment[]
+  );
 }

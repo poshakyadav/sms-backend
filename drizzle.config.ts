@@ -1,7 +1,7 @@
 import { defineConfig } from 'drizzle-kit';
 
 export default defineConfig({
-  schema: './src/db/schemas/*.ts',
+  schema: './src/db/schemas/super/*.ts',
   out: './drizzle',
   dialect: 'turso',  // Always Turso – auto-uses @libsql/client
   dbCredentials: {

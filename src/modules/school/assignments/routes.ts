@@ -2,9 +2,9 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import {
+  requirePermission,
   schoolJwtMiddleware,
   schoolTokenValidationMiddleware,
-  schoolPermissionMiddleware,
 } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
 import { SchoolRole } from "../../../types/school-role";
@@ -20,6 +20,7 @@ import {
   getStudentAssignments,
   getSubmissionsByStudent,
   getAssignmentById,
+  getStudentOwnAssignments,
 } from "./services";
 
 const assignmentsRouter = new Hono<SchoolEnv>();
@@ -30,35 +31,33 @@ assignmentsRouter.use(
   schoolTokenValidationMiddleware
 );
 
-// ==================== Get Student Assignments (With filters) ====================
-// ==================== Get Student Assignments ====================
-const studentAssignmentsSchema = z.object({
-  studentId: z.coerce.number().optional(),
+// ==================== STUDENT: View Own Assignments ====================
+const studentOwnAssignmentsSchema = z.object({
   dateFrom: z.string().optional(),
   dateTo: z.string().optional(),
   classSubjectId: z.coerce.number().optional(),
+  type: z.enum(["CLASS_WORK", "HOME_WORK", "ASSIGNMENT"]).optional(),
 });
-
+ 
 assignmentsRouter.get(
-  "/student",
-  schoolPermissionMiddleware([SchoolRole.STUDENT, SchoolRole.STUDENT_PARENT]),
-  zValidator("query", studentAssignmentsSchema),
+  "/student/my",
+  requirePermission("assignments.student.view"), // ← FIXED: was "assignments.submissions.view"
+  zValidator("query", studentOwnAssignmentsSchema),
   async (c) => {
     try {
       const query = c.req.valid("query");
       const user = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
-
-      let effectiveStudentId = user.role === SchoolRole.STUDENT ? user.id : query.studentId;
-      if (!effectiveStudentId) throw new Error("Student ID required");
-
-      const assignments = await getStudentAssignments(c.env, schoolCode, {
-        studentId: effectiveStudentId,
+ 
+      // studentId always comes from JWT — student cannot query another student's data
+      const assignments = await getStudentOwnAssignments(c.env, schoolCode, {
+        studentId: user.id,
         dateFrom: query.dateFrom,
         dateTo: query.dateTo,
         classSubjectId: query.classSubjectId,
+        type: query.type,
       });
-
+ 
       return c.json({ assignments });
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -66,32 +65,82 @@ assignmentsRouter.get(
   }
 );
 
-// ==================== Student Mark as Done ====================
+// ==================== STUDENT: Mark Assignment as Done ====================
 const studentSubmitSchema = z.object({
   assignmentId: z.number(),
 });
 
 assignmentsRouter.post(
-  "/submit",
-  schoolPermissionMiddleware([SchoolRole.STUDENT]),
+  "/student/submit",
+  requirePermission("assignments.student.submit"), // ← FIXED: was "assignments.submissions.view"
   zValidator("json", studentSubmitSchema),
   async (c) => {
     try {
-      console.log("🔄 Student submitting assignment...");
       const data = c.req.valid("json");
       const user = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
-
+ 
       const result = await studentSubmitAssignment(
         c.env,
         schoolCode,
-        data, // now only { assignmentId }
+        data,
         user.id
       );
-      console.log("✅ Student marked as done successfully");
       return c.json(result, 201);
     } catch (error: any) {
-      console.error("❌ Student submit error:", error.message);
+      console.error("Student submit error:", error.message);
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// ==================== PARENT: View Child's Assignments ====================
+// Child ID is read from X-Active-Child-Id header (injected by auth-interceptor.ts)
+const parentAssignmentsQuerySchema = z.object({
+  dateFrom: z.string().optional(),
+  dateTo: z.string().optional(),
+  classSubjectId: z.coerce.number().optional(),
+  type: z.enum(["CLASS_WORK", "HOME_WORK", "ASSIGNMENT"]).optional(),
+});
+ 
+assignmentsRouter.get(
+  "/parent/child",
+  requirePermission("assignments.parent.view"),
+  zValidator("query", parentAssignmentsQuerySchema),
+  async (c) => {
+    try {
+      const query = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+ 
+      // X-Active-Child-Id is set by auth-interceptor.ts from ParentService.activeChildId()
+      const activeChildIdHeader = c.req.header("X-Active-Child-Id");
+      if (!activeChildIdHeader) {
+        return c.json(
+          {
+            error:
+              "No active child selected. Please select a child to view their assignments.",
+            requiresChildSelection: true,
+          },
+          400
+        );
+      }
+ 
+      const childId = parseInt(activeChildIdHeader, 10);
+      if (isNaN(childId) || childId <= 0) {
+        return c.json({ error: "Invalid child ID in X-Active-Child-Id header" }, 400);
+      }
+ 
+      const assignments = await getStudentOwnAssignments(c.env, schoolCode, {
+        studentId: childId,
+        dateFrom: query.dateFrom,
+        dateTo: query.dateTo,
+        classSubjectId: query.classSubjectId,
+        type: query.type,
+      });
+ 
+      return c.json({ assignments });
+    } catch (error: any) {
+      console.error("Parent child assignments error:", error.message);
       return c.json({ error: error.message }, 400);
     }
   }
@@ -112,15 +161,12 @@ const assignmentSchema = z.object({
 
 assignmentsRouter.post(
   "/",
-  schoolPermissionMiddleware([SchoolRole.TEACHER]),
+  requirePermission("assignments.create"),
   zValidator("json", assignmentSchema, (result, c) => {
     if (!result.success) {
-      console.error("❌ Zod Validation Failed:", result.error.message);
+      console.error("Zod Validation Failed:", result.error.message);
       return c.json(
-        {
-          error: "Validation Failed",
-          details: result.error.message,
-        },
+        { error: "Validation Failed", details: result.error.message },
         400
       );
     }
@@ -131,11 +177,10 @@ assignmentsRouter.post(
       const user = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
 
-      console.log("✅ Validation Passed. Creating assignment...");
       const result = await createAssignment(c.env, schoolCode, data, user.id);
       return c.json(result, 201);
     } catch (error: any) {
-      console.error("🔥 Create Assignment Service Error:", error);
+      console.error("Create Assignment Service Error:", error);
       return c.json({ error: error.message }, 500);
     }
   }
@@ -149,17 +194,12 @@ const reportSchema = z.object({
 
 assignmentsRouter.get(
   "/report",
-  schoolPermissionMiddleware([
-    SchoolRole.TEACHER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("assignments.grade"),
   zValidator("query", reportSchema),
   async (c) => {
     try {
       const data = c.req.valid("query");
       const schoolCode = c.get("schoolCode")!;
-
       const report = await getSubmissionsReport(c.env, schoolCode, data);
       return c.json({ report });
     } catch (error: any) {
@@ -170,20 +210,13 @@ assignmentsRouter.get(
 );
 
 // ==================== Get Single Assignment (for Edit) ====================
-// This must come AFTER /report
 assignmentsRouter.get(
   "/:id",
-  schoolPermissionMiddleware([
-    SchoolRole.TEACHER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-    SchoolRole.SCHOOL_OWNER,
-  ]),
+  requirePermission(["assignments.edit", "assignments.create"]),
   async (c) => {
     try {
       const id = parseInt(c.req.param("id"));
       const schoolCode = c.get("schoolCode")!;
-
       const assignment = await getAssignmentById(c.env, schoolCode, id);
       return c.json({ assignment });
     } catch (error: any) {
@@ -199,12 +232,7 @@ assignmentsRouter.get(
 // ==================== Staff Assignments (Enhanced with filters) ====================
 assignmentsRouter.get(
   "/",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-    SchoolRole.TEACHER,
-  ]),
+  requirePermission("assignments.create"),
   zValidator(
     "query",
     z.object({
@@ -221,10 +249,7 @@ assignmentsRouter.get(
     try {
       const filters = c.req.valid("query");
       const schoolCode = c.get("schoolCode")!;
-
       const assignments = await getAssignments(c.env, schoolCode, filters);
-
-      console.log("Fetched assignments with filters:", filters, assignments);
       return c.json({ assignments });
     } catch (error: any) {
       return c.json({ error: error.message }, 500);
@@ -232,18 +257,17 @@ assignmentsRouter.get(
   }
 );
 
+// ==================== Update Assignment ====================
 assignmentsRouter.put(
   "/:id",
-  schoolPermissionMiddleware([SchoolRole.TEACHER, SchoolRole.PRINCIPAL]),
+  requirePermission("assignments.edit"),
   zValidator("json", assignmentSchema.partial()),
   async (c) => {
     try {
       const id = parseInt(c.req.param("id"));
       const data = c.req.valid("json");
       const schoolCode = c.get("schoolCode")!;
-
       const result = await updateAssignment(c.env, schoolCode, id, data);
-
       return c.json(result);
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -251,16 +275,15 @@ assignmentsRouter.put(
   }
 );
 
+// ==================== Delete Assignment ====================
 assignmentsRouter.delete(
   "/:id",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL]),
+  requirePermission("assignments.delete"),
   async (c) => {
     try {
       const id = parseInt(c.req.param("id"));
       const schoolCode = c.get("schoolCode")!;
-
       const result = await deleteAssignment(c.env, schoolCode, id);
-
       return c.json(result);
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -285,10 +308,10 @@ const submissionSchema = z.object({
 
 assignmentsRouter.post(
   "/submissions",
-  schoolPermissionMiddleware([SchoolRole.TEACHER, SchoolRole.PRINCIPAL]),
+  requirePermission("assignments.grade"),
   zValidator("json", submissionSchema, (result, c) => {
     if (!result.success) {
-      console.error("❌ Submission Validation Failed:", result.error.message);
+      console.error("Submission Validation Failed:", result.error.message);
       return c.json(
         { error: "Invalid submission data", details: result.error.message },
         400
@@ -301,16 +324,10 @@ assignmentsRouter.post(
       const user = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
 
-      console.log(
-        `🔄 Saving ${data.submissions.length} submissions for assignment ${data.assignmentId}`
-      );
-
       const result = await recordSubmission(c.env, schoolCode, data, user.id);
-
-      console.log("✅ Submissions saved successfully");
       return c.json(result, 201);
     } catch (error: any) {
-      console.error("❌ Record submission error:", error.message);
+      console.error("Record submission error:", error.message);
       return c.json({ error: error.message }, 400);
     }
   }
@@ -324,26 +341,18 @@ const studentSubmissionsSchema = z.object({
 
 assignmentsRouter.get(
   "/submissions/student",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.TEACHER,
-    SchoolRole.STUDENT,
-    SchoolRole.STUDENT_PARENT,
-  ]),
+  requirePermission(["assignments.grade", "assignments.submissions.view"]),
   zValidator("query", studentSubmissionsSchema),
   async (c) => {
     try {
       const { studentId, assignmentId } = c.req.valid("query");
       const schoolCode = c.get("schoolCode")!;
-
       const submissions = await getSubmissionsByStudent(
         c.env,
         schoolCode,
         studentId,
         assignmentId
       );
-
       return c.json({ submissions });
     } catch (error: any) {
       return c.json({ error: error.message }, 500);

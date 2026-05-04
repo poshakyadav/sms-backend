@@ -9,15 +9,14 @@ import { schoolAttendancesSchema } from "./school-attendances";
 import { schoolFeePaymentsSchema } from "./school-fee-payments";
 import { schoolTeacherAssignmentsSchema } from "./school-teacher-assignments";
 import { schoolExamMarksSchema } from "./school-exam-marks";
-import {
-  schoolAssignmentsSchema,
-} from "./school-assignments";
-import {
-  schoolNotificationsSchema,
-} from "./school-notifications";
+import { schoolAssignmentsSchema } from "./school-assignments";
+import { schoolNotificationsSchema } from "./school-notifications";
 import { schoolAssignmentSubmissionsSchema } from "./school-assignment-submissions";
 import { schoolNotificationInteractionsSchema } from "./school-notification-interactions";
 import { schoolClassSectionsSchema } from "./school-class-sections";
+import { schoolUserRolesSchema } from "./school-user-roles";
+import { schoolRolesSchema } from "./school-roles";
+import { schoolUserPermissionsSchema } from "./school-user-permissions";
 
 export const schoolUsersRelations = relations(
   schoolUsersSchema,
@@ -38,7 +37,7 @@ export const schoolUsersRelations = relations(
       fields: [schoolUsersSchema.id],
       references: [staffSchema.userId],
     }),
-    
+
     enrollments: many(schoolStudentEnrollmentsSchema),
     attendances: many(schoolAttendancesSchema), // For teachers: attendances they marked
     feePayments: many(schoolFeePaymentsSchema), // For students/accountants
@@ -47,12 +46,17 @@ export const schoolUsersRelations = relations(
     assignments: many(schoolAssignmentsSchema), // For teachers
     assignmentSubmissions: many(schoolAssignmentSubmissionsSchema), // For students/teachers
     notifications: many(schoolNotificationsSchema), // For senders
-    notificationInteractions: many(schoolNotificationInteractionsSchema), 
+    notificationInteractions: many(schoolNotificationInteractionsSchema),
 
     // ── NEW: Class sections where this user is the class teacher ──
     classSectionsAsClassTeacher: many(schoolClassSectionsSchema, {
       // We tell Drizzle which field in class_sections points back to this user
-      relationName: "class_teacher",   // ← optional but strongly recommended when there can be ambiguity later
+      relationName: "class_teacher", // ← optional but strongly recommended when there can be ambiguity later
     }),
+
+    // ── NEW PERMISSION SYSTEM RELATIONS ──
+    userRoles: many(schoolUserRolesSchema),
+    roles: many(schoolRolesSchema, { relationName: "user_roles" }), // for easy querying
+    userPermissions: many(schoolUserPermissionsSchema),
   })
 );

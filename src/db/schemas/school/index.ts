@@ -2,6 +2,17 @@
 export * from "./school-users";
 export * from "./schools";
 export * from "./refresh-tokens"; // Depends on school-users
+export * from "./school-theme-configs";
+
+// NEW PERMISSION SYSTEM (add here)
+export * from "./school-permissions";
+export * from "./school-roles";
+export * from "./school-role-permissions";
+export * from "./school-user-roles";
+export * from "./school-user-permissions";
+
+// About Us (singleton)
+export * from "./school-about-us";
 
 // School config tables
 export * from "./school-academic-years"; // Depends on schools
@@ -32,7 +43,7 @@ export * from "./school-exam-marks"; // Depends on exams, student_enrollments, s
 export * from "./school-assignments"; // Depends on teacher_assignments, school-users
 export * from "./school-assignment-submissions"; // Depends on assignments, student_enrollments, school-users
 
-
 // Relations (keep at end if needed)
 export * from "./school-users-relations";
 export * from "./school-class-sections-relations";
+export * from "./school-theme-configs-relations";

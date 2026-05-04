@@ -21,14 +21,25 @@ const REFRESH_TOKEN_EXPIRY = 60 * 60 * 24 * 30; // 30 days
  * Used for all authenticated requests
  */
 export async function generateSchoolAccessToken(
-  user: { id: number; name: string; role: string; schoolCode: string },
+  user: {
+    id: number;
+    name: string;
+    email?: string;
+    schoolCode: string;
+    permissions: string[]; 
+    tokenVersion: number; 
+    role?: string;
+  },
   secret: string
 ): Promise<string> {
   const payload = {
     sub: user.id.toString(),
     name: user.name,
-    role: user.role,
+    email: user.email ?? "",
     schoolCode: user.schoolCode,
+    permissions: user.permissions, // ← Full permissions array
+    tokenVersion: user.tokenVersion, // ← For instant invalidation
+    role: user.role ?? '',
     exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_EXPIRY,
   };
 

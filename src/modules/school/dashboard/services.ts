@@ -1,4 +1,5 @@
 // src/modules/school/dashboard/services.ts
+// Production-grade, persona-aware dashboard service
 
 import { and, desc, eq, sql } from "drizzle-orm";
 import { getSchoolDB } from "../../../db/school-client";
@@ -6,9 +7,9 @@ import {
   schoolAcademicYearsSchema,
   schoolAssignmentSubmissionsSchema,
   schoolAttendancesSchema,
-  schoolClassSectionsSchema,
-  schoolClassSubjectsSchema,
   schoolClassesSchema,
+  schoolClassSectionSubjectsSchema,
+  schoolClassSectionsSchema,
   schoolExamMarksSchema,
   schoolExamsSchema,
   schoolFeePaymentsSchema,
@@ -19,47 +20,359 @@ import {
   schoolSubjectsSchema,
   schoolTeacherAssignmentsSchema,
   schoolUsersSchema,
-  staffSchema,
+  studentParentsSchema,
   studentsSchema,
-  teachersSchema,
 } from "../../../db/schemas/school";
 import { SchoolEnv } from "../../../types/common-types";
 import { SchoolRole } from "../../../types/school-role";
 
-/**
- * DASHBOARD DATA INTERFACE
- * Centralized shape for all roles. Easy to extend later.
- */
-interface DashboardData {
-  role: SchoolRole;
-  stats: Record<string, number | string>;
-  lists: Record<string, any[]>;
-  quickLinks: string[]; // e.g., ["/users", "/academics/years"]
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+export type DashboardPersona =
+  | "OWNER"
+  | "MANAGEMENT"
+  | "TEACHER"
+  | "STUDENT"
+  | "PARENT"
+  | "GENERAL_STAFF";
+
+export interface DashboardNotification {
+  id: number;
+  title: string;
+  message: string;
+  createdAt: string;
 }
 
+export interface DashboardAssignedClass {
+  className: string;
+  sectionName: string;
+  subjectName: string;
+  classSectionId: number;
+  teacherAssignmentId: number;
+  isPrimary: boolean;
+}
 
-/**
- * GET DASHBOARD DATA
- *
- * Purpose: Returns role-specific dashboard stats, recent lists, and quick links.
- * This is the single entry point for the dashboard page across all roles.
- *
- * How it works:
- * 1. Fetches current academic year (shared for all roles)
- * 2. Switches on user.role and builds role-specific data
- * 3. Uses classSectionId joins everywhere (new schema compliant)
- *
- * @param user - From JWT middleware (contains id + role)
- * @returns DashboardData object
- */
+export interface DashboardGrade {
+  examName: string;
+  marksObtained: number;
+  grade?: string;
+  remarks?: string;
+}
+
+export interface DashboardStats {
+  // Owner / Management
+  totalStudents?: number;
+  totalTeachers?: number;
+  totalStaff?: number;
+  currentEnrollments?: number;
+  feesCollected?: number;
+  feesPending?: number;
+  feeCollectionRate?: number;
+  activeClassSections?: number;
+
+  // Teacher
+  attendancesMarkedToday?: number;
+  pendingSubmissions?: number;
+
+  // Student / Parent
+  myClass?: string;
+  mySection?: string;
+  rollNumber?: string;
+  attendancePercentage?: number;
+  totalDaysTracked?: number;
+  pendingAssignments?: number;
+
+  // Student only
+  // (uses shared fields above)
+
+  // PARENT — child identity fields
+  childName?: string;
+  childAvatarUrl?: string;
+  childGender?: string;
+  childBloodGroup?: string;
+  childAdmissionDate?: string;
+  childMedicalInfo?: string;
+
+  // PARENT — attendance breakdown
+  presentDays?: number;
+  absentDays?: number;
+
+  // PARENT — fees
+  totalFeeDue?: number;
+
+  [key: string]: number | string | undefined;
+}
+
+export interface DashboardLists {
+  recentNotifications?: DashboardNotification[];
+  assignedClasses?: DashboardAssignedClass[];
+  recentGrades?: DashboardGrade[];
+  [key: string]: any[] | undefined;
+}
+
+export interface DashboardData {
+  persona: DashboardPersona;
+  stats: DashboardStats;
+  lists: DashboardLists;
+}
+
+// ─── Role → Persona mapping ───────────────────────────────────────────────────
+
+function resolvePersona(role: string): DashboardPersona {
+  switch (role) {
+    case SchoolRole.SCHOOL_OWNER:
+      return "OWNER";
+    case SchoolRole.PRINCIPAL:
+    case SchoolRole.MANAGER:
+    case SchoolRole.ADMISSION_OFFICER:
+    case SchoolRole.ACCOUNTANT:
+      return "MANAGEMENT";
+    case SchoolRole.TEACHER:
+      return "TEACHER";
+    case SchoolRole.STUDENT:
+      return "STUDENT";
+    case SchoolRole.STUDENT_PARENT:
+      return "PARENT";
+    default:
+      return "GENERAL_STAFF";
+  }
+}
+
+// ─── Main dashboard data loader ───────────────────────────────────────────────
+
 export async function getDashboardData(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
-  user: any
+  userId: number,
+  role: string,
+  activeChildId: number | null
 ): Promise<DashboardData> {
   const db = await getSchoolDB(env, schoolCode);
+  const persona = resolvePersona(role);
 
-  // Get current academic year (common for all roles)
+  switch (persona) {
+    case "OWNER":
+    case "MANAGEMENT":
+      return buildOwnerManagementDashboard(db, persona);
+    case "TEACHER":
+      return buildTeacherDashboard(db, userId);
+    case "STUDENT":
+      return buildStudentDashboard(db, userId);
+    case "PARENT":
+      return buildParentDashboard(db, userId, activeChildId);
+    default:
+      return buildGeneralStaffDashboard(db);
+  }
+}
+
+// ─── Shared helper ────────────────────────────────────────────────────────────
+
+async function fetchRecentNotifications(
+  db: any
+): Promise<DashboardNotification[]> {
+  return db
+    .select({
+      id: schoolNotificationsSchema.id,
+      title: schoolNotificationsSchema.title,
+      message: schoolNotificationsSchema.message,
+      createdAt: schoolNotificationsSchema.createdAt,
+    })
+    .from(schoolNotificationsSchema)
+    .orderBy(desc(schoolNotificationsSchema.createdAt))
+    .limit(5)
+    .all();
+}
+
+// ─── OWNER / MANAGEMENT ───────────────────────────────────────────────────────
+
+async function buildOwnerManagementDashboard(
+  db: any,
+  persona: DashboardPersona
+): Promise<DashboardData> {
+  const currentYear = await db
+    .select()
+    .from(schoolAcademicYearsSchema)
+    .where(eq(schoolAcademicYearsSchema.isCurrent, true))
+    .get();
+
+  const totalStudents =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(studentsSchema)
+        .get()
+    )?.count ?? 0;
+
+  const totalTeachers =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolTeacherAssignmentsSchema)
+        .get()
+    )?.count ?? 0;
+
+  const currentEnrollments = currentYear
+    ? (
+        await db
+          .select({ count: sql<number>`count(*)` })
+          .from(schoolStudentEnrollmentsSchema)
+          .where(
+            and(
+              eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id),
+              eq(schoolStudentEnrollmentsSchema.isActive, true)
+            )
+          )
+          .get()
+      )?.count ?? 0
+    : 0;
+
+  const feesCollected = currentYear
+    ? (
+        await db
+          .select({
+            total: sql<number>`coalesce(sum(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+          })
+          .from(schoolFeePaymentsSchema)
+          .innerJoin(
+            schoolStudentEnrollmentsSchema,
+            eq(
+              schoolFeePaymentsSchema.enrollmentId,
+              schoolStudentEnrollmentsSchema.id
+            )
+          )
+          .where(
+            eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id)
+          )
+          .get()
+      )?.total ?? 0
+    : 0;
+
+  const feesAssigned = currentYear
+    ? (
+        await db
+          .select({
+            total: sql<number>`coalesce(sum(${schoolFeeStructuresSchema.amount}), 0)`,
+          })
+          .from(schoolFeeStructuresSchema)
+          .where(eq(schoolFeeStructuresSchema.academicYearId, currentYear.id))
+          .get()
+      )?.total ?? 0
+    : 0;
+
+  const feesPending = Math.max(0, feesAssigned - feesCollected);
+  const feeCollectionRate =
+    feesAssigned > 0 ? Math.round((feesCollected / feesAssigned) * 100) : 0;
+
+  const activeClassSections =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolClassSectionsSchema)
+        .where(eq(schoolClassSectionsSchema.isActive, true))
+        .get()
+    )?.count ?? 0;
+
+  const recentNotifications = await fetchRecentNotifications(db);
+
+  return {
+    persona,
+    stats: {
+      totalStudents,
+      totalTeachers,
+      currentEnrollments,
+      feesCollected,
+      feesPending,
+      feeCollectionRate,
+      activeClassSections,
+    },
+    lists: { recentNotifications },
+  };
+}
+
+// ─── TEACHER ──────────────────────────────────────────────────────────────────
+
+async function buildTeacherDashboard(
+  db: any,
+  userId: number
+): Promise<DashboardData> {
+  const assignedClasses: DashboardAssignedClass[] = await db
+    .select({
+      teacherAssignmentId: schoolTeacherAssignmentsSchema.id,
+      classSectionId: schoolClassSectionSubjectsSchema.classSectionId,
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
+      subjectName: schoolSubjectsSchema.name,
+      isPrimary: schoolTeacherAssignmentsSchema.isPrimary,
+    })
+    .from(schoolTeacherAssignmentsSchema)
+    .innerJoin(
+      schoolClassSectionSubjectsSchema,
+      eq(
+        schoolTeacherAssignmentsSchema.classSectionSubjectId,
+        schoolClassSectionSubjectsSchema.id
+      )
+    )
+    .innerJoin(
+      schoolClassSectionsSchema,
+      eq(
+        schoolClassSectionSubjectsSchema.classSectionId,
+        schoolClassSectionsSchema.id
+      )
+    )
+    .innerJoin(
+      schoolClassesSchema,
+      eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id)
+    )
+    .innerJoin(
+      schoolSectionsSchema,
+      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+    )
+    .innerJoin(
+      schoolSubjectsSchema,
+      eq(schoolClassSectionSubjectsSchema.subjectId, schoolSubjectsSchema.id)
+    )
+    .where(eq(schoolTeacherAssignmentsSchema.teacherId, userId))
+    .all();
+
+  const today = new Date().toISOString().slice(0, 10);
+  const attendancesMarkedToday =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolAttendancesSchema)
+        .where(
+          and(
+            eq(schoolAttendancesSchema.markedBy, userId),
+            eq(schoolAttendancesSchema.date, today)
+          )
+        )
+        .get()
+    )?.count ?? 0;
+
+  const pendingSubmissions =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolAssignmentSubmissionsSchema)
+        .where(eq(schoolAssignmentSubmissionsSchema.teacherStatus, "RECEIVED"))
+        .get()
+    )?.count ?? 0;
+
+  const recentNotifications = await fetchRecentNotifications(db);
+
+  return {
+    persona: "TEACHER",
+    stats: { attendancesMarkedToday, pendingSubmissions },
+    lists: { assignedClasses, recentNotifications },
+  };
+}
+
+// ─── STUDENT ──────────────────────────────────────────────────────────────────
+
+async function buildStudentDashboard(
+  db: any,
+  userId: number
+): Promise<DashboardData> {
   const currentYear = await db
     .select()
     .from(schoolAcademicYearsSchema)
@@ -67,341 +380,399 @@ export async function getDashboardData(
     .get();
 
   if (!currentYear) {
-    throw new Error("No current academic year found", {
-      cause: { status: 404 },
-    });
+    return {
+      persona: "STUDENT",
+      stats: {},
+      lists: { recentNotifications: [] },
+    };
   }
 
-  let data: DashboardData = {
-    role: user.role,
-    stats: {},
-    lists: {},
-    quickLinks: [],
-  };
+  const enrollment = await db
+    .select({
+      enrollmentId: schoolStudentEnrollmentsSchema.id,
+      classSectionId: schoolStudentEnrollmentsSchema.classSectionId,
+      rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
+    })
+    .from(schoolStudentEnrollmentsSchema)
+    .innerJoin(
+      schoolClassSectionsSchema,
+      eq(
+        schoolStudentEnrollmentsSchema.classSectionId,
+        schoolClassSectionsSchema.id
+      )
+    )
+    .innerJoin(
+      schoolClassesSchema,
+      eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id)
+    )
+    .innerJoin(
+      schoolSectionsSchema,
+      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.studentId, userId),
+        eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id),
+        eq(schoolStudentEnrollmentsSchema.isActive, true)
+      )
+    )
+    .get();
 
-  switch (user.role) {
-    case SchoolRole.SCHOOL_OWNER:
-    case SchoolRole.PRINCIPAL:
-    case SchoolRole.MANAGER: // Similar high-level access
-      // Stats: Total users by type
-      data.stats.totalStudents =
-        (
-          await db
-            .select({ count: sql<number>`count(*)` })
-            .from(studentsSchema)
-            .get()
-        )?.count || 0;
-      data.stats.totalTeachers =
-        (
-          await db
-            .select({ count: sql<number>`count(*)` })
-            .from(teachersSchema)
-            .get()
-        )?.count || 0;
-      data.stats.totalStaff =
-        (
-          await db
-            .select({ count: sql<number>`count(*)` })
-            .from(staffSchema)
-            .get()
-        )?.count || 0;
+  if (!enrollment) {
+    return {
+      persona: "STUDENT",
+      stats: {},
+      lists: { recentNotifications: [] },
+    };
+  }
 
-      // Enrollments this year
-      data.stats.currentEnrollments =
-        (
-          await db
-            .select({ count: sql<number>`count(*)` })
-            .from(schoolStudentEnrollmentsSchema)
-            .where(
-              eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id)
-            )
-            .get()
-        )?.count || 0;
-
-      // Fees: Collected vs Pending (aggregate)
-      const collected =
-        (
-          await db
-            .select({
-              total: sql<number>`sum(${schoolFeePaymentsSchema.amountPaid})`,
-            })
-            .from(schoolFeePaymentsSchema)
-            .get()
-        )?.total || 0;
-      const totalDue =
-        (
-          await db
-            .select({
-              total: sql<number>`sum(${schoolFeeStructuresSchema.amount})`,
-            })
-            .from(schoolFeeStructuresSchema)
-            .where(eq(schoolFeeStructuresSchema.academicYearId, currentYear.id))
-            .get()
-        )?.total || 0;
-      data.stats.feesCollected = collected;
-      data.stats.feesPending = totalDue - collected;
-
-      // Recent notifications (last 5)
-      data.lists.recentNotifications = await db
-        .select()
-        .from(schoolNotificationsSchema)
-        .orderBy(desc(schoolNotificationsSchema.createdAt))
-        .limit(5)
-        .all();
-
-      data.quickLinks = [
-        "/users",
-        "/academics/years",
-        "/academics/classes",
-        "/academics/sections",
-        "/academics/enroll",
-        "/fees/structures",
-        "/fees/payments",
-        "/fees/report",
-        "/fees/ledger",
-        "/attendance",
-      ];
-      break;
-
-    case SchoolRole.TEACHER:
-      // Assigned classes/subjects
-      const assignments = await db
+  const totalDays =
+    (
+      await db
         .select({
-          class: schoolClassesSchema.name,
-          subject: schoolSubjectsSchema.name,
-          section: schoolSectionsSchema.name,
+          count: sql<number>`count(distinct ${schoolAttendancesSchema.date})`,
         })
-        .from(schoolTeacherAssignmentsSchema)
-        .innerJoin(
-          schoolClassSubjectsSchema,
-          eq(
-            schoolTeacherAssignmentsSchema.classSubjectId,
-            schoolClassSubjectsSchema.id
-          )
+        .from(schoolAttendancesSchema)
+        .where(
+          eq(schoolAttendancesSchema.enrollmentId, enrollment.enrollmentId)
         )
-        .innerJoin(
-          schoolClassesSchema,
-          eq(schoolClassSubjectsSchema.classId, schoolClassesSchema.id)
-        )
-        .innerJoin(
-          schoolSubjectsSchema,
-          eq(schoolClassSubjectsSchema.subjectId, schoolSubjectsSchema.id)
-        )
-        .leftJoin(
-          schoolSectionsSchema,
-          eq(schoolClassesSchema.id, schoolSectionsSchema.schoolId)
-        ) // Adjust if needed
-        .where(eq(schoolTeacherAssignmentsSchema.teacherId, user.id))
-        .all();
-      data.lists.assignedClasses = assignments;
+        .get()
+    )?.count ?? 0;
 
-      // Today's attendances to mark (enrollments in assigned classes)
-      const today = new Date().toISOString().split("T")[0]; // YYYY-MM-DD
-      data.stats.attendancesToMark =
-        (
-          await db
-            .select({ count: sql<number>`count(*)` })
-            .from(schoolAttendancesSchema)
-            .where(
-              and(
-                eq(schoolAttendancesSchema.date, today),
-                eq(schoolAttendancesSchema.markedBy, user.id)
-              )
-            )
-            .get()
-        )?.count || 0;
-
-      // Upcoming exams/assignments (next 7 days, limit 5)
-      data.lists.upcomingExams = await db
-        .select()
-        .from(schoolExamsSchema)
+  const presentDays =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolAttendancesSchema)
         .where(
           and(
-            sql`${schoolExamsSchema.date} > CURRENT_DATE`,
-            sql`${schoolExamsSchema.date} <= date(CURRENT_DATE, '+7 days')`
+            eq(schoolAttendancesSchema.enrollmentId, enrollment.enrollmentId),
+            eq(schoolAttendancesSchema.status, "PRESENT")
           )
         )
-        .limit(5)
-        .all();
+        .get()
+    )?.count ?? 0;
 
-      // Pending submissions (for my assignments)
-      // Use correct dual-status column for Teacher
-      data.stats.pendingSubmissions = (
-        await db
-          .select({ count: sql<number>`count(*)` })
-          .from(schoolAssignmentSubmissionsSchema)
-          .where(
-            and(
-              eq(schoolAssignmentSubmissionsSchema.teacherStatus, "NOT_RECEIVED"), // Teacher's pending
-              eq(schoolAssignmentSubmissionsSchema.enteredBy, user.id)
-            )
-          )
-          .get()
-      )?.count || 0;
+  const attendancePercentage =
+    totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 0;
 
-      data.quickLinks = ["/attendance", "/assignments", "/exams"];
-      break;
-
-    case SchoolRole.STUDENT:
-      // My current enrollment (using classSectionId)
-      const enrollment = await db
-        .select({
-          id: schoolStudentEnrollmentsSchema.id,
-          className: schoolClassesSchema.name,
-          sectionName: schoolSectionsSchema.name,
-        })
-        .from(schoolStudentEnrollmentsSchema)
-        .innerJoin(
-          schoolClassSectionsSchema,
-          eq(schoolStudentEnrollmentsSchema.classSectionId, schoolClassSectionsSchema.id)
-        )
-        .innerJoin(schoolClassesSchema, eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id))
-        .innerJoin(schoolSectionsSchema, eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id))
-        .where(
-          and(
-            eq(schoolStudentEnrollmentsSchema.studentId, user.id),
-            eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id),
-            eq(schoolStudentEnrollmentsSchema.isActive, true)
-          )
-        )
-        .get();
-        data.stats.myClass = enrollment?.className || "N/A";
-        data.stats.mySection = enrollment?.sectionName || "N/A";
-
-      // Attendance summary (percentage this year) - fixed: added filter to totalDays for this enrollment
-      const totalDays =
-        (
-          await db
-            .select({
-              count: sql<number>`count(distinct ${schoolAttendancesSchema.date})`,
-            })
-            .from(schoolAttendancesSchema)
-            .where(
-              eq(schoolAttendancesSchema.enrollmentId, enrollment?.id || 0)
-            ) // Added filter
-            .get()
-        )?.count || 0;
-      const presentDays =
-        (
-          await db
-            .select({ count: sql<number>`count(*)` })
-            .from(schoolAttendancesSchema)
-            .where(
-              and(
-                eq(schoolAttendancesSchema.enrollmentId, enrollment?.id || 0),
-                eq(schoolAttendancesSchema.status, "PRESENT")
-              )
-            )
-            .get()
-        )?.count || 0;
-      data.stats.attendancePercentage = totalDays
-        ? Math.round((presentDays / totalDays) * 100)
-        : 0;
-
-      // Recent grades (last 5 marks)
-      data.lists.recentGrades = await db
-        .select({
-          exam: schoolExamsSchema.name,
-          marks: schoolExamMarksSchema.marksObtained,
-          grade: schoolExamMarksSchema.grade,
-        })
-        .from(schoolExamMarksSchema)
-        .innerJoin(
-          schoolExamsSchema,
-          eq(schoolExamMarksSchema.examId, schoolExamsSchema.id)
-        )
-        .where(eq(schoolExamMarksSchema.enrollmentId, enrollment?.id || 0))
-        .orderBy(desc(schoolExamsSchema.date))
-        .limit(5)
-        .all();
-
-      // Due assignments (pending for me)
-      // Use correct dual-status column for Student
-      data.lists.dueAssignments = await db
-        .select()
+  const pendingAssignments =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
         .from(schoolAssignmentSubmissionsSchema)
         .where(
           and(
-            eq(schoolAssignmentSubmissionsSchema.enrollmentId, enrollment?.id || 0),
-            eq(schoolAssignmentSubmissionsSchema.studentStatus, "PENDING") // ← Correct column
+            eq(
+              schoolAssignmentSubmissionsSchema.enrollmentId,
+              enrollment.enrollmentId
+            ),
+            eq(schoolAssignmentSubmissionsSchema.studentStatus, "PENDING")
           )
         )
-        .limit(5)
-        .all();
+        .get()
+    )?.count ?? 0;
 
-      data.quickLinks = ["/assignments", "/exams", "/fees"];
-      break;
+  const recentGrades: DashboardGrade[] = await db
+    .select({
+      examName: schoolExamsSchema.name,
+      marksObtained: schoolExamMarksSchema.marksObtained,
+      grade: schoolExamMarksSchema.grade,
+      remarks: schoolExamMarksSchema.remarks,
+    })
+    .from(schoolExamMarksSchema)
+    .innerJoin(
+      schoolExamsSchema,
+      eq(schoolExamMarksSchema.examId, schoolExamsSchema.id)
+    )
+    .where(eq(schoolExamMarksSchema.enrollmentId, enrollment.enrollmentId))
+    .orderBy(desc(schoolExamsSchema.createdAt))
+    .limit(5)
+    .all();
 
-    default:
-      // Staff: Fetch designation and handle accordingly
-      const staffProfile = await db
-        .select()
-        .from(staffSchema)
-        .where(eq(staffSchema.userId, user.id))
-        .get();
-      if (!staffProfile)
-        throw new Error("Staff profile not found", { cause: { status: 404 } });
+  const recentNotifications = await fetchRecentNotifications(db);
 
-      switch (staffProfile.designation) {
-        case "ACCOUNTANT":
-          // Fees stats similar to owner but limited
-          const staffCollected =
-            (
-              await db
-                .select({
-                  total: sql<number>`sum(${schoolFeePaymentsSchema.amountPaid})`,
-                })
-                .from(schoolFeePaymentsSchema)
-                .where(eq(schoolFeePaymentsSchema.recordedBy, user.id))
-                .get()
-            )?.total || 0;
-          data.stats.feesCollectedByMe = staffCollected;
-          data.stats.pendingPayments =
-            (
-              await db
-                .select({ count: sql<number>`count(*)` })
-                .from(schoolFeeStructuresSchema)
-                .leftJoin(
-                  schoolFeePaymentsSchema,
-                  eq(
-                    schoolFeeStructuresSchema.id,
-                    schoolFeePaymentsSchema.feeStructureId
-                  )
-                )
-                .where(sql`${schoolFeePaymentsSchema.id} IS NULL`)
-                .get()
-            )?.count || 0;
+  return {
+    persona: "STUDENT",
+    stats: {
+      myClass: enrollment.className,
+      mySection: enrollment.sectionName,
+      rollNumber: enrollment.rollNumber ?? undefined,
+      attendancePercentage,
+      totalDaysTracked: totalDays,
+      pendingAssignments,
+    },
+    lists: { recentGrades, recentNotifications },
+  };
+}
 
-          data.quickLinks = [
-            "/fees/structures",
-            "/fees/payments",
-            "/fees/report",
-            "/fees/ledger",
-          ];
-          break;
+// ─── PARENT ───────────────────────────────────────────────────────────────────
 
-        // Add cases for other designations (e.g., LIBRARIAN: book stats if schema added)
-        default:
-          // Fallback for general staff
-          data.stats.generalNotifications =
-            (
-              await db
-                .select({ count: sql<number>`count(*)` })
-                .from(schoolNotificationsSchema)
-                .get()
-            )?.count || 0;
-          data.quickLinks = ["/notifications"];
-      }
-
-      // Common for all staff: Recent notifications
-      data.lists.recentNotifications = await db
-        .select()
-        .from(schoolNotificationsSchema)
-        .orderBy(desc(schoolNotificationsSchema.createdAt))
-        .limit(5)
-        .all();
-      break;
+async function buildParentDashboard(
+  db: any,
+  parentUserId: number,
+  activeChildId: number | null
+): Promise<DashboardData> {
+  // ── Guard: no child selected ─────────────────────────────────────────────
+  if (!activeChildId) {
+    const recentNotifications = await fetchRecentNotifications(db);
+    return {
+      persona: "PARENT",
+      stats: {},
+      lists: { recentNotifications },
+    };
   }
 
-  return data;
+  // ── Security: verify parent↔child link ──────────────────────────────────
+  // student_parents.parent_id = parents.user_id = school_users.id (parentUserId)
+  // student_parents.student_id = students.user_id = school_users.id (activeChildId)
+  const link = await db
+    .select({ id: studentParentsSchema.id })
+    .from(studentParentsSchema)
+    .where(
+      and(
+        eq(studentParentsSchema.parentId, parentUserId),
+        eq(studentParentsSchema.studentId, activeChildId)
+      )
+    )
+    .get();
+
+  if (!link) {
+    console.warn(
+      `[Dashboard/Parent] User ${parentUserId} attempted to access child ${activeChildId} — not linked`
+    );
+    const recentNotifications = await fetchRecentNotifications(db);
+    return {
+      persona: "PARENT",
+      stats: {},
+      lists: { recentNotifications },
+    };
+  }
+
+  // ── Fetch child's school_users row (name, avatar, gender, blood group) ───
+  const childUser = await db
+    .select({
+      name: schoolUsersSchema.name,
+      avatarUrl: schoolUsersSchema.avatarUrl,
+      gender: schoolUsersSchema.gender,
+      bloodGroup: schoolUsersSchema.bloodGroup,
+      dateOfBirth: schoolUsersSchema.dateOfBirth,
+    })
+    .from(schoolUsersSchema)
+    .where(eq(schoolUsersSchema.id, activeChildId))
+    .get();
+
+  // ── Fetch child's student-profile row (admissionDate, medicalInfo, etc.) ─
+  const studentProfile = await db
+    .select({
+      admissionDate: studentsSchema.admissionDate,
+      previousSchool: studentsSchema.previousSchool,
+      medicalInfo: studentsSchema.medicalInfo,
+    })
+    .from(studentsSchema)
+    .where(eq(studentsSchema.userId, activeChildId))
+    .get();
+
+  // ── Fetch current academic year ──────────────────────────────────────────
+  const currentYear = await db
+    .select()
+    .from(schoolAcademicYearsSchema)
+    .where(eq(schoolAcademicYearsSchema.isCurrent, true))
+    .get();
+
+  const recentNotifications = await fetchRecentNotifications(db);
+
+  // Base stats available even without enrollment
+  const baseStats: DashboardStats = {
+    childName: childUser?.name ?? undefined,
+    childAvatarUrl: childUser?.avatarUrl || undefined,
+    childGender: childUser?.gender || undefined,
+    childBloodGroup: childUser?.bloodGroup || undefined,
+    childAdmissionDate: studentProfile?.admissionDate || undefined,
+  };
+
+  if (!currentYear) {
+    return {
+      persona: "PARENT",
+      stats: baseStats,
+      lists: { recentNotifications },
+    };
+  }
+
+  // ── Fetch child's active enrollment ─────────────────────────────────────
+  const enrollment = await db
+    .select({
+      enrollmentId: schoolStudentEnrollmentsSchema.id,
+      classSectionId: schoolStudentEnrollmentsSchema.classSectionId,
+      rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
+    })
+    .from(schoolStudentEnrollmentsSchema)
+    .innerJoin(
+      schoolClassSectionsSchema,
+      eq(
+        schoolStudentEnrollmentsSchema.classSectionId,
+        schoolClassSectionsSchema.id
+      )
+    )
+    .innerJoin(
+      schoolClassesSchema,
+      eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id)
+    )
+    .innerJoin(
+      schoolSectionsSchema,
+      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.studentId, activeChildId),
+        eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id),
+        eq(schoolStudentEnrollmentsSchema.isActive, true)
+      )
+    )
+    .get();
+
+  if (!enrollment) {
+    return {
+      persona: "PARENT",
+      stats: baseStats,
+      lists: { recentNotifications },
+    };
+  }
+
+  // ── Attendance ───────────────────────────────────────────────────────────
+  const totalDays =
+    (
+      await db
+        .select({
+          count: sql<number>`count(distinct ${schoolAttendancesSchema.date})`,
+        })
+        .from(schoolAttendancesSchema)
+        .where(
+          eq(schoolAttendancesSchema.enrollmentId, enrollment.enrollmentId)
+        )
+        .get()
+    )?.count ?? 0;
+
+  const presentDays =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolAttendancesSchema)
+        .where(
+          and(
+            eq(schoolAttendancesSchema.enrollmentId, enrollment.enrollmentId),
+            eq(schoolAttendancesSchema.status, "PRESENT")
+          )
+        )
+        .get()
+    )?.count ?? 0;
+
+  const absentDays = totalDays - presentDays;
+  const attendancePercentage =
+    totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 0;
+
+  // ── Fees ─────────────────────────────────────────────────────────────────
+  const totalDue =
+    (
+      await db
+        .select({
+          total: sql<number>`coalesce(sum(${schoolFeeStructuresSchema.amount}), 0)`,
+        })
+        .from(schoolFeeStructuresSchema)
+        .where(
+          and(
+            eq(
+              schoolFeeStructuresSchema.classSectionId,
+              enrollment.classSectionId
+            ),
+            eq(schoolFeeStructuresSchema.academicYearId, currentYear.id)
+          )
+        )
+        .get()
+    )?.total ?? 0;
+
+  const totalPaid =
+    (
+      await db
+        .select({
+          total: sql<number>`coalesce(sum(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(
+          eq(schoolFeePaymentsSchema.enrollmentId, enrollment.enrollmentId)
+        )
+        .get()
+    )?.total ?? 0;
+
+  const feesPending = Math.max(0, totalDue - totalPaid);
+
+  // ── Pending assignments ──────────────────────────────────────────────────
+  const pendingAssignments =
+    (
+      await db
+        .select({ count: sql<number>`count(*)` })
+        .from(schoolAssignmentSubmissionsSchema)
+        .where(
+          and(
+            eq(
+              schoolAssignmentSubmissionsSchema.enrollmentId,
+              enrollment.enrollmentId
+            ),
+            eq(schoolAssignmentSubmissionsSchema.studentStatus, "PENDING")
+          )
+        )
+        .get()
+    )?.count ?? 0;
+
+  // ── Recent grades ────────────────────────────────────────────────────────
+  const recentGrades: DashboardGrade[] = await db
+    .select({
+      examName: schoolExamsSchema.name,
+      marksObtained: schoolExamMarksSchema.marksObtained,
+      grade: schoolExamMarksSchema.grade,
+      remarks: schoolExamMarksSchema.remarks,
+    })
+    .from(schoolExamMarksSchema)
+    .innerJoin(
+      schoolExamsSchema,
+      eq(schoolExamMarksSchema.examId, schoolExamsSchema.id)
+    )
+    .where(eq(schoolExamMarksSchema.enrollmentId, enrollment.enrollmentId))
+    .orderBy(desc(schoolExamsSchema.createdAt))
+    .limit(5)
+    .all();
+
+  return {
+    persona: "PARENT",
+    stats: {
+      ...baseStats,
+      myClass: enrollment.className,
+      mySection: enrollment.sectionName,
+      rollNumber: enrollment.rollNumber ?? undefined,
+      attendancePercentage,
+      totalDaysTracked: totalDays,
+      presentDays,
+      absentDays,
+      feesCollected: totalPaid,
+      feesPending,
+      totalFeeDue: totalDue,
+      pendingAssignments,
+    },
+    lists: { recentGrades, recentNotifications },
+  };
+}
+
+// ─── GENERAL STAFF ────────────────────────────────────────────────────────────
+
+async function buildGeneralStaffDashboard(db: any): Promise<DashboardData> {
+  const recentNotifications = await fetchRecentNotifications(db);
+  return {
+    persona: "GENERAL_STAFF",
+    stats: {},
+    lists: { recentNotifications },
+  };
 }

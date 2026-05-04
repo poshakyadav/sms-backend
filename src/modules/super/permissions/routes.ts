@@ -1,41 +1,52 @@
-// src/modules/permissions/routes.ts
-import { Hono } from 'hono';
-import { zValidator } from '@hono/zod-validator';
-import { z } from 'zod';
-import { updateUserPermission, getUserPermissions } from './services';
-import { jwtMiddleware, permissionMiddleware } from '../../../middleware/super-auth';
-import { Env } from '../../../types/common-types';
-import { Permission } from '../../../types/permissions';
-import { getCommonDB } from '../../../db';
+import { Hono } from "hono";
+import { Env } from "../../../types/common-types";
+import { getCommonDB } from "../../../db";
+import {
+  jwtMiddleware,
+  superTokenValidationMiddleware,
+  requireSuperPermission,
+} from "../../../middleware/super-auth";
+import { superPermissionsSchema } from "../../../db/schemas/super";
+import { seedSuperPermissionsAndRoles } from "./services";
+import { WILDCARD_PERMISSION } from "../../../types/super-permissions";
 
 const permissionsRouter = new Hono<Env>();
 
-permissionsRouter.use('*', jwtMiddleware, permissionMiddleware(['canManagePermissions']));
+permissionsRouter.use("*", jwtMiddleware, superTokenValidationMiddleware);
 
-const updateSchema = z.object({
-  userId: z.number(),
-  permission: z.string(),  // Validate against Permission if needed
-  allowed: z.boolean(),
-});
-permissionsRouter.post('/update', zValidator('json', updateSchema), async (c) => {
-  try {
-    const { userId, permission, allowed } = c.req.valid('json');
-    const db = getCommonDB(c.env);
-    await updateUserPermission(db, userId, permission as Permission, allowed);
-    return c.json({ message: 'Permission updated' });
-  } catch (error: any) {
-    return c.json({ error: error.message }, 400);
+// List all available super permissions (used by frontend to render permission checkboxes)
+permissionsRouter.get(
+  "/",
+  requireSuperPermission("permissions.manage"),
+  async (c) => {
+    try {
+      const db = getCommonDB(c.env);
+      const permissions = await db
+        .select({
+          id: superPermissionsSchema.id,
+          slug: superPermissionsSchema.slug,
+          name: superPermissionsSchema.name,
+          description: superPermissionsSchema.description,
+          module: superPermissionsSchema.module,
+        })
+        .from(superPermissionsSchema)
+        .orderBy(superPermissionsSchema.module, superPermissionsSchema.slug)
+        .all();
+      return c.json({ success: true, permissions });
+    } catch (e: any) {
+      return c.json({ error: e.message }, 500);
+    }
   }
-});
+);
 
-permissionsRouter.get('/:userId', async (c) => {
+// Trigger manual re-seed (superadmin only, useful in dev)
+permissionsRouter.post("/seed", requireSuperPermission(WILDCARD_PERMISSION), async (c) => {
   try {
-    const userId = parseInt(c.req.param('userId'));
     const db = getCommonDB(c.env);
-    const perms = await getUserPermissions(db, userId);
-    return c.json(perms);
-  } catch (error: any) {
-    return c.json({ error: error.message }, 500);
+    await seedSuperPermissionsAndRoles(db);
+    return c.json({ success: true, message: "Seeding complete" });
+  } catch (e: any) {
+    return c.json({ error: e.message }, 500);
   }
 });
 

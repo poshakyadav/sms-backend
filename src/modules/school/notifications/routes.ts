@@ -2,9 +2,9 @@ import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import {
+  requirePermission,
   schoolJwtMiddleware,
   schoolTokenValidationMiddleware,
-  schoolPermissionMiddleware,
 } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
 import { SchoolRole } from "../../../types/school-role";
@@ -65,11 +65,7 @@ const notificationSchema = z
 // ==================== Create ====================
 notificationsRouter.post(
   "/",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("notifications.send"),
   zValidator("json", notificationSchema),
   async (c) => {
     const data = c.req.valid("json");
@@ -81,15 +77,13 @@ notificationsRouter.post(
 );
 
 // ==================== Get My Notifications ====================
+// All authenticated users can view their own notifications — no extra permission needed.
 notificationsRouter.get("/", async (c) => {
   const user = c.get("user")!;
   const schoolCode = c.get("schoolCode")!;
-  const notifications = await getNotifications(
-    c.env,
-    schoolCode,
-    user.id,
-    user.role as SchoolRole
-  );
+
+  // Pass userId only; service resolves targeting from DB (no role needed in context)
+  const notifications = await getNotifications(c.env, schoolCode, user.id);
   return c.json({ notifications });
 });
 
@@ -116,23 +110,14 @@ notificationsRouter.post(
 notificationsRouter.get("/unread-count", async (c) => {
   const user = c.get("user")!;
   const schoolCode = c.get("schoolCode")!;
-  const count = await getUnreadCount(
-    c.env,
-    schoolCode,
-    user.id,
-    user.role as SchoolRole
-  );
+  const count = await getUnreadCount(c.env, schoolCode, user.id);
   return c.json({ count });
 });
 
 // ==================== Report (Admin only) ====================
 notificationsRouter.get(
   "/report/:id",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("notifications.send"),
   async (c) => {
     const id = parseInt(c.req.param("id"));
     const schoolCode = c.get("schoolCode")!;

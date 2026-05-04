@@ -9,16 +9,27 @@ import {
 import { getSchoolDB } from "../../../../db/school-client";
 import { SchoolEnv } from "../../../../types/common-types";
 
+/** Single source of truth — mirrors the value in routes.ts and the frontend. */
+const MAX_CAPACITY = 50;
+
+// ==================== CREATE ====================
 export async function createClassSection(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
-  data: any
+  data: {
+    classId: number;
+    sectionId: number;
+    capacity?: number;
+    classTeacherId?: number | null;
+    roomNumber?: string | null;
+    isActive?: boolean;
+  }
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  // Prevent duplicate combination
+  // Guard: duplicate combination
   const existing = await db
-    .select()
+    .select({ id: schoolClassSectionsSchema.id })
     .from(schoolClassSectionsSchema)
     .where(
       and(
@@ -31,24 +42,33 @@ export async function createClassSection(
   if (existing)
     throw new Error("This class-section combination already exists");
 
+  // Guard: capacity cap (belt-and-suspenders — Zod already rejects >50)
+  const capacity = data.capacity ?? 40;
+  if (capacity > MAX_CAPACITY) {
+    throw new Error(
+      `Capacity cannot exceed ${MAX_CAPACITY} students per section`
+    );
+  }
+
   const [newSection] = await db
     .insert(schoolClassSectionsSchema)
     .values({
       classId: data.classId,
       sectionId: data.sectionId,
-      capacity: data.capacity,
-      classTeacherId: data.classTeacherId,
-      roomNumber: data.roomNumber,
-      isActive: data.isActive,
+      capacity,
+      classTeacherId: data.classTeacherId ?? null,
+      roomNumber: data.roomNumber ?? null,
+      isActive: data.isActive ?? true,
     })
     .returning();
 
   return {
     classSection: newSection,
-    message: "Class-Section created successfully",
+    message: "Class-section created successfully",
   };
 }
 
+// ==================== GET ALL ====================
 export async function getClassSections(
   env: SchoolEnv["Bindings"],
   schoolCode: string
@@ -67,6 +87,16 @@ export async function getClassSections(
       classTeacherName: schoolUsersSchema.name,
       roomNumber: schoolClassSectionsSchema.roomNumber,
       isActive: schoolClassSectionsSchema.isActive,
+      currentStudents: db.$count(
+        schoolStudentEnrollmentsSchema,
+        and(
+          eq(
+            schoolStudentEnrollmentsSchema.classSectionId,
+            schoolClassSectionsSchema.id
+          ),
+          eq(schoolStudentEnrollmentsSchema.isActive, true)
+        )
+      ),
     })
     .from(schoolClassSectionsSchema)
     .innerJoin(
@@ -84,6 +114,7 @@ export async function getClassSections(
     .orderBy(schoolClassesSchema.sort_order, schoolSectionsSchema.name);
 }
 
+// ==================== GET AVAILABLE FOR ENROLLMENT ====================
 export async function getAvailableClassSectionsForEnrollment(
   env: SchoolEnv["Bindings"],
   schoolCode: string
@@ -94,16 +125,20 @@ export async function getAvailableClassSectionsForEnrollment(
     .select({
       id: schoolClassSectionsSchema.id,
       displayName:
-        sql`${schoolClassesSchema.name} || ' - ' || ${schoolSectionsSchema.name}`.as(
+        sql<string>`${schoolClassesSchema.name} || ' - ' || ${schoolSectionsSchema.name}`.as(
           "displayName"
         ),
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
       capacity: schoolClassSectionsSchema.capacity,
-      // Current student count (Drizzle way – subquery)
       currentStudents: db.$count(
         schoolStudentEnrollmentsSchema,
-        eq(
-          schoolStudentEnrollmentsSchema.classSectionId,
-          schoolClassSectionsSchema.id
+        and(
+          eq(
+            schoolStudentEnrollmentsSchema.classSectionId,
+            schoolClassSectionsSchema.id
+          ),
+          eq(schoolStudentEnrollmentsSchema.isActive, true)
         )
       ),
     })
@@ -116,5 +151,116 @@ export async function getAvailableClassSectionsForEnrollment(
       schoolSectionsSchema,
       eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
     )
-    .where(eq(schoolClassSectionsSchema.isActive, true));
+    .where(eq(schoolClassSectionsSchema.isActive, true))
+    .orderBy(schoolClassesSchema.sort_order, schoolSectionsSchema.name);
+}
+
+// ==================== UPDATE ====================
+export async function updateClassSection(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  id: number,
+  data: Partial<{
+    classId: number;
+    sectionId: number;
+    capacity: number;
+    classTeacherId: number | null;
+    roomNumber: string | null;
+    isActive: boolean;
+  }>
+) {
+  const db = await getSchoolDB(env, schoolCode);
+
+  // Guard: capacity cap
+  if (data.capacity !== undefined && data.capacity > MAX_CAPACITY) {
+    throw new Error(
+      `Capacity cannot exceed ${MAX_CAPACITY} students per section`
+    );
+  }
+
+  // Guard: record must exist
+  const existing = await db
+    .select({ id: schoolClassSectionsSchema.id })
+    .from(schoolClassSectionsSchema)
+    .where(eq(schoolClassSectionsSchema.id, id))
+    .get();
+
+  if (!existing) throw new Error("Class-section not found");
+
+  // Guard: if changing class+section combo, ensure uniqueness
+  if (data.classId !== undefined || data.sectionId !== undefined) {
+    const current = await db
+      .select({
+        classId: schoolClassSectionsSchema.classId,
+        sectionId: schoolClassSectionsSchema.sectionId,
+      })
+      .from(schoolClassSectionsSchema)
+      .where(eq(schoolClassSectionsSchema.id, id))
+      .get();
+
+    const newClassId = data.classId ?? current!.classId;
+    const newSectionId = data.sectionId ?? current!.sectionId;
+
+    const duplicate = await db
+      .select({ id: schoolClassSectionsSchema.id })
+      .from(schoolClassSectionsSchema)
+      .where(
+        and(
+          eq(schoolClassSectionsSchema.classId, newClassId),
+          eq(schoolClassSectionsSchema.sectionId, newSectionId)
+        )
+      )
+      .get();
+
+    // Allow if the only match is the record being updated
+    if (duplicate && duplicate.id !== id) {
+      throw new Error("This class-section combination already exists");
+    }
+  }
+
+  const [updated] = await db
+    .update(schoolClassSectionsSchema)
+    .set({ ...data, updatedAt: sql`CURRENT_TIMESTAMP` })
+    .where(eq(schoolClassSectionsSchema.id, id))
+    .returning();
+
+  return {
+    classSection: updated,
+    message: "Class-section updated successfully",
+  };
+}
+
+// ==================== DELETE ====================
+export async function deleteClassSection(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  id: number
+) {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const hasEnrollments = await db
+    .select({ id: schoolStudentEnrollmentsSchema.id })
+    .from(schoolStudentEnrollmentsSchema)
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.classSectionId, id),
+        eq(schoolStudentEnrollmentsSchema.isActive, true)
+      )
+    )
+    .limit(1)
+    .get();
+
+  if (hasEnrollments) {
+    throw new Error(
+      "Cannot delete class-section with active enrolled students"
+    );
+  }
+
+  const [deleted] = await db
+    .delete(schoolClassSectionsSchema)
+    .where(eq(schoolClassSectionsSchema.id, id))
+    .returning();
+
+  if (!deleted) throw new Error("Class-section not found");
+  return { message: "Class-section deleted successfully" };
 }

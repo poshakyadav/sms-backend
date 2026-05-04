@@ -1,7 +1,7 @@
 import z from "zod";
 import {
+  requirePermission,
   schoolJwtMiddleware,
-  schoolPermissionMiddleware,
   schoolTokenValidationMiddleware,
 } from "../../../../middleware/school-auth";
 import { SchoolRole } from "../../../../types/school-role";
@@ -26,11 +26,7 @@ const sectionSchema = z.object({
 
 sectionsRouter.post(
   "/sections",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("academics.sections.manage"),
   zValidator("json", sectionSchema),
   async (c) => {
     try {
@@ -49,12 +45,7 @@ sectionsRouter.post(
 
 sectionsRouter.get(
   "/sections",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-    SchoolRole.TEACHER,
-  ]),
+  requirePermission("academics.sections.manage"),
   async (c) => {
     try {
       const schoolCode = c.get("schoolCode")!;
@@ -69,15 +60,12 @@ sectionsRouter.get(
 
 sectionsRouter.put(
   "/sections/:id",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("academics.sections.manage"),
   zValidator("json", sectionSchema.partial()),
   async (c) => {
     try {
       const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
       const data = c.req.valid("json");
       const schoolCode = c.get("schoolCode")!;
 
@@ -92,10 +80,11 @@ sectionsRouter.put(
 
 sectionsRouter.delete(
   "/sections/:id",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL]),
+  requirePermission("academics.sections.manage"),
   async (c) => {
     try {
       const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
       const schoolCode = c.get("schoolCode")!;
 
       const result = await deleteSection(c.env, schoolCode, id);

@@ -1,20 +1,35 @@
-import { Hono } from "hono";
-import { schoolJwtMiddleware, schoolPermissionMiddleware, schoolTokenValidationMiddleware } from "../../../../middleware/school-auth";
-import { SchoolRole } from "../../../../types/school-role";
-import { SchoolEnv } from "../../../../types/common-types";
-import z from "zod";
 import { zValidator } from "@hono/zod-validator";
-import { createClassSection, getAvailableClassSectionsForEnrollment, getClassSections } from "./services";
+import { Hono } from "hono";
+import z from "zod";
+import {
+  requirePermission,
+  schoolJwtMiddleware,
+  schoolTokenValidationMiddleware,
+} from "../../../../middleware/school-auth";
+import { SchoolEnv } from "../../../../types/common-types";
+import {
+  createClassSection,
+  deleteClassSection,
+  getAvailableClassSectionsForEnrollment,
+  getClassSections,
+  updateClassSection,
+} from "./services";
 
+/** Hard capacity cap — enforced at both API and DB level. */
+const MAX_CAPACITY = 50;
 
 const classSectionsRouter = new Hono<SchoolEnv>();
 
-classSectionsRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
+classSectionsRouter.use(
+  "*",
+  schoolJwtMiddleware,
+  schoolTokenValidationMiddleware
+);
 
 const classSectionSchema = z.object({
   classId: z.number().int().positive(),
   sectionId: z.number().int().positive(),
-  capacity: z.number().int().min(1).max(100).default(40),
+  capacity: z.number().int().min(1).max(MAX_CAPACITY).default(40),
   classTeacherId: z.number().int().positive().optional().nullable(),
   roomNumber: z.string().optional().nullable(),
   isActive: z.boolean().default(true),
@@ -22,34 +37,97 @@ const classSectionSchema = z.object({
 
 classSectionsRouter.post(
   "/class-sections",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL, SchoolRole.MANAGER]),
+  requirePermission("academics.sections.manage"),
   zValidator("json", classSectionSchema),
   async (c) => {
-    const data = c.req.valid("json");
-    const schoolCode = c.get("schoolCode")!;
-    const result = await createClassSection(c.env, schoolCode, data);
-    return c.json(result, 201);
+    try {
+      const data = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await createClassSection(c.env, schoolCode, data);
+      return c.json(result, 201);
+    } catch (error: any) {
+      console.error("Class-section creation error:", error);
+      return c.json({ error: error.message }, 400);
+    }
   }
 );
 
 classSectionsRouter.get(
   "/class-sections",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL, SchoolRole.MANAGER, SchoolRole.TEACHER]),
+  requirePermission("academics.sections.manage"),
   async (c) => {
-    const schoolCode = c.get("schoolCode")!;
-    const sections = await getClassSections(c.env, schoolCode);
-    return c.json({ classSections: sections });
+    try {
+      const schoolCode = c.get("schoolCode")!;
+      const sections = await getClassSections(c.env, schoolCode);
+      return c.json({ classSections: sections });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 500);
+    }
   }
 );
 
-// NEW: For enrollment dropdown (very useful)
+// Available sections for enrollment dropdowns
 classSectionsRouter.get(
   "/class-sections/available",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.ADMISSION_OFFICER, SchoolRole.PRINCIPAL]),
+  requirePermission("academics.enroll"),
   async (c) => {
-    const schoolCode = c.get("schoolCode")!;
-    const sections = await getAvailableClassSectionsForEnrollment(c.env, schoolCode);
-    return c.json({ available: sections });
+    try {
+      const schoolCode = c.get("schoolCode")!;
+      const sections = await getAvailableClassSectionsForEnrollment(
+        c.env,
+        schoolCode
+      );
+      return c.json({ available: sections });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 500);
+    }
+  }
+);
+
+const updateClassSectionSchema = classSectionSchema.partial();
+
+classSectionsRouter.put(
+  "/class-sections/:id",
+  requirePermission("academics.sections.manage"),
+  zValidator("json", updateClassSectionSchema),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
+      const data = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+
+      // Extra guard: reject even partial updates that exceed the cap
+      if (data.capacity !== undefined && data.capacity > MAX_CAPACITY) {
+        return c.json(
+          {
+            error: `Capacity cannot exceed ${MAX_CAPACITY} students per section`,
+          },
+          400
+        );
+      }
+
+      const result = await updateClassSection(c.env, schoolCode, id, data);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+classSectionsRouter.delete(
+  "/class-sections/:id",
+  requirePermission("academics.sections.manage"),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
+      const schoolCode = c.get("schoolCode")!;
+      const result = await deleteClassSection(c.env, schoolCode, id);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
   }
 );
 

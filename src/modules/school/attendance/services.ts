@@ -1,9 +1,11 @@
 import { getSchoolDB } from "../../../db/school-client";
 import { and, eq, gte, lte, sql } from "drizzle-orm";
 import {
+  schoolAcademicYearsSchema,
   schoolAttendancesSchema,
   schoolStudentEnrollmentsSchema,
   schoolUsersSchema,
+  studentParentsSchema,
 } from "../../../db/schemas/school";
 import { SchoolEnv } from "../../../types/common-types";
 
@@ -205,7 +207,22 @@ export async function getAttendanceReport(
   const datePattern = `${year}-${month.toString().padStart(2, "0")}-%`;
   const totalDaysInMonth = new Date(year, month, 0).getDate();
 
-  const enrollmentWhere = [eq(schoolStudentEnrollmentsSchema.isActive, true)];
+  // ── Resolve current academic year for scoping ─────────────────────────────
+  // Without this, students from past years enrolled in the same class-section
+  // would appear in the report. We scope to the active academic year only.
+  const currentYear = await db
+    .select({ id: schoolAcademicYearsSchema.id })
+    .from(schoolAcademicYearsSchema)
+    .where(eq(schoolAcademicYearsSchema.isCurrent, true))
+    .get();
+
+  if (!currentYear) throw new Error("No active academic year found");
+
+  const enrollmentWhere = [
+    eq(schoolStudentEnrollmentsSchema.isActive, true),
+    eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id), // ← NEW: scope to current year
+  ];
+
   if (data.classSectionId)
     enrollmentWhere.push(
       eq(schoolStudentEnrollmentsSchema.classSectionId, data.classSectionId)
@@ -219,6 +236,7 @@ export async function getAttendanceReport(
     .select({
       studentId: schoolStudentEnrollmentsSchema.studentId,
       studentName: schoolUsersSchema.name,
+      rollNumber: schoolStudentEnrollmentsSchema.rollNumber, // ← NEW: include roll number for sorting
       totalDays: sql<number>`${totalDaysInMonth}`.as("total_days"),
       present:
         sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'PRESENT' THEN 1 END)`.as(
@@ -252,12 +270,22 @@ export async function getAttendanceReport(
       )
     )
     .where(and(...enrollmentWhere))
-    .groupBy(schoolStudentEnrollmentsSchema.studentId, schoolUsersSchema.name)
-    .orderBy(schoolUsersSchema.name);
+    .groupBy(
+      schoolStudentEnrollmentsSchema.studentId,
+      schoolUsersSchema.name,
+      schoolStudentEnrollmentsSchema.rollNumber // ← group by roll number too
+    )
+    .orderBy(
+      // ── Sort by roll number when a class-section is selected, else by name ──
+      data.classSectionId
+        ? sql`CAST(${schoolStudentEnrollmentsSchema.rollNumber} AS INTEGER)`
+        : schoolUsersSchema.name
+    );
 
   return reportData.map((row: any) => ({
     studentId: row.studentId,
     studentName: row.studentName,
+    rollNumber: row.rollNumber ?? null, // ← NEW: expose to frontend
     totalDays: row.totalDays,
     present: row.present || 0,
     absent: row.absent || 0,
@@ -266,4 +294,261 @@ export async function getAttendanceReport(
     attendancePercentage:
       row.totalDays > 0 ? Math.round((row.present / row.totalDays) * 100) : 0,
   }));
+}
+
+// ==================== NEW: GET ATTENDANCE FOR STUDENT (SELF VIEW) ====================
+/**
+ * GET ATTENDANCE BY STUDENT SELF
+ *
+ * Purpose: Student views their OWN attendance history.
+ * Security: userId comes from the validated JWT — no studentId override possible.
+ * Used by: /attendance/me endpoint (guarded by attendance.student.view)
+ */
+export async function getAttendanceByStudentSelf(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number,         // From JWT — authoritative, cannot be spoofed
+  fromDate: string,
+  toDate: string
+) {
+  const db = await getSchoolDB(env, schoolCode);
+
+  return await db
+    .select({
+      id: schoolAttendancesSchema.id,
+      date: schoolAttendancesSchema.date,
+      status: schoolAttendancesSchema.status,
+      notes: schoolAttendancesSchema.notes,
+      createdAt: schoolAttendancesSchema.createdAt,
+    })
+    .from(schoolAttendancesSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolAttendancesSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.studentId, userId),
+        gte(schoolAttendancesSchema.date, fromDate),
+        lte(schoolAttendancesSchema.date, toDate)
+      )
+    )
+    .orderBy(schoolAttendancesSchema.date);
+}
+
+
+// ==================== NEW: GET ATTENDANCE SUMMARY FOR STUDENT (SELF) ====================
+/**
+ * Monthly summary — total days, present, absent, late, halfDay, percentage.
+ * Used by the student attendance dashboard card.
+ */
+export async function getAttendanceSummaryForStudent(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number,   // From JWT
+  month: number,
+  year: number
+) {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const datePattern = `${year}-${month.toString().padStart(2, "0")}-%`;
+  const totalDaysInMonth = new Date(year, month, 0).getDate();
+
+  const rows = await db
+    .select({
+      present:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'PRESENT' THEN 1 END)`.as("present"),
+      absent:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'ABSENT' THEN 1 END)`.as("absent"),
+      late:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'LATE' THEN 1 END)`.as("late"),
+      halfDay:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'HALF_DAY' THEN 1 END)`.as("half_day"),
+    })
+    .from(schoolAttendancesSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolAttendancesSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.studentId, userId),
+        sql`${schoolAttendancesSchema.date} LIKE ${datePattern}`
+      )
+    )
+    .get();
+
+  const present = rows?.present ?? 0;
+  const absent = rows?.absent ?? 0;
+  const late = rows?.late ?? 0;
+  const halfDay = rows?.halfDay ?? 0;
+  const markedDays = present + absent + late + halfDay;
+
+  return {
+    month,
+    year,
+    totalDaysInMonth,
+    markedDays,
+    present,
+    absent,
+    late,
+    halfDay,
+    attendancePercentage:
+      markedDays > 0 ? Math.round((present / markedDays) * 100) : 0,
+  };
+}
+
+
+// ==================== NEW: GET ATTENDANCE FOR PARENT (CHILD VIEW) ====================
+/**
+ * GET ATTENDANCE FOR PARENT (CHILD VIEW)
+ *
+ * Purpose: Parent views their child's attendance.
+ * Security:
+ *   - parentId comes from JWT (cannot be spoofed).
+ *   - childStudentId comes from X-Active-Child-Id header (set by auth-interceptor).
+ *   - We verify the parent–child link in student_parents table before returning data.
+ *     This prevents a parent from viewing another family's child by manipulating the header.
+ *
+ * @param parentUserId  - Authenticated parent's userId (from JWT)
+ * @param childStudentId - Active child's userId (from X-Active-Child-Id header)
+ */
+export async function getAttendanceForParentChildView(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  parentUserId: number,
+  childStudentId: number,
+  fromDate: string,
+  toDate: string
+) {
+  const db = await getSchoolDB(env, schoolCode);
+
+  // ── Security check: verify parent-child relationship ──────────────────────
+  const link = await db
+    .select({ id: studentParentsSchema.id })
+    .from(studentParentsSchema)
+    .where(
+      and(
+        eq(studentParentsSchema.parentId, parentUserId),
+        eq(studentParentsSchema.studentId, childStudentId)
+      )
+    )
+    .get();
+
+  if (!link) {
+    throw new Error("Unauthorized: no parent-child relationship found");
+  }
+
+  return await db
+    .select({
+      id: schoolAttendancesSchema.id,
+      date: schoolAttendancesSchema.date,
+      status: schoolAttendancesSchema.status,
+      notes: schoolAttendancesSchema.notes,
+      createdAt: schoolAttendancesSchema.createdAt,
+    })
+    .from(schoolAttendancesSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolAttendancesSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.studentId, childStudentId),
+        gte(schoolAttendancesSchema.date, fromDate),
+        lte(schoolAttendancesSchema.date, toDate)
+      )
+    )
+    .orderBy(schoolAttendancesSchema.date);
+}
+
+
+// ==================== NEW: GET ATTENDANCE SUMMARY FOR PARENT (CHILD VIEW) ====================
+/**
+ * Monthly summary for the parent's selected child.
+ * Same security check as getAttendanceForParentChildView.
+ */
+export async function getAttendanceSummaryForParentChild(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  parentUserId: number,
+  childStudentId: number,
+  month: number,
+  year: number
+) {
+  const db = await getSchoolDB(env, schoolCode);
+
+  // ── Security check ────────────────────────────────────────────────────────
+  const link = await db
+    .select({ id: studentParentsSchema.id })
+    .from(studentParentsSchema)
+    .where(
+      and(
+        eq(studentParentsSchema.parentId, parentUserId),
+        eq(studentParentsSchema.studentId, childStudentId)
+      )
+    )
+    .get();
+
+  if (!link) {
+    throw new Error("Unauthorized: no parent-child relationship found");
+  }
+
+  const datePattern = `${year}-${month.toString().padStart(2, "0")}-%`;
+  const totalDaysInMonth = new Date(year, month, 0).getDate();
+
+  const rows = await db
+    .select({
+      present:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'PRESENT' THEN 1 END)`.as("present"),
+      absent:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'ABSENT' THEN 1 END)`.as("absent"),
+      late:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'LATE' THEN 1 END)`.as("late"),
+      halfDay:
+        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'HALF_DAY' THEN 1 END)`.as("half_day"),
+    })
+    .from(schoolAttendancesSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolAttendancesSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.studentId, childStudentId),
+        sql`${schoolAttendancesSchema.date} LIKE ${datePattern}`
+      )
+    )
+    .get();
+
+  const present = rows?.present ?? 0;
+  const absent = rows?.absent ?? 0;
+  const late = rows?.late ?? 0;
+  const halfDay = rows?.halfDay ?? 0;
+  const markedDays = present + absent + late + halfDay;
+
+  return {
+    month,
+    year,
+    totalDaysInMonth,
+    markedDays,
+    present,
+    absent,
+    late,
+    halfDay,
+    attendancePercentage:
+      markedDays > 0 ? Math.round((present / markedDays) * 100) : 0,
+  };
 }

@@ -3,7 +3,8 @@ import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
 import {
   jwtMiddleware,
-  permissionMiddleware,
+  requireSuperPermission,
+  superTokenValidationMiddleware,
 } from "../../../middleware/super-auth";
 import { Env } from "../../../types/common-types";
 import { getCommonDB } from "../../../db";
@@ -12,11 +13,7 @@ import { count, eq } from "drizzle-orm";
 
 const tursoDbsRouter = new Hono<Env>();
 
-tursoDbsRouter.use(
-  "*",
-  jwtMiddleware,
-  permissionMiddleware(["canManageTursoDBs"])
-);
+tursoDbsRouter.use("*", jwtMiddleware, superTokenValidationMiddleware, requireSuperPermission("turso.manage"));
 
 const addSchema = z.object({
   url: z.string().url(),

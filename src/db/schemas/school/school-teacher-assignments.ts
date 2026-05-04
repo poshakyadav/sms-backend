@@ -17,7 +17,7 @@ export const schoolTeacherAssignmentsSchema = sqliteTable(
     teacherId: integer("teacher_id")
       .references(() => teachersSchema.userId, { onDelete: "cascade" })
       .notNull(),
-    classSubjectId: integer("class_subject_id")
+    classSectionSubjectId: integer("class_section_subject_id")
       .references(() => schoolClassSectionSubjectsSchema.id, { onDelete: "cascade" })
       .notNull(),
     assignedDate: text("assigned_date")

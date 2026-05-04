@@ -16,6 +16,22 @@ export const schoolExamSubjectsSchema = sqliteTable("exam_subjects", {
   roomNumber: text("room_number"),
   maxMarks: integer("max_marks").notNull(),
   passingMarks: integer("passing_marks"),
+  /**
+   * OPTIONAL CUSTOM SUBJECT LABEL
+   *
+   * Overrides the subject name for this specific exam slot.
+   * Used when the same subject has multiple papers, e.g.:
+   *   - "English Paper One"
+   *   - "English Paper Two"
+   *   - "Mathematics Theory"
+   *   - "Mathematics Practical"
+   *
+   * If NULL / empty, the timetable display falls back to the
+   * canonical subject name from the subjects table.
+   * This avoids creating duplicate subject records just for
+   * exam-paper labelling.
+   */
+  subjectLabel: text("subject_label"), // e.g. "English Paper One" — optional override
 });
 
 export type SchoolExamSubject = typeof schoolExamSubjectsSchema.$inferSelect;

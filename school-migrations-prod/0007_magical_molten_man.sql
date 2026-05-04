@@ -1,0 +1,1 @@
+ALTER TABLE `permissions` ADD `category` text DEFAULT 'staff' NOT NULL;

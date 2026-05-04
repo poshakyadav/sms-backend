@@ -16,17 +16,10 @@ export const schoolFeeStructuresSchema = sqliteTable("fee_structures", {
     .references(() => schoolAcademicYearsSchema.id, { onDelete: "cascade" })
     .notNull(),
 
-  classId: integer("class_id")
-    .references(() => schoolClassesSchema.id, { onDelete: "cascade" })
+  // === Fee structure is now directly tied to class-section ===
+  classSectionId: integer("class_section_id")
+    .references(() => schoolClassSectionsSchema.id, { onDelete: "cascade" })
     .notNull(),
-  // sectionId: integer("section_id") // nullable = class-level fee
-  //   .references(() => schoolSectionsSchema.id, { onDelete: "cascade" }),
-
-  // === nullable = class-level fee (all sections) ===
-  classSectionId: integer("class_section_id").references(
-    () => schoolClassSectionsSchema.id,
-    { onDelete: "set null" }
-  ),
 
   feeType: text("fee_type").notNull(), // "TUITION", "BUS", "LIBRARY", "ADMISSION"
   amount: integer("amount").notNull(),

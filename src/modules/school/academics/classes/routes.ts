@@ -1,7 +1,7 @@
 import z from "zod";
 import {
+  requirePermission,
   schoolJwtMiddleware,
-  schoolPermissionMiddleware,
   schoolTokenValidationMiddleware,
 } from "../../../../middleware/school-auth";
 import { SchoolRole } from "../../../../types/school-role";
@@ -23,11 +23,7 @@ const classSchema = z.object({
 
 classesRouter.post(
   "/classes",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("academics.classes.manage"),
   zValidator("json", classSchema),
   async (c) => {
     try {
@@ -46,12 +42,7 @@ classesRouter.post(
 
 classesRouter.get(
   "/classes",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-    SchoolRole.TEACHER,
-  ]),
+  requirePermission("academics.classes.manage"),
   async (c) => {
     try {
       const schoolCode = c.get("schoolCode")!;
@@ -66,11 +57,7 @@ classesRouter.get(
 
 classesRouter.put(
   "/classes/:id",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
+  requirePermission("academics.classes.manage"),
   zValidator("json", classSchema.partial()),
   async (c) => {
     try {
@@ -89,10 +76,11 @@ classesRouter.put(
 
 classesRouter.delete(
   "/classes/:id",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL]),
+  requirePermission("academics.classes.manage"),
   async (c) => {
     try {
       const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
       const schoolCode = c.get("schoolCode")!;
 
       const result = await deleteClass(c.env, schoolCode, id);

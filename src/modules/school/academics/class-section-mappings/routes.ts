@@ -1,7 +1,7 @@
 import z from "zod";
 import {
+  requirePermission,
   schoolJwtMiddleware,
-  schoolPermissionMiddleware,
   schoolTokenValidationMiddleware,
 } from "../../../../middleware/school-auth";
 import { SchoolRole } from "../../../../types/school-role";
@@ -47,27 +47,101 @@ classSectionMappingsRouter.use(
  */
 // Example: POST /class-section-mappings
 // ==================== Schema (Fixed typo + bulk support) ====================
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHEMAS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * academicYearId rules:
+ *   - omitted / null  → GLOBAL mapping (reused every year)
+ *   - positive int    → year-specific mapping
+ */
 const singleMappingSchema = z.object({
   currentClassSectionId: z.number().int().positive(),
   nextClassSectionId: z.number().int().positive(),
   academicYearId: z.number().int().positive().optional().nullable(),
 });
 
-const bulkMappingSchema = z.array(singleMappingSchema);
+const bulkMappingSchema = z
+  .array(singleMappingSchema)
+  .min(1, "At least one mapping is required")
+  .max(200, "Cannot bulk-create more than 200 mappings at once");
 
-// ==================== Single Create ====================
-classSectionMappingsRouter.post(
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ALL  —  with optional ?scope=global | ?scope=year&yearId=N
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * GET /school/academics/mappings
+ *
+ * Query params:
+ *   ?scope=all            → all mappings (default)
+ *   ?scope=global         → only global (no year) mappings
+ *   ?scope=year&yearId=N  → only mappings for academic year N
+ */
+classSectionMappingsRouter.get(
   "/",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL]),
-  zValidator("json", singleMappingSchema),
+  requirePermission("academics.mappings.manage"),
   async (c) => {
-    const data = c.req.valid("json");
-    const schoolCode = c.get("schoolCode")!;
-    const result = await createNextMapping(c.env, schoolCode, data);
-    return c.json(result, 201);
+    try {
+      const schoolCode = c.get("schoolCode")!;
+      const scopeParam = c.req.query("scope") ?? "all";
+      const yearIdParam = c.req.query("yearId");
+
+      let scope: "global" | "all" | number = "all";
+
+      if (scopeParam === "global") {
+        scope = "global";
+      } else if (scopeParam === "year" && yearIdParam) {
+        const yearId = parseInt(yearIdParam);
+        if (isNaN(yearId)) {
+          return c.json({ error: "yearId must be a valid integer" }, 400);
+        }
+        scope = yearId;
+      }
+
+      const mappings = await getClassSectionMappings(c.env, schoolCode, scope);
+      return c.json({ mappings, scope: scopeParam });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 500);
+    }
   }
 );
 
+// ─────────────────────────────────────────────────────────────────────────────
+// CREATE SINGLE
+// ─────────────────────────────────────────────────────────────────────────────
+classSectionMappingsRouter.post(
+  "/",
+  requirePermission("academics.mappings.manage"),
+  zValidator("json", singleMappingSchema),
+  async (c) => {
+    try {
+      const data = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await createNextMapping(c.env, schoolCode, data);
+      return c.json(result, 201);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BULK CREATE
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * POST /school/academics/mappings/bulk
+ *
+ * Body: array of mapping objects.
+ * Each item may have academicYearId = null (global) or a year ID.
+ *
+ * Example:
+ * [
+ *   { "currentClassSectionId": 1, "nextClassSectionId": 3 },            // global
+ *   { "currentClassSectionId": 2, "nextClassSectionId": 4, "academicYearId": 5 } // year-specific
+ * ]
+ */
 /**
  * How to Use Bulk Create (UI-Friendly)
  * Request:
@@ -95,54 +169,63 @@ classSectionMappingsRouter.post(
 // ==================== BULK CREATE (New) ====================
 classSectionMappingsRouter.post(
   "/bulk",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL]),
+  requirePermission("academics.mappings.manage"),
   zValidator("json", bulkMappingSchema),
   async (c) => {
-    const data = c.req.valid("json");
-    const schoolCode = c.get("schoolCode")!;
-    const result = await createBulkMappings(c.env, schoolCode, data);
-    return c.json(result, 201);
+    try {
+      const data = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await createBulkMappings(c.env, schoolCode, data);
+      return c.json(result, 201);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
   }
 );
 
-// ==================== Get All (UI-friendly) ====================
-classSectionMappingsRouter.get(
-  "/",
-  schoolPermissionMiddleware([
-    SchoolRole.SCHOOL_OWNER,
-    SchoolRole.PRINCIPAL,
-    SchoolRole.MANAGER,
-  ]),
-  async (c) => {
-    const schoolCode = c.get("schoolCode")!;
-    const mappings = await getClassSectionMappings(c.env, schoolCode);
-    return c.json({ mappings });
-  }
-);
-
-// ==================== Update ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * PUT /school/academics/mappings/:id
+ *
+ * To convert a year-specific mapping to global, send academicYearId: null.
+ * To convert a global mapping to year-specific, send the target yearId.
+ */
 classSectionMappingsRouter.put(
   "/:id",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER, SchoolRole.PRINCIPAL]),
+  requirePermission("academics.mappings.manage"),
   zValidator("json", singleMappingSchema.partial()),
   async (c) => {
-    const id = parseInt(c.req.param("id"));
-    const data = c.req.valid("json");
-    const schoolCode = c.get("schoolCode")!;
-    const result = await updateMapping(c.env, schoolCode, id, data);
-    return c.json(result);
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid mapping ID" }, 400);
+      const data = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await updateMapping(c.env, schoolCode, id, data);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
   }
 );
 
-// ==================== Delete ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE
+// ─────────────────────────────────────────────────────────────────────────────
 classSectionMappingsRouter.delete(
   "/:id",
-  schoolPermissionMiddleware([SchoolRole.SCHOOL_OWNER]),
+  requirePermission("academics.mappings.manage"),
   async (c) => {
-    const id = parseInt(c.req.param("id"));
-    const schoolCode = c.get("schoolCode")!;
-    const result = await deleteMapping(c.env, schoolCode, id);
-    return c.json(result);
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid mapping ID" }, 400);
+      const schoolCode = c.get("schoolCode")!;
+      const result = await deleteMapping(c.env, schoolCode, id);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
   }
 );
 

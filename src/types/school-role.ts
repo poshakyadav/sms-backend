@@ -1,3 +1,12 @@
+
+
+/**
+ * src/types/school-role.ts
+ * LEGACY ROLE NAMES (kept for display, seeding, and backward compatibility)
+ *
+ * REAL AUTHORIZATION IS NOW PERMISSION-BASED (see school-permissions.ts).
+ * School owner can create custom roles and assign any permissions.
+ */
 /**
  * @description Defines the access levels and responsibilities within the School Management System.
  * Each role has a specific set of permissions (RBAC).
@@ -194,3 +203,6 @@ export const StaffRoles = [
   SchoolRole.GROUNDS_STAFF,
   SchoolRole.UTILITY_STAFF,
 ] as const;
+
+/** @deprecated Use SchoolPermissionSlug instead for authorization */
+export type LegacySchoolRole = SchoolRole;
