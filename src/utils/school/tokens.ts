@@ -26,8 +26,8 @@ export async function generateSchoolAccessToken(
     name: string;
     email?: string;
     schoolCode: string;
-    permissions: string[]; 
-    tokenVersion: number; 
+    permissions: string[];
+    tokenVersion: number;
     role?: string;
   },
   secret: string
@@ -39,7 +39,7 @@ export async function generateSchoolAccessToken(
     schoolCode: user.schoolCode,
     permissions: user.permissions, // ← Full permissions array
     tokenVersion: user.tokenVersion, // ← For instant invalidation
-    role: user.role ?? '',
+    role: user.role ?? "",
     exp: Math.floor(Date.now() / 1000) + ACCESS_TOKEN_EXPIRY,
   };
 
@@ -49,6 +49,18 @@ export async function generateSchoolAccessToken(
 /**
  * Generate Refresh Token + Store in DB
  * Single active refresh token per user (old one is deleted on new login/refresh)
+ *
+ * * Generates a new refresh token and persists it atomically.
+ *
+ * Uses db.batch([delete, insert]) to send both statements in a single
+ * HTTP request to Turso. The server executes them sequentially inside
+ * an implicit transaction — either both succeed or both roll back.
+ *
+ * This replaces the original two sequential awaits (2 round trips) with
+ * one batch call (1 round trip). Saves ~30-100ms per login/refresh.
+ *
+ * Single-session policy is preserved: the DELETE removes any existing
+ * token for this user before the INSERT creates the new one.
  */
 export async function generateSchoolRefreshToken(
   db: any,
@@ -58,15 +70,14 @@ export async function generateSchoolRefreshToken(
 
   const expiresAt = Math.floor(Date.now() / 1000) + REFRESH_TOKEN_EXPIRY;
 
-  // Delete any old refresh token for this user (single session policy)
-  await db
-    .delete(schoolRefreshTokensSchema)
-    .where(eq(schoolRefreshTokensSchema.userId, userId));
+  // Single HTTP round trip — DELETE then INSERT, atomically on the server
+  await db.batch([
+    db
+      .delete(schoolRefreshTokensSchema)
+      .where(eq(schoolRefreshTokensSchema.userId, userId)),
 
-  // Insert new refresh token
-  await db
-    .insert(schoolRefreshTokensSchema)
-    .values({ userId, token, expiresAt });
+    db.insert(schoolRefreshTokensSchema).values({ userId, token, expiresAt }),
+  ]);
 
   return token;
 }

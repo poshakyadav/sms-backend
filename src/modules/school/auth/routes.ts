@@ -1040,10 +1040,13 @@ schoolAuthRouter.post(
       // It fetches user + roles + denials + directPerms in ONE round trip,
       // then rolePerms in a second. It also returns primaryRole directly
       // from school_users — no extra query needed.
-      const userWithPermissions = await getUserWithPermissions(
-        db,
-        payload.userId
-      );
+      // getUserWithPermissions + fetchSchoolBranding in parallel ─
+      // Branding doesn't need userId — it can start at the same time as
+      // the user/permissions fetch. Both hit the same already-open DB conn.
+      const [userWithPermissions, school] = await Promise.all([
+        getUserWithPermissions(db, payload.userId),
+        fetchSchoolBranding(db),
+      ]);
 
       if (!userWithPermissions) {
         return c.json({ error: "User not found" }, 404);
@@ -1055,25 +1058,24 @@ schoolAuthRouter.post(
       // primaryRole now comes from getUserWithPermissions — no extra DB call
       const role = userWithPermissions.primaryRole ?? "";
 
-      // Step 3+4 in parallel: generate new tokens AND fetch branding together.
-      // These are completely independent — run simultaneously.
-      const [{ access_token, refresh_token: newRefreshToken }, school] =
-        await Promise.all([
-          generateSchoolTokens(
-            db,
-            {
-              id: userWithPermissions.id,
-              name: userWithPermissions.name,
-              email: userWithPermissions.email,
-              schoolCode,
-              permissions: userWithPermissions.permissions as string[],
-              tokenVersion: userWithPermissions.tokenVersion,
-              role,
-            },
-            c.env.JWT_SECRET
-          ),
-          fetchSchoolBranding(db),
-        ]);
+      // ── Step 3: Generate new tokens ─────────────────────────────────────
+      // generateSchoolTokens internally calls:
+      //   - generateSchoolAccessToken  → pure CPU (JWT sign), no DB
+      //   - generateSchoolRefreshToken → db.batch([DELETE, INSERT]), 1 round trip
+      const { access_token, refresh_token: newRefreshToken } =
+        await generateSchoolTokens(
+          db,
+          {
+            id: userWithPermissions.id,
+            name: userWithPermissions.name,
+            email: userWithPermissions.email,
+            schoolCode,
+            permissions: userWithPermissions.permissions as string[],
+            tokenVersion: userWithPermissions.tokenVersion,
+            role,
+          },
+          c.env.JWT_SECRET
+        );
 
       return c.json({
         success: true,

@@ -94,39 +94,6 @@ classesRouter.get(
   }
 );
 
-classesRouter.put(
-  "/classes/:id",
-  requirePermission("academics.classes.manage"),
-  zValidator("json", classSchema.partial()),
-  async (c) => {
-    try {
-      const id = parseInt(c.req.param("id"));
-      const data = c.req.valid("json");
-      const schoolCode = c.get("schoolCode")!;
-      const result = await updateClass(c.env, schoolCode, id, data);
-      return c.json(result);
-    } catch (error: any) {
-      return c.json({ error: error.message }, 400);
-    }
-  }
-);
-
-classesRouter.delete(
-  "/classes/:id",
-  requirePermission("academics.classes.manage"),
-  async (c) => {
-    try {
-      const id = parseInt(c.req.param("id"));
-      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
-      const schoolCode = c.get("schoolCode")!;
-      const result = await deleteClass(c.env, schoolCode, id);
-      return c.json(result);
-    } catch (error: any) {
-      return c.json({ error: error.message }, 400);
-    }
-  }
-);
-
 // ==================== Bulk Create ====================
 /**
  * POST /school/academics/classes/bulk
@@ -167,12 +134,45 @@ classesRouter.put(
   async (c) => {
     try {
       const { classes } = c.req.valid("json");
-      console.log('[BulkUpdate] Received classes:', JSON.stringify(classes));
+      console.log("[BulkUpdate] Received classes:", JSON.stringify(classes));
       const schoolCode = c.get("schoolCode")!;
       const result = await bulkUpdateClasses(c.env, schoolCode, classes);
       return c.json(result);
     } catch (error: any) {
       console.error("Bulk class update error:", error);
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+classesRouter.put(
+  "/classes/:id",
+  requirePermission("academics.classes.manage"),
+  zValidator("json", classSchema.partial()),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      const data = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await updateClass(c.env, schoolCode, id, data);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+classesRouter.delete(
+  "/classes/:id",
+  requirePermission("academics.classes.manage"),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) return c.json({ error: "Invalid ID" }, 400);
+      const schoolCode = c.get("schoolCode")!;
+      const result = await deleteClass(c.env, schoolCode, id);
+      return c.json(result);
+    } catch (error: any) {
       return c.json({ error: error.message }, 400);
     }
   }
