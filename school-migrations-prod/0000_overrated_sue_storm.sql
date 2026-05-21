@@ -4,6 +4,7 @@ CREATE TABLE `school_users` (
 	`name` text NOT NULL,
 	`email` text NOT NULL,
 	`password_hash` text NOT NULL,
+	`primary_role` text DEFAULT '' NOT NULL,
 	`token_version` integer DEFAULT 0 NOT NULL,
 	`phone` text DEFAULT '' NOT NULL,
 	`alternate_phone` text DEFAULT '',
@@ -12,10 +13,15 @@ CREATE TABLE `school_users` (
 	`address_line_one` text DEFAULT '',
 	`address_line_two` text DEFAULT '',
 	`city` text DEFAULT '',
-	`state` text DEFAULT '',
 	`postal_code` text DEFAULT '',
+	`state` text DEFAULT '',
 	`blood_group` text DEFAULT '',
 	`avatar_url` text DEFAULT '',
+	`father_name` text DEFAULT '',
+	`mother_name` text DEFAULT '',
+	`guardian_name` text DEFAULT '',
+	`guardian_relation` text DEFAULT '',
+	`terms_accepted_at` text,
 	`is_active` integer DEFAULT true NOT NULL,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
@@ -26,6 +32,7 @@ CREATE UNIQUE INDEX `school_users_email_unique` ON `school_users` (`email`);--> 
 CREATE TABLE `schools` (
 	`id` integer PRIMARY KEY AUTOINCREMENT DEFAULT 1 NOT NULL,
 	`name` text NOT NULL,
+	`short_name` text DEFAULT '',
 	`unique_code` text NOT NULL,
 	`address_line_one` text DEFAULT '' NOT NULL,
 	`address_line_two` text DEFAULT '',
@@ -37,6 +44,9 @@ CREATE TABLE `schools` (
 	`tagline` text DEFAULT '',
 	`is_active` integer DEFAULT true NOT NULL,
 	`active_theme_id` integer,
+	`udise_code` text,
+	`state_code` text,
+	`district_code` text,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
@@ -65,7 +75,7 @@ CREATE TABLE `school_theme_configs` (
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL
 );
 --> statement-breakpoint
-CREATE UNIQUE INDEX `uq_active_theme_per_school` ON `school_theme_configs` (`school_id`,`is_active`);--> statement-breakpoint
+CREATE UNIQUE INDEX `uq_school_active_theme` ON `school_theme_configs` (`school_id`) WHERE "school_theme_configs"."is_active" = 1;--> statement-breakpoint
 CREATE TABLE `permissions` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`school_id` integer DEFAULT 1 NOT NULL,
@@ -73,6 +83,7 @@ CREATE TABLE `permissions` (
 	`name` text NOT NULL,
 	`description` text NOT NULL,
 	`module` text NOT NULL,
+	`category` text DEFAULT 'staff' NOT NULL,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade
@@ -85,6 +96,7 @@ CREATE TABLE `roles` (
 	`name` text NOT NULL,
 	`description` text NOT NULL,
 	`is_system` integer DEFAULT false NOT NULL,
+	`category` text DEFAULT 'staff' NOT NULL,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade
@@ -119,6 +131,49 @@ CREATE TABLE `user_permissions` (
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`user_id`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`permission_id`) REFERENCES `permissions`(`id`) ON UPDATE no action ON DELETE cascade
+);
+--> statement-breakpoint
+CREATE TABLE `user_permission_denials` (
+	`school_id` integer DEFAULT 1 NOT NULL,
+	`user_id` integer NOT NULL,
+	`permission_id` integer NOT NULL,
+	PRIMARY KEY(`user_id`, `permission_id`),
+	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`user_id`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`permission_id`) REFERENCES `permissions`(`id`) ON UPDATE no action ON DELETE cascade
+);
+--> statement-breakpoint
+CREATE TABLE `school_about_us` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`school_id` integer DEFAULT 1 NOT NULL,
+	`description` text DEFAULT '' NOT NULL,
+	`mission` text DEFAULT '' NOT NULL,
+	`vision` text DEFAULT '' NOT NULL,
+	`founded_year` integer,
+	`founded_by` text DEFAULT '',
+	`history` text DEFAULT '',
+	`affiliation_board` text DEFAULT '',
+	`affiliation_number` text DEFAULT '',
+	`accreditation` text DEFAULT '',
+	`total_students` integer,
+	`total_teachers` integer,
+	`total_staff` integer,
+	`campus_area_acres` text DEFAULT '',
+	`principal_name` text DEFAULT '',
+	`principal_message` text DEFAULT '',
+	`principal_avatar_url` text DEFAULT '',
+	`facebook_url` text DEFAULT '',
+	`twitter_url` text DEFAULT '',
+	`instagram_url` text DEFAULT '',
+	`youtube_url` text DEFAULT '',
+	`linkedin_url` text DEFAULT '',
+	`facilities` text DEFAULT '[]' NOT NULL,
+	`gallery_urls` text DEFAULT '[]' NOT NULL,
+	`core_values` text DEFAULT '[]' NOT NULL,
+	`achievements` text DEFAULT '[]' NOT NULL,
+	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
 CREATE TABLE `academic_years` (
@@ -193,9 +248,31 @@ CREATE UNIQUE INDEX `uq_class_section_subject` ON `class_subjects` (`class_secti
 CREATE TABLE `students` (
 	`user_id` integer PRIMARY KEY NOT NULL,
 	`school_id` integer DEFAULT 1 NOT NULL,
-	`roll_number` text,
+	`admission_number` text,
 	`admission_date` text,
+	`roll_number` text,
+	`enrollment_type` text DEFAULT 'REGULAR' NOT NULL,
 	`previous_school` text,
+	`previous_school_udise_code` text,
+	`previous_class_result` text,
+	`pen` text,
+	`apaar_id` text,
+	`state_student_id` text,
+	`aadhaar_masked` text,
+	`aadhaar_name` text,
+	`is_aadhaar_verified` integer DEFAULT false NOT NULL,
+	`udise_verified` integer DEFAULT false NOT NULL,
+	`social_category` integer,
+	`religion` integer,
+	`is_minority` integer DEFAULT false NOT NULL,
+	`mother_tongue_code` integer,
+	`is_bpl` integer DEFAULT false NOT NULL,
+	`locality_type` text,
+	`is_cwsn` integer DEFAULT false NOT NULL,
+	`disability_type` integer,
+	`has_disability_certificate` integer DEFAULT false,
+	`udid_number` text,
+	`facilities_received` text DEFAULT '[]',
 	`medical_info` text,
 	FOREIGN KEY (`user_id`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade
@@ -247,17 +324,22 @@ CREATE TABLE `student_parents` (
 --> statement-breakpoint
 CREATE TABLE `student_enrollments` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`school_id` integer DEFAULT 1 NOT NULL,
 	`student_id` integer NOT NULL,
 	`academic_year_id` integer NOT NULL,
 	`class_section_id` integer NOT NULL,
-	`school_id` integer DEFAULT 1 NOT NULL,
 	`roll_number` text,
 	`enrollment_date` text DEFAULT CURRENT_DATE,
 	`is_active` integer DEFAULT true NOT NULL,
+	`unenrollment_type` text,
+	`unenrollment_reason` text,
+	`unenrolled_at` text,
+	`unenrolled_by` integer,
+	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`student_id`) REFERENCES `students`(`user_id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`academic_year_id`) REFERENCES `academic_years`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`class_section_id`) REFERENCES `class_sections`(`id`) ON UPDATE no action ON DELETE cascade,
-	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade
+	FOREIGN KEY (`unenrolled_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
 CREATE TABLE `class_section_mappings` (
@@ -277,6 +359,7 @@ CREATE TABLE `fee_structures` (
 	`class_section_id` integer NOT NULL,
 	`fee_type` text NOT NULL,
 	`amount` integer NOT NULL,
+	`fee_month` text,
 	`due_date` text,
 	`is_mandatory` integer DEFAULT true NOT NULL,
 	`description` text,
@@ -285,6 +368,56 @@ CREATE TABLE `fee_structures` (
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`academic_year_id`) REFERENCES `academic_years`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`class_section_id`) REFERENCES `class_sections`(`id`) ON UPDATE no action ON DELETE cascade
+);
+--> statement-breakpoint
+CREATE TABLE `fee_concessions` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`school_id` integer DEFAULT 1 NOT NULL,
+	`enrollment_id` integer NOT NULL,
+	`fee_structure_id` integer,
+	`student_fee_assignment_id` integer,
+	`concession_type` text NOT NULL,
+	`concession_value` integer NOT NULL,
+	`reason` text NOT NULL,
+	`approved_by` integer NOT NULL,
+	`is_active` integer DEFAULT true NOT NULL,
+	`revoked_at` text,
+	`revoked_by` integer,
+	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`enrollment_id`) REFERENCES `student_enrollments`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`fee_structure_id`) REFERENCES `fee_structures`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`student_fee_assignment_id`) REFERENCES `student_fee_assignments`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`approved_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action,
+	FOREIGN KEY (`revoked_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action
+);
+--> statement-breakpoint
+CREATE INDEX `idx_concession_enrollment_fee` ON `fee_concessions` (`enrollment_id`,`fee_structure_id`,`is_active`);--> statement-breakpoint
+CREATE INDEX `idx_concession_enrollment_assignment` ON `fee_concessions` (`enrollment_id`,`student_fee_assignment_id`,`is_active`);--> statement-breakpoint
+CREATE TABLE `student_fee_assignments` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`school_id` integer DEFAULT 1 NOT NULL,
+	`enrollment_id` integer NOT NULL,
+	`academic_year_id` integer NOT NULL,
+	`fee_type` text NOT NULL,
+	`amount` integer NOT NULL,
+	`fee_month` text,
+	`due_date` text,
+	`description` text,
+	`is_mandatory` integer DEFAULT true NOT NULL,
+	`assigned_by` integer NOT NULL,
+	`is_cancelled` integer DEFAULT false NOT NULL,
+	`cancelled_at` text,
+	`cancelled_by` integer,
+	`cancellation_reason` text,
+	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
+	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`enrollment_id`) REFERENCES `student_enrollments`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`academic_year_id`) REFERENCES `academic_years`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`assigned_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action,
+	FOREIGN KEY (`cancelled_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
 CREATE TABLE `teacher_assignments` (
@@ -338,6 +471,7 @@ CREATE TABLE `attendances` (
 	`enrollment_id` integer NOT NULL,
 	`date` text NOT NULL,
 	`status` text DEFAULT 'PRESENT' NOT NULL,
+	`half_day_session` text,
 	`notes` text,
 	`marked_by` integer NOT NULL,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
@@ -351,7 +485,8 @@ CREATE TABLE `fee_payments` (
 	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
 	`school_id` integer DEFAULT 1 NOT NULL,
 	`enrollment_id` integer NOT NULL,
-	`fee_structure_id` integer NOT NULL,
+	`fee_structure_id` integer,
+	`student_fee_assignment_id` integer,
 	`amount_paid` integer NOT NULL,
 	`payment_date` text DEFAULT CURRENT_DATE NOT NULL,
 	`payment_method` text DEFAULT 'CASH' NOT NULL,
@@ -364,6 +499,7 @@ CREATE TABLE `fee_payments` (
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`enrollment_id`) REFERENCES `student_enrollments`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`fee_structure_id`) REFERENCES `fee_structures`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`student_fee_assignment_id`) REFERENCES `student_fee_assignments`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`recorded_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action
 );
 --> statement-breakpoint
@@ -376,6 +512,11 @@ CREATE TABLE `exams` (
 	`name` text NOT NULL,
 	`type` text NOT NULL,
 	`description` text,
+	`status` text DEFAULT 'SCHEDULED' NOT NULL,
+	`admit_card_published` integer DEFAULT false NOT NULL,
+	`report_card_published` integer DEFAULT false NOT NULL,
+	`admit_card_published_at` text,
+	`report_card_published_at` text,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade,
@@ -400,6 +541,21 @@ CREATE TABLE `exam_marks` (
 	FOREIGN KEY (`class_subject_id`) REFERENCES `class_subjects`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`enrollment_id`) REFERENCES `student_enrollments`(`id`) ON UPDATE no action ON DELETE cascade,
 	FOREIGN KEY (`entered_by`) REFERENCES `school_users`(`id`) ON UPDATE no action ON DELETE no action
+);
+--> statement-breakpoint
+CREATE TABLE `exam_subjects` (
+	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
+	`exam_id` integer NOT NULL,
+	`class_subject_id` integer NOT NULL,
+	`date` text NOT NULL,
+	`start_time` text,
+	`end_time` text,
+	`room_number` text,
+	`max_marks` integer NOT NULL,
+	`passing_marks` integer,
+	`subject_label` text,
+	FOREIGN KEY (`exam_id`) REFERENCES `exams`(`id`) ON UPDATE no action ON DELETE cascade,
+	FOREIGN KEY (`class_subject_id`) REFERENCES `class_subjects`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
 CREATE TABLE `assignments` (
@@ -447,23 +603,10 @@ CREATE TABLE `card_templates` (
 	`school_id` integer DEFAULT 1 NOT NULL,
 	`type` text NOT NULL,
 	`name` text NOT NULL,
+	`template_key` text,
 	`html_content` text NOT NULL,
 	`is_active` integer DEFAULT true NOT NULL,
 	`created_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	`updated_at` text DEFAULT CURRENT_TIMESTAMP NOT NULL,
 	FOREIGN KEY (`school_id`) REFERENCES `schools`(`id`) ON UPDATE no action ON DELETE cascade
-);
---> statement-breakpoint
-CREATE TABLE `exam_subjects` (
-	`id` integer PRIMARY KEY AUTOINCREMENT NOT NULL,
-	`exam_id` integer NOT NULL,
-	`class_subject_id` integer NOT NULL,
-	`date` text NOT NULL,
-	`start_time` text,
-	`end_time` text,
-	`room_number` text,
-	`max_marks` integer NOT NULL,
-	`passing_marks` integer,
-	FOREIGN KEY (`exam_id`) REFERENCES `exams`(`id`) ON UPDATE no action ON DELETE cascade,
-	FOREIGN KEY (`class_subject_id`) REFERENCES `class_subjects`(`id`) ON UPDATE no action ON DELETE cascade
 );

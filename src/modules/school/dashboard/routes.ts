@@ -97,7 +97,7 @@ schoolDashboardRouter.get(
         activeChildId
       );
 
-      console.log("Data:  ", data);
+      // console.log("Data:  ", data);
 
       return c.json(data);
     } catch (error: any) {

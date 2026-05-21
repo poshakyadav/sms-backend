@@ -59,16 +59,37 @@ export interface DashboardGrade {
   remarks?: string;
 }
 
+// ── NEW: Attendance coverage item (one row per active class-section) ──────────
+// Returned only for OWNER and MANAGEMENT personas.
+// Built with a single LEFT JOIN query — no N+1.
+export interface AttendanceCoverageItem {
+  classSectionId: number;
+  className: string;
+  sectionName: string;
+  /** True when at least one attendance record exists for today's date. */
+  isMarked: boolean;
+  /** Number of student attendance records entered today for this section. */
+  markedCount: number;
+  /** Total active enrollments in this section (for "X / Y students" display). */
+  totalEnrolled: number;
+}
+
 export interface DashboardStats {
   // Owner / Management
   totalStudents?: number;
   totalTeachers?: number;
   totalStaff?: number;
   currentEnrollments?: number;
-  feesCollected?: number;
-  feesPending?: number;
-  feeCollectionRate?: number;
+  // NOTE: feesCollected / feesPending / feeCollectionRate are intentionally
+  // OMITTED from the OWNER persona response — the owner has a dedicated fee
+  // dashboard at /school/fees/dashboard. Keeping them out here prevents
+  // duplication and avoids confusion.
   activeClassSections?: number;
+
+  // ── OWNER / MANAGEMENT: Attendance summary chips ──────────────────────────
+  // Rendered as a single "8 / 12 Sections" stat card above the coverage list.
+  sectionsMarkedToday?: number;
+  totalActiveSections?: number;
 
   // Teacher
   attendancesMarkedToday?: number;
@@ -81,9 +102,6 @@ export interface DashboardStats {
   attendancePercentage?: number;
   totalDaysTracked?: number;
   pendingAssignments?: number;
-
-  // Student only
-  // (uses shared fields above)
 
   // PARENT — child identity fields
   childName?: string;
@@ -107,6 +125,8 @@ export interface DashboardLists {
   recentNotifications?: DashboardNotification[];
   assignedClasses?: DashboardAssignedClass[];
   recentGrades?: DashboardGrade[];
+  // ── NEW: per-section attendance coverage (OWNER / MANAGEMENT only) ─────────
+  attendanceCoverage?: AttendanceCoverageItem[];
   [key: string]: any[] | undefined;
 }
 
@@ -183,18 +203,118 @@ async function fetchRecentNotifications(
     .all();
 }
 
+// ─── NEW: Attendance coverage fetcher ────────────────────────────────────────
+// Single round-trip query:
+//   1. All active class-sections (LEFT JOIN to get name parts)
+//   2. LEFT JOIN active enrollments → count totalEnrolled
+//   3. LEFT JOIN today's attendances → count markedCount
+// One GROUP BY gives us everything in a single pass.
+//
+// "isMarked" = markedCount > 0 (at least one student's attendance recorded).
+// This is intentional — a teacher who marks even one student has "started";
+// the markedCount / totalEnrolled ratio tells the owner how complete it is.
+
+async function fetchAttendanceCoverage(
+  db: any,
+  today: string // "YYYY-MM-DD"
+): Promise<AttendanceCoverageItem[]> {
+  // We use raw SQL via Drizzle's sql`` template for the conditional COUNT
+  // because Drizzle ORM doesn't expose CASE WHEN inside aggregate directly.
+  const rows: Array<{
+    classSectionId: number;
+    className: string;
+    sectionName: string;
+    totalEnrolled: number;
+    markedCount: number;
+  }> = await db
+    .select({
+      classSectionId: schoolClassSectionsSchema.id,
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
+      // Total active students enrolled in this section
+      totalEnrolled: sql<number>`
+        COUNT(DISTINCT ${schoolStudentEnrollmentsSchema.id})
+      `,
+      // Attendance records entered for THIS section on today's date
+      markedCount: sql<number>`
+        COUNT(DISTINCT CASE
+          WHEN ${schoolAttendancesSchema.date} = ${today}
+          THEN ${schoolAttendancesSchema.id}
+          ELSE NULL
+        END)
+      `,
+    })
+    .from(schoolClassSectionsSchema)
+    // Join class name
+    .innerJoin(
+      schoolClassesSchema,
+      eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id)
+    )
+    // Join section name
+    .innerJoin(
+      schoolSectionsSchema,
+      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+    )
+    // LEFT JOIN enrollments so sections with 0 students still appear
+    .leftJoin(
+      schoolStudentEnrollmentsSchema,
+      and(
+        eq(
+          schoolStudentEnrollmentsSchema.classSectionId,
+          schoolClassSectionsSchema.id
+        ),
+        eq(schoolStudentEnrollmentsSchema.isActive, true)
+      )
+    )
+    // LEFT JOIN attendances for today only (scoped via CASE WHEN above)
+    .leftJoin(
+      schoolAttendancesSchema,
+      eq(
+        schoolAttendancesSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    // Only active sections
+    .where(eq(schoolClassSectionsSchema.isActive, true))
+    // One row per class-section
+    .groupBy(
+      schoolClassSectionsSchema.id,
+      schoolClassesSchema.name,
+      schoolSectionsSchema.name
+    )
+    // Pending sections first (isMarked = false), then by class name
+    .orderBy(
+      sql`COUNT(DISTINCT CASE WHEN ${schoolAttendancesSchema.date} = ${today} THEN ${schoolAttendancesSchema.id} ELSE NULL END) = 0 DESC`,
+      schoolClassesSchema.name,
+      schoolSectionsSchema.name
+    )
+    .all();
+
+  return rows.map((row) => ({
+    classSectionId: row.classSectionId,
+    className: row.className,
+    sectionName: row.sectionName,
+    isMarked: row.markedCount > 0,
+    markedCount: row.markedCount,
+    totalEnrolled: row.totalEnrolled,
+  }));
+}
+
 // ─── OWNER / MANAGEMENT ───────────────────────────────────────────────────────
 
 async function buildOwnerManagementDashboard(
   db: any,
   persona: DashboardPersona
 ): Promise<DashboardData> {
+  const today = new Date().toISOString().slice(0, 10); // "YYYY-MM-DD"
+
   const currentYear = await db
     .select()
     .from(schoolAcademicYearsSchema)
     .where(eq(schoolAcademicYearsSchema.isCurrent, true))
     .get();
 
+  // ── Core counts ─────────────────────────────────────────────────────────
   const totalStudents =
     (
       await db
@@ -226,43 +346,6 @@ async function buildOwnerManagementDashboard(
       )?.count ?? 0
     : 0;
 
-  const feesCollected = currentYear
-    ? (
-        await db
-          .select({
-            total: sql<number>`coalesce(sum(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-          })
-          .from(schoolFeePaymentsSchema)
-          .innerJoin(
-            schoolStudentEnrollmentsSchema,
-            eq(
-              schoolFeePaymentsSchema.enrollmentId,
-              schoolStudentEnrollmentsSchema.id
-            )
-          )
-          .where(
-            eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id)
-          )
-          .get()
-      )?.total ?? 0
-    : 0;
-
-  const feesAssigned = currentYear
-    ? (
-        await db
-          .select({
-            total: sql<number>`coalesce(sum(${schoolFeeStructuresSchema.amount}), 0)`,
-          })
-          .from(schoolFeeStructuresSchema)
-          .where(eq(schoolFeeStructuresSchema.academicYearId, currentYear.id))
-          .get()
-      )?.total ?? 0
-    : 0;
-
-  const feesPending = Math.max(0, feesAssigned - feesCollected);
-  const feeCollectionRate =
-    feesAssigned > 0 ? Math.round((feesCollected / feesAssigned) * 100) : 0;
-
   const activeClassSections =
     (
       await db
@@ -272,7 +355,19 @@ async function buildOwnerManagementDashboard(
         .get()
     )?.count ?? 0;
 
+  // ── Attendance coverage (single query — see fetchAttendanceCoverage) ──────
+  const attendanceCoverage = await fetchAttendanceCoverage(db, today);
+
+  const sectionsMarkedToday = attendanceCoverage.filter(
+    (s) => s.isMarked
+  ).length;
+  const totalActiveSections = attendanceCoverage.length;
+
+  // ── Notifications ─────────────────────────────────────────────────────────
   const recentNotifications = await fetchRecentNotifications(db);
+
+  // NOTE: feesCollected / feesPending / feeCollectionRate intentionally
+  // excluded — owner has a dedicated /school/fees/dashboard for those.
 
   return {
     persona,
@@ -280,12 +375,14 @@ async function buildOwnerManagementDashboard(
       totalStudents,
       totalTeachers,
       currentEnrollments,
-      feesCollected,
-      feesPending,
-      feeCollectionRate,
       activeClassSections,
+      sectionsMarkedToday,
+      totalActiveSections,
     },
-    lists: { recentNotifications },
+    lists: {
+      recentNotifications,
+      attendanceCoverage,
+    },
   };
 }
 
@@ -515,7 +612,6 @@ async function buildParentDashboard(
   parentUserId: number,
   activeChildId: number | null
 ): Promise<DashboardData> {
-  // ── Guard: no child selected ─────────────────────────────────────────────
   if (!activeChildId) {
     const recentNotifications = await fetchRecentNotifications(db);
     return {
@@ -525,9 +621,7 @@ async function buildParentDashboard(
     };
   }
 
-  // ── Security: verify parent↔child link ──────────────────────────────────
-  // student_parents.parent_id = parents.user_id = school_users.id (parentUserId)
-  // student_parents.student_id = students.user_id = school_users.id (activeChildId)
+  // Security: verify parent↔child link
   const link = await db
     .select({ id: studentParentsSchema.id })
     .from(studentParentsSchema)
@@ -551,7 +645,6 @@ async function buildParentDashboard(
     };
   }
 
-  // ── Fetch child's school_users row (name, avatar, gender, blood group) ───
   const childUser = await db
     .select({
       name: schoolUsersSchema.name,
@@ -564,7 +657,6 @@ async function buildParentDashboard(
     .where(eq(schoolUsersSchema.id, activeChildId))
     .get();
 
-  // ── Fetch child's student-profile row (admissionDate, medicalInfo, etc.) ─
   const studentProfile = await db
     .select({
       admissionDate: studentsSchema.admissionDate,
@@ -575,7 +667,6 @@ async function buildParentDashboard(
     .where(eq(studentsSchema.userId, activeChildId))
     .get();
 
-  // ── Fetch current academic year ──────────────────────────────────────────
   const currentYear = await db
     .select()
     .from(schoolAcademicYearsSchema)
@@ -584,7 +675,6 @@ async function buildParentDashboard(
 
   const recentNotifications = await fetchRecentNotifications(db);
 
-  // Base stats available even without enrollment
   const baseStats: DashboardStats = {
     childName: childUser?.name ?? undefined,
     childAvatarUrl: childUser?.avatarUrl || undefined,
@@ -601,7 +691,6 @@ async function buildParentDashboard(
     };
   }
 
-  // ── Fetch child's active enrollment ─────────────────────────────────────
   const enrollment = await db
     .select({
       enrollmentId: schoolStudentEnrollmentsSchema.id,
@@ -643,7 +732,6 @@ async function buildParentDashboard(
     };
   }
 
-  // ── Attendance ───────────────────────────────────────────────────────────
   const totalDays =
     (
       await db
@@ -675,7 +763,6 @@ async function buildParentDashboard(
   const attendancePercentage =
     totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 0;
 
-  // ── Fees ─────────────────────────────────────────────────────────────────
   const totalDue =
     (
       await db
@@ -710,7 +797,6 @@ async function buildParentDashboard(
 
   const feesPending = Math.max(0, totalDue - totalPaid);
 
-  // ── Pending assignments ──────────────────────────────────────────────────
   const pendingAssignments =
     (
       await db
@@ -728,7 +814,6 @@ async function buildParentDashboard(
         .get()
     )?.count ?? 0;
 
-  // ── Recent grades ────────────────────────────────────────────────────────
   const recentGrades: DashboardGrade[] = await db
     .select({
       examName: schoolExamsSchema.name,

@@ -1,3 +1,5 @@
+// src/modules/school/attendance/routes.ts
+
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
@@ -7,33 +9,82 @@ import {
   schoolTokenValidationMiddleware,
 } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
-import { SchoolRole } from "../../../types/school-role";
+import {
+  ALL_ATTENDANCE_STATUSES,
+  AttendanceStatus,
+  HalfDaySession,
+} from "../../../db/schemas/school/school-attendances";
 import {
   markAttendance,
   getAttendanceByStudent,
-  getAttendanceByClass,
   getAttendanceReport,
   getAttendanceSummaryForParentChild,
   getAttendanceForParentChildView,
   getAttendanceSummaryForStudent,
   getAttendanceByStudentSelf,
+  getAttendanceByClassSection,
 } from "./services";
 
 const attendanceRouter = new Hono<SchoolEnv>();
 
 attendanceRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
 
-// ==================== Mark Attendance (Batch for Class/Section) ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// SHARED SCHEMAS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Zod enum built directly from the canonical status tuple.
+ * Adding a new status to AttendanceStatus auto-expands this validator —
+ * no need to update routes separately.
+ */
+const attendanceStatusEnum = z.enum(ALL_ATTENDANCE_STATUSES);
+
+/**
+ * Per-student record within a batch mark request.
+ * halfDaySession is required when status === HALF_DAY; validated with .superRefine.
+ */
+const attendanceRecordSchema = z
+  .object({
+    studentId: z.number().int().positive(),
+    status: attendanceStatusEnum,
+    halfDaySession: z
+      .enum([HalfDaySession.MORNING, HalfDaySession.AFTERNOON])
+      .optional(),
+    notes: z.string().max(500).optional(),
+  })
+  .superRefine((val, ctx) => {
+    if (val.status === AttendanceStatus.HALF_DAY && !val.halfDaySession) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["halfDaySession"],
+        message:
+          "halfDaySession (MORNING or AFTERNOON) is required when status is HALF_DAY",
+      });
+    }
+    if (val.status !== AttendanceStatus.HALF_DAY && val.halfDaySession) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["halfDaySession"],
+        message: "halfDaySession must be omitted when status is not HALF_DAY",
+      });
+    }
+  });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /school/attendance — Mark Attendance (Batch for a Class-Section)
+//
+// Permission : attendance.mark
+// Used by    : Teachers, Class Teachers, Admin
+// Notes      : Uses upsert pattern so corrections are allowed after initial marking.
+//              HOLIDAY and ON_DUTY rows can be created here too — the service
+//              handles them identically (stores the status, no special logic needed
+//              at the route layer).
+// ─────────────────────────────────────────────────────────────────────────────
 const markAttendanceSchema = z.object({
-  date: z.string().date(), // "2026-02-14"
-  classSectionId: z.number(),
-  attendances: z.array(
-    z.object({
-      studentId: z.number(),
-      status: z.enum(["PRESENT", "ABSENT", "LATE", "HALF_DAY"]),
-      notes: z.string().optional(),
-    })
-  ),
+  date: z.string().date(), // "YYYY-MM-DD"
+  classSectionId: z.number().int().positive(),
+  attendances: z.array(attendanceRecordSchema).min(1),
 });
 
 attendanceRouter.post(
@@ -47,7 +98,6 @@ attendanceRouter.post(
       const schoolCode = c.get("schoolCode")!;
 
       const result = await markAttendance(c.env, schoolCode, data, user.id);
-
       return c.json(result, 201);
     } catch (error: any) {
       console.error("Attendance marking error:", error);
@@ -56,9 +106,14 @@ attendanceRouter.post(
   }
 );
 
-// ==================== Get Attendance by Student ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/student — Get Attendance by Student (Staff view)
+//
+// Permission : attendance.student.view   (staff version — any student)
+// Query      : studentId, fromDate, toDate
+// ─────────────────────────────────────────────────────────────────────────────
 const studentAttendanceSchema = z.object({
-  studentId: z.coerce.number(),
+  studentId: z.coerce.number().int().positive(),
   fromDate: z.string().date(),
   toDate: z.string().date(),
 });
@@ -79,7 +134,6 @@ attendanceRouter.get(
         fromDate,
         toDate
       );
-
       return c.json({ attendance });
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -87,12 +141,69 @@ attendanceRouter.get(
   }
 );
 
-// ==================== Get Attendance by Class/Section/Date ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/class — Full Class Sheet for a Date (Teacher view)
+//
+// Permission : attendance.mark
+// Query      : classSectionId, date
+//
+// UPDATED RESPONSE SHAPE (breaking change from old shape):
+//
+//   {
+//     session: {
+//       date: "2026-05-10",
+//       classSectionId: 12,
+//       isFullyMarked: false,       ← true only when every student has a record
+//       isPartiallyMarked: true,    ← true when ≥1 but not all students are marked
+//       markedCount: 18,
+//       totalCount: 42,
+//       lastMarkedBy: {
+//         userId: 7,
+//         name: "Priya Sharma"
+//       },
+//       lastUpdatedAt: "2026-05-10T08:32:14.000Z"
+//     },
+//     students: [
+//       {
+//         enrollmentId: 101,
+//         studentId: 55,
+//         studentName: "Aarav Singh",
+//         rollNumber: "3",
+//         avatarUrl: null,
+//         attendanceRecord: {          ← null when not yet marked for this date
+//           id: 2001,
+//           status: "PRESENT",
+//           halfDaySession: null,
+//           notes: null,
+//           markedBy: 7,
+//           markedByName: "Priya Sharma",
+//           updatedAt: "2026-05-10T08:32:14.000Z"
+//         }
+//       },
+//       {
+//         enrollmentId: 102,
+//         studentId: 56,
+//         studentName: "Diya Patel",
+//         rollNumber: "4",
+//         avatarUrl: null,
+//         attendanceRecord: null       ← not yet marked — default to PRESENT on frontend
+//       },
+//       ...
+//     ]
+//   }
+//
+// Frontend contract:
+//   1. Check session.isFullyMarked / isPartiallyMarked to show the status banner.
+//   2. Students with attendanceRecord === null have not been marked yet.
+//      Default their status to PRESENT in the form before the teacher submits.
+//   3. Students with attendanceRecord !== null show their existing status.
+//      Teacher can still edit (form is pre-populated).
+// ─────────────────────────────────────────────────────────────────────────────
 const classAttendanceSchema = z.object({
-  classSectionId: z.coerce.number(),
+  classSectionId: z.coerce.number().int().positive(),
   date: z.string().date(),
 });
-
+ 
 attendanceRouter.get(
   "/class",
   requirePermission("attendance.mark"),
@@ -101,25 +212,36 @@ attendanceRouter.get(
     try {
       const { classSectionId, date } = c.req.valid("query");
       const schoolCode = c.get("schoolCode")!;
-
-      const attendance = await getAttendanceByClass(
+ 
+      const result = await getAttendanceByClassSection(
         c.env,
         schoolCode,
         classSectionId,
         date
       );
-      return c.json({ attendance });
+ 
+      // result already has the shape { session, students }
+      return c.json(result);
     } catch (error: any) {
+      console.error("Get class attendance error:", error);
       return c.json({ error: error.message }, 400);
     }
   }
 );
 
-// ==================== Get Attendance Report (Monthly/Yearly Summary) ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/report — Monthly / Yearly Summary (Staff view)
+//
+// Permission : attendance.report
+// Query      : classSectionId?, month, year
+//
+// Returns per-student breakdown with all nine status counts + derived
+// percentage using the production-grade formula (neutral statuses excluded
+// from denominator).
+// ─────────────────────────────────────────────────────────────────────────────
 const reportSchema = z.object({
-  classSectionId: z.coerce.number().optional(),
-  // studentId: z.coerce.number().optional(),
-  month: z.coerce.number().min(1).max(12).optional(), // For monthly report
+  classSectionId: z.coerce.number().int().positive().optional(),
+  month: z.coerce.number().min(1).max(12).optional(),
   year: z.coerce.number().min(2000).max(2100).optional(),
 });
 
@@ -134,7 +256,6 @@ attendanceRouter.get(
       console.log("Generating attendance report with params:", data);
 
       const report = await getAttendanceReport(c.env, schoolCode, data);
-
       return c.json({ report });
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -142,7 +263,12 @@ attendanceRouter.get(
   }
 );
 
-// ==================== STUDENT: View Own Attendance (date range) ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/me — Student: Own Attendance (date range)
+//
+// Permission : attendance.student.view
+// JWT userId : used directly — no override possible.
+// ─────────────────────────────────────────────────────────────────────────────
 const studentSelfAttendanceSchema = z.object({
   fromDate: z.string().date(),
   toDate: z.string().date(),
@@ -161,11 +287,10 @@ attendanceRouter.get(
       const attendance = await getAttendanceByStudentSelf(
         c.env,
         schoolCode,
-        user.id, // JWT userId — authoritative
+        user.id,
         fromDate,
         toDate
       );
-
       return c.json({ attendance });
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -173,7 +298,11 @@ attendanceRouter.get(
   }
 );
 
-// ==================== STUDENT: Monthly Summary ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/me/summary — Student: Monthly Summary
+//
+// Permission : attendance.student.view
+// ─────────────────────────────────────────────────────────────────────────────
 const studentSummarySchema = z.object({
   month: z.coerce.number().min(1).max(12),
   year: z.coerce.number().min(2000).max(2100),
@@ -196,7 +325,6 @@ attendanceRouter.get(
         month,
         year
       );
-
       return c.json({ summary });
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
@@ -204,7 +332,13 @@ attendanceRouter.get(
   }
 );
 
-// ==================== PARENT: View Child's Attendance (date range) ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/child — Parent: View Child's Attendance (date range)
+//
+// Permission : attendance.parent.view
+// Security   : parentId from JWT + childStudentId from X-Active-Child-Id header.
+//              Parent–child link is verified in the service layer.
+// ─────────────────────────────────────────────────────────────────────────────
 const parentChildAttendanceSchema = z.object({
   fromDate: z.string().date(),
   toDate: z.string().date(),
@@ -220,7 +354,6 @@ attendanceRouter.get(
       const user = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
 
-      // X-Active-Child-Id is injected by the frontend auth-interceptor for STUDENT_PARENT role
       const activeChildIdHeader = c.req.header("X-Active-Child-Id");
       if (!activeChildIdHeader) {
         return c.json({ error: "No active child selected" }, 400);
@@ -233,12 +366,11 @@ attendanceRouter.get(
       const attendance = await getAttendanceForParentChildView(
         c.env,
         schoolCode,
-        user.id, // parentUserId from JWT
-        childStudentId, // from X-Active-Child-Id (security-verified in service)
+        user.id,
+        childStudentId,
         fromDate,
         toDate
       );
-
       return c.json({ attendance });
     } catch (error: any) {
       const status = error.message?.includes("Unauthorized") ? 403 : 400;
@@ -247,7 +379,11 @@ attendanceRouter.get(
   }
 );
 
-// ==================== PARENT: Child's Monthly Summary ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/child/summary — Parent: Child's Monthly Summary
+//
+// Permission : attendance.parent.view
+// ─────────────────────────────────────────────────────────────────────────────
 const parentSummarySchema = z.object({
   month: z.coerce.number().min(1).max(12),
   year: z.coerce.number().min(2000).max(2100),
@@ -280,7 +416,6 @@ attendanceRouter.get(
         month,
         year
       );
-
       return c.json({ summary });
     } catch (error: any) {
       const status = error.message?.includes("Unauthorized") ? 403 : 400;

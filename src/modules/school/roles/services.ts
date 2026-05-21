@@ -135,14 +135,16 @@ async function createRoleInTx(
 }
 
 // ==================== GET ALL ROLES ====================
+// ==================== GET ALL ROLES ====================
 export async function getAllRoles(
   env: SchoolEnv["Bindings"],
-  schoolCode: string
+  schoolCode: string,
+  category?: "staff" | "student" | "parent"
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  // UPDATED: Include `category` in the select
-  const roles = await db
+  // Build base query — filter by category when provided
+  const rolesQuery = db
     .select({
       id: schoolRolesSchema.id,
       name: schoolRolesSchema.name,
@@ -152,12 +154,15 @@ export async function getAllRoles(
       createdAt: schoolRolesSchema.createdAt,
     })
     .from(schoolRolesSchema)
-    .orderBy(schoolRolesSchema.name)
-    .all();
+    .orderBy(schoolRolesSchema.name);
+
+  const roles = category
+    ? await rolesQuery.where(eq(schoolRolesSchema.category, category)).all()
+    : await rolesQuery.all();
 
   if (roles.length === 0) return [];
 
-  // Fetch permissions for all roles
+  // Fetch permissions for the returned roles
   const roleIds = roles.map((r) => r.id);
 
   const permissionsData = await db

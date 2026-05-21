@@ -1,5 +1,7 @@
+// src/modules/school/attendance/services.ts
+
 import { getSchoolDB } from "../../../db/school-client";
-import { and, eq, gte, lte, sql } from "drizzle-orm";
+import { and, eq, gte, inArray, lte, sql } from "drizzle-orm";
 import {
   schoolAcademicYearsSchema,
   schoolAttendancesSchema,
@@ -8,26 +10,95 @@ import {
   studentParentsSchema,
 } from "../../../db/schemas/school";
 import { SchoolEnv } from "../../../types/common-types";
+import {
+  AttendanceStatus,
+  AttendanceStatusValue,
+  NEUTRAL_STATUSES,
+} from "../../../db/schemas/school/school-attendances";
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ATTENDANCE PERCENTAGE HELPER
+//
+// Formula:
+//   effectivePresent = PRESENT + LATE + (HALF_DAY × 0.5)
+//   workingDays      = total records - HOLIDAY - EXCUSED - ON_DUTY
+//   percentage       = (effectivePresent / workingDays) × 100
+//
+// SICK and SUSPENDED count as absent — they reduce the percentage like ABSENT
+// does but are tracked as separate buckets for medical and discipline reports.
+//
+// HOLIDAY, EXCUSED, ON_DUTY are excluded from the denominator so the student
+// is not penalised for school-approved or school-declared non-attendance.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface StatusCounts {
+  present: number;
+  late: number;
+  halfDay: number;
+  absent: number;
+  sick: number;
+  suspended: number;
+  excused: number;
+  holiday: number;
+  onDuty: number;
+}
 
 /**
- * MARK ATTENDANCE (Batch with Upsert)
- *
- * Purpose: Teacher marks attendance for an entire class-section on a specific date.
- *          Uses upsert pattern so teachers can correct mistakes later.
- *
- * How it works:
- * 1. Validates classSectionId exists
- * 2. For each student: finds enrollment via classSectionId
- * 3. Inserts new record or updates existing one
- *
- * @param data.classSectionId - Required
- * @param data.attendances - Array of {studentId, status, notes?}
- * @returns Success message with counts
+ * Derives the final attendance percentage and working-day count from raw
+ * per-status counts. Centralised here so every summary endpoint uses the
+ * exact same formula.
  */
+function deriveAttendanceStats(counts: StatusCounts) {
+  const effectivePresent = counts.present + counts.late + counts.halfDay * 0.5;
+
+  // Days the student was genuinely expected to be present
+  const workingDays =
+    counts.present +
+    counts.late +
+    counts.halfDay +
+    counts.absent +
+    counts.sick +
+    counts.suspended;
+  // EXCUSED, HOLIDAY, ON_DUTY deliberately excluded from denominator
+
+  const totalMarkedDays =
+    workingDays + counts.excused + counts.holiday + counts.onDuty;
+
+  const attendancePercentage =
+    workingDays > 0
+      ? Math.round((effectivePresent / workingDays) * 100 * 10) / 10 // one decimal
+      : 0;
+
+  return {
+    effectivePresent,
+    workingDays,
+    totalMarkedDays,
+    attendancePercentage,
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MARK ATTENDANCE (Batch with Upsert)
+//
+// Purpose : Teacher marks attendance for an entire class-section on one date.
+//           Uses upsert pattern so teachers can correct mistakes later.
+//
+// Supports all nine AttendanceStatus values including halfDaySession detail.
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function markAttendance(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
-  data: any,
+  data: {
+    date: string;
+    classSectionId: number;
+    attendances: Array<{
+      studentId: number;
+      status: AttendanceStatusValue;
+      halfDaySession?: "MORNING" | "AFTERNOON";
+      notes?: string;
+    }>;
+  },
   markedBy: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
@@ -53,10 +124,11 @@ export async function markAttendance(
         )
         .get();
 
-      if (!enrollment)
+      if (!enrollment) {
         throw new Error(
           `No active enrollment found for student ${att.studentId} in this class-section`
         );
+      }
 
       const existing = await tx
         .select()
@@ -73,7 +145,8 @@ export async function markAttendance(
         enrollmentId: enrollment.id,
         date: data.date,
         status: att.status,
-        notes: att.notes || null,
+        halfDaySession: att.halfDaySession ?? null,
+        notes: att.notes ?? null,
         markedBy,
         updatedAt: sql`CURRENT_TIMESTAMP`,
       };
@@ -98,12 +171,10 @@ export async function markAttendance(
   });
 }
 
-/**
- * GET ATTENDANCE BY STUDENT
- *
- * Purpose: Returns full attendance history for one student between two dates.
- * Used by student/parent dashboard and teacher reports.
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE BY STUDENT (Staff view — any student, date range)
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getAttendanceByStudent(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -118,6 +189,7 @@ export async function getAttendanceByStudent(
       id: schoolAttendancesSchema.id,
       date: schoolAttendancesSchema.date,
       status: schoolAttendancesSchema.status,
+      halfDaySession: schoolAttendancesSchema.halfDaySession,
       notes: schoolAttendancesSchema.notes,
       markedBy: schoolAttendancesSchema.markedBy,
       createdAt: schoolAttendancesSchema.createdAt,
@@ -141,75 +213,272 @@ export async function getAttendanceByStudent(
     .orderBy(schoolAttendancesSchema.date);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPES FOR getAttendanceByClassSection RESPONSE
+// ─────────────────────────────────────────────────────────────────────────────
+ 
 /**
- * GET ATTENDANCE BY CLASS-SECTION & DATE
+ * Per-student row returned by getAttendanceByClassSection.
  *
- * Purpose: Shows full class attendance sheet for one date (teacher view).
+ * attendanceRecord is null when no attendance has been marked for
+ * this student on this date — this is the "unmarked" sentinel.
  */
-export async function getAttendanceByClass(
+export interface ClassAttendanceStudentRow {
+  // Enrollment identity
+  enrollmentId: number;
+  studentId: number;
+  studentName: string;
+  rollNumber: string | null;
+  avatarUrl: string | null;
+ 
+  // Today's attendance record (null = not yet marked for this student)
+  attendanceRecord: {
+    id: number;
+    status: AttendanceStatusValue;
+    halfDaySession: "MORNING" | "AFTERNOON" | null;
+    notes: string | null;
+    markedBy: number;
+    markedByName: string;
+    updatedAt: string;
+  } | null;
+}
+ 
+/**
+ * Session-level metadata returned alongside the student rows.
+ *
+ * isMarked = true only when EVERY active enrolled student has a record for
+ * this date. Partial marking is surfaced separately via markedCount / totalCount.
+ *
+ * This is the single field the frontend checks to render "✓ Attendance marked"
+ * or "⚠ Attendance not marked yet" on the teacher's class sheet header.
+ */
+export interface ClassAttendanceSessionMeta {
+  /** Date this metadata describes ("YYYY-MM-DD") */
+  date: string;
+  /** classSectionId this metadata describes */
+  classSectionId: number;
+ 
+  /**
+   * True only when every enrolled student has an attendance record for this date.
+   * Partial marking → false; teacher should re-open the sheet to complete it.
+   */
+  isFullyMarked: boolean;
+ 
+  /**
+   * True when at least one student has a record for this date (partial or full).
+   * Lets the frontend distinguish "never opened" vs "started but not finished".
+   */
+  isPartiallyMarked: boolean;
+ 
+  /** How many students have a record for this date */
+  markedCount: number;
+ 
+  /** Total active enrolled students in this class-section */
+  totalCount: number;
+ 
+  /**
+   * The teacher who last created or updated any attendance record for this date.
+   * Null when isPartiallyMarked is false (no records exist at all).
+   */
+  lastMarkedBy: {
+    userId: number;
+    name: string;
+  } | null;
+ 
+  /**
+   * ISO timestamp of the most recent INSERT or UPDATE among all records for
+   * this date in this class-section. Null when no records exist.
+   * Displayed as "Last updated at HH:mm" on the sheet header.
+   */
+  lastUpdatedAt: string | null;
+}
+ 
+/**
+ * Full response shape from getAttendanceByClassSection.
+ */
+export interface ClassAttendanceResponse {
+  session: ClassAttendanceSessionMeta;
+  students: ClassAttendanceStudentRow[];
+}
+ 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE BY CLASS-SECTION & DATE (Teacher class-sheet view)
+//
+// PRODUCTION-GRADE REWRITE:
+//
+//   Previously this function only returned rows that ALREADY HAD attendance
+//   records (inner join). The frontend had to make a second API call to get
+//   enrolled students and merge them manually.
+//
+//   Now this function:
+//     1. Fetches ALL active enrollments for the class-section.
+//     2. LEFT JOINs attendance records for the requested date.
+//     3. JOINs the marking teacher's name onto each attendance row.
+//     4. Computes session-level metadata (isFullyMarked, markedCount,
+//        lastMarkedBy, lastUpdatedAt) in the same DB round-trip.
+//     5. Returns a single response — no second API call needed.
+//
+//   This approach ensures:
+//     • Students with no record for the date appear as attendanceRecord: null
+//       (the frontend defaults them to PRESENT before the teacher submits).
+//     • The session banner shows correct marking status immediately on page load.
+//     • One DB connection round-trip total (two queries: enrollments + metadata).
+// ─────────────────────────────────────────────────────────────────────────────
+ 
+export async function getAttendanceByClassSection(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   classSectionId: number,
   date: string
-) {
+): Promise<ClassAttendanceResponse> {
   const db = await getSchoolDB(env, schoolCode);
-
-  return await db
+ 
+  // ── Query 1: All active enrollments + LEFT JOIN their attendance for this date ──
+  // We alias schoolUsersSchema twice — once for the student, once for the teacher
+  // who marked the record. Drizzle doesn't support self-join aliases natively,
+  // so we use a raw sql sub-select for the teacher name to keep the query clean.
+ 
+  const rows = await db
     .select({
-      id: schoolAttendancesSchema.id,
+      // Enrollment fields
+      enrollmentId: schoolStudentEnrollmentsSchema.id,
       studentId: schoolStudentEnrollmentsSchema.studentId,
       studentName: schoolUsersSchema.name,
       rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
+      avatarUrl: schoolUsersSchema.avatarUrl,
+ 
+      // Attendance fields (null when no record for this date)
+      attendanceId: schoolAttendancesSchema.id,
       status: schoolAttendancesSchema.status,
+      halfDaySession: schoolAttendancesSchema.halfDaySession,
       notes: schoolAttendancesSchema.notes,
       markedBy: schoolAttendancesSchema.markedBy,
+      updatedAt: schoolAttendancesSchema.updatedAt,
+ 
+      // Teacher name resolved via correlated sub-query
+      // (avoids a second self-join on schoolUsersSchema)
+      markedByName: sql<string>`(
+        SELECT su.name
+        FROM school_users su
+        WHERE su.id = ${schoolAttendancesSchema.markedBy}
+      )`.as("marked_by_name"),
     })
-    .from(schoolAttendancesSchema)
-    .innerJoin(
-      schoolStudentEnrollmentsSchema,
-      eq(
-        schoolAttendancesSchema.enrollmentId,
-        schoolStudentEnrollmentsSchema.id
-      )
-    )
+    .from(schoolStudentEnrollmentsSchema)
     .innerJoin(
       schoolUsersSchema,
       eq(schoolStudentEnrollmentsSchema.studentId, schoolUsersSchema.id)
     )
-    .where(
+    .leftJoin(
+      schoolAttendancesSchema,
       and(
-        eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId),
+        eq(
+          schoolAttendancesSchema.enrollmentId,
+          schoolStudentEnrollmentsSchema.id
+        ),
         eq(schoolAttendancesSchema.date, date)
       )
     )
-    .orderBy(schoolStudentEnrollmentsSchema.rollNumber);
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId),
+        eq(schoolStudentEnrollmentsSchema.isActive, true)
+      )
+    )
+    .orderBy(
+      // Numeric roll number sort (students without roll number sort last)
+      sql`CASE WHEN ${schoolStudentEnrollmentsSchema.rollNumber} IS NULL THEN 1 ELSE 0 END`,
+      sql`CAST(${schoolStudentEnrollmentsSchema.rollNumber} AS INTEGER)`,
+      schoolUsersSchema.name
+    );
+ 
+  // ── Build student rows ────────────────────────────────────────────────────
+ 
+  const students: ClassAttendanceStudentRow[] = rows.map((row) => ({
+    enrollmentId: row.enrollmentId,
+    studentId: row.studentId,
+    studentName: row.studentName,
+    rollNumber: row.rollNumber ?? null,
+    avatarUrl: row.avatarUrl ?? null,
+ 
+    attendanceRecord:
+      row.attendanceId != null
+        ? {
+            id: row.attendanceId,
+            status: row.status as AttendanceStatusValue,
+            halfDaySession: (row.halfDaySession as "MORNING" | "AFTERNOON") ?? null,
+            notes: row.notes ?? null,
+            markedBy: row.markedBy!,
+            markedByName: row.markedByName ?? "Unknown",
+            updatedAt: row.updatedAt!,
+          }
+        : null,
+  }));
+ 
+  // ── Compute session metadata from the already-fetched rows ───────────────
+  // No extra DB query needed — we derive everything from `rows` in JS.
+ 
+  const totalCount = rows.length;
+  const markedRows = rows.filter((r) => r.attendanceId != null);
+  const markedCount = markedRows.length;
+ 
+  const isFullyMarked = totalCount > 0 && markedCount === totalCount;
+  const isPartiallyMarked = markedCount > 0 && markedCount < totalCount;
+ 
+  // Find the most recently updated record across all marked rows
+  let lastUpdatedAt: string | null = null;
+  let lastMarkedByUserId: number | null = null;
+  let lastMarkedByName: string | null = null;
+ 
+  for (const r of markedRows) {
+    // updatedAt is an ISO string; lexicographic comparison is safe for ISO dates
+    if (r.updatedAt != null) {
+      if (lastUpdatedAt === null || r.updatedAt > lastUpdatedAt) {
+        lastUpdatedAt = r.updatedAt;
+        lastMarkedByUserId = r.markedBy ?? null;
+        lastMarkedByName = r.markedByName ?? null;
+      }
+    }
+  }
+ 
+  const session: ClassAttendanceSessionMeta = {
+    date,
+    classSectionId,
+    isFullyMarked,
+    isPartiallyMarked,
+    markedCount,
+    totalCount,
+    lastMarkedBy:
+      lastMarkedByUserId != null
+        ? { userId: lastMarkedByUserId, name: lastMarkedByName ?? "Unknown" }
+        : null,
+    lastUpdatedAt,
+  };
+ 
+  return { session, students };
 }
 
-/**
- * GET ATTENDANCE REPORT (Monthly Summary)
- *
- * Purpose: Generates monthly attendance percentage report for a class-section or single student.
- * Includes present/absent/late/half-day counts and percentage.
- *
- * @param data.classSectionId or data.studentId + month/year
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE REPORT (Monthly Summary — Staff view)
+//
+// Returns a row per student with all nine status counts + the derived
+// attendance percentage using the production-grade formula.
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getAttendanceReport(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
-  data: any
+  data: { classSectionId?: number; month?: number; year?: number }
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  const year = data.year || new Date().getFullYear();
+  const year = data.year ?? new Date().getFullYear();
   const month = data.month;
   if (!month) throw new Error("Month is required for attendance report");
 
   const datePattern = `${year}-${month.toString().padStart(2, "0")}-%`;
   const totalDaysInMonth = new Date(year, month, 0).getDate();
 
-  // ── Resolve current academic year for scoping ─────────────────────────────
-  // Without this, students from past years enrolled in the same class-section
-  // would appear in the report. We scope to the active academic year only.
+  // Scope to active academic year so past-year enrollments don't bleed in
   const currentYear = await db
     .select({ id: schoolAcademicYearsSchema.id })
     .from(schoolAcademicYearsSchema)
@@ -220,39 +489,57 @@ export async function getAttendanceReport(
 
   const enrollmentWhere = [
     eq(schoolStudentEnrollmentsSchema.isActive, true),
-    eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id), // ← NEW: scope to current year
+    eq(schoolStudentEnrollmentsSchema.academicYearId, currentYear.id),
   ];
 
-  if (data.classSectionId)
+  if (data.classSectionId) {
     enrollmentWhere.push(
       eq(schoolStudentEnrollmentsSchema.classSectionId, data.classSectionId)
     );
-  if (data.studentId)
-    enrollmentWhere.push(
-      eq(schoolStudentEnrollmentsSchema.studentId, data.studentId)
-    );
+  }
 
   const reportData = await db
     .select({
       studentId: schoolStudentEnrollmentsSchema.studentId,
       studentName: schoolUsersSchema.name,
-      rollNumber: schoolStudentEnrollmentsSchema.rollNumber, // ← NEW: include roll number for sorting
-      totalDays: sql<number>`${totalDaysInMonth}`.as("total_days"),
-      present:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'PRESENT' THEN 1 END)`.as(
-          "present"
-        ),
-      absent:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'ABSENT' THEN 1 END)`.as(
-          "absent"
-        ),
-      late: sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'LATE' THEN 1 END)`.as(
-        "late"
-      ),
-      halfDay:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'HALF_DAY' THEN 1 END)`.as(
-          "half_day"
-        ),
+      rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
+
+      // ── All nine status buckets ────────────────────────────────────────────
+      present: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.PRESENT} THEN 1 END)
+      `.as("present"),
+
+      late: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.LATE} THEN 1 END)
+      `.as("late"),
+
+      halfDay: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.HALF_DAY} THEN 1 END)
+      `.as("half_day"),
+
+      absent: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.ABSENT} THEN 1 END)
+      `.as("absent"),
+
+      sick: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.SICK} THEN 1 END)
+      `.as("sick"),
+
+      suspended: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.SUSPENDED} THEN 1 END)
+      `.as("suspended"),
+
+      excused: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.EXCUSED} THEN 1 END)
+      `.as("excused"),
+
+      holiday: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.HOLIDAY} THEN 1 END)
+      `.as("holiday"),
+
+      onDuty: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.ON_DUTY} THEN 1 END)
+      `.as("on_duty"),
     })
     .from(schoolStudentEnrollmentsSchema)
     .innerJoin(
@@ -273,41 +560,60 @@ export async function getAttendanceReport(
     .groupBy(
       schoolStudentEnrollmentsSchema.studentId,
       schoolUsersSchema.name,
-      schoolStudentEnrollmentsSchema.rollNumber // ← group by roll number too
+      schoolStudentEnrollmentsSchema.rollNumber
     )
     .orderBy(
-      // ── Sort by roll number when a class-section is selected, else by name ──
       data.classSectionId
         ? sql`CAST(${schoolStudentEnrollmentsSchema.rollNumber} AS INTEGER)`
         : schoolUsersSchema.name
     );
 
-  return reportData.map((row: any) => ({
-    studentId: row.studentId,
-    studentName: row.studentName,
-    rollNumber: row.rollNumber ?? null, // ← NEW: expose to frontend
-    totalDays: row.totalDays,
-    present: row.present || 0,
-    absent: row.absent || 0,
-    late: row.late || 0,
-    halfDay: row.halfDay || 0,
-    attendancePercentage:
-      row.totalDays > 0 ? Math.round((row.present / row.totalDays) * 100) : 0,
-  }));
+  return reportData.map((row: any) => {
+    const counts: StatusCounts = {
+      present: row.present || 0,
+      late: row.late || 0,
+      halfDay: row.halfDay || 0,
+      absent: row.absent || 0,
+      sick: row.sick || 0,
+      suspended: row.suspended || 0,
+      excused: row.excused || 0,
+      holiday: row.holiday || 0,
+      onDuty: row.onDuty || 0,
+    };
+
+    const {
+      effectivePresent,
+      workingDays,
+      totalMarkedDays,
+      attendancePercentage,
+    } = deriveAttendanceStats(counts);
+
+    return {
+      studentId: row.studentId,
+      studentName: row.studentName,
+      rollNumber: row.rollNumber ?? null,
+      totalDaysInMonth,
+      totalMarkedDays,
+      workingDays, // days student was expected to attend
+      // ── All nine buckets ──
+      ...counts,
+      // ── Derived ───────────────────────────────────────────────────────────
+      effectivePresent, // PRESENT + LATE + HALF_DAY×0.5
+      attendancePercentage,
+    };
+  });
 }
 
-// ==================== NEW: GET ATTENDANCE FOR STUDENT (SELF VIEW) ====================
-/**
- * GET ATTENDANCE BY STUDENT SELF
- *
- * Purpose: Student views their OWN attendance history.
- * Security: userId comes from the validated JWT — no studentId override possible.
- * Used by: /attendance/me endpoint (guarded by attendance.student.view)
- */
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE BY STUDENT SELF (Student portal — own records, date range)
+//
+// Security: userId from JWT — cannot be spoofed by the client.
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getAttendanceByStudentSelf(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
-  userId: number,         // From JWT — authoritative, cannot be spoofed
+  userId: number,
   fromDate: string,
   toDate: string
 ) {
@@ -318,6 +624,7 @@ export async function getAttendanceByStudentSelf(
       id: schoolAttendancesSchema.id,
       date: schoolAttendancesSchema.date,
       status: schoolAttendancesSchema.status,
+      halfDaySession: schoolAttendancesSchema.halfDaySession,
       notes: schoolAttendancesSchema.notes,
       createdAt: schoolAttendancesSchema.createdAt,
     })
@@ -339,16 +646,14 @@ export async function getAttendanceByStudentSelf(
     .orderBy(schoolAttendancesSchema.date);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE SUMMARY FOR STUDENT SELF (Student portal — monthly card)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ==================== NEW: GET ATTENDANCE SUMMARY FOR STUDENT (SELF) ====================
-/**
- * Monthly summary — total days, present, absent, late, halfDay, percentage.
- * Used by the student attendance dashboard card.
- */
 export async function getAttendanceSummaryForStudent(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
-  userId: number,   // From JWT
+  userId: number,
   month: number,
   year: number
 ) {
@@ -357,16 +662,35 @@ export async function getAttendanceSummaryForStudent(
   const datePattern = `${year}-${month.toString().padStart(2, "0")}-%`;
   const totalDaysInMonth = new Date(year, month, 0).getDate();
 
-  const rows = await db
+  const row = await db
     .select({
-      present:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'PRESENT' THEN 1 END)`.as("present"),
-      absent:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'ABSENT' THEN 1 END)`.as("absent"),
-      late:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'LATE' THEN 1 END)`.as("late"),
-      halfDay:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'HALF_DAY' THEN 1 END)`.as("half_day"),
+      present: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.PRESENT} THEN 1 END)
+      `.as("present"),
+      late: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.LATE} THEN 1 END)
+      `.as("late"),
+      halfDay: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.HALF_DAY} THEN 1 END)
+      `.as("half_day"),
+      absent: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.ABSENT} THEN 1 END)
+      `.as("absent"),
+      sick: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.SICK} THEN 1 END)
+      `.as("sick"),
+      suspended: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.SUSPENDED} THEN 1 END)
+      `.as("suspended"),
+      excused: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.EXCUSED} THEN 1 END)
+      `.as("excused"),
+      holiday: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.HOLIDAY} THEN 1 END)
+      `.as("holiday"),
+      onDuty: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.ON_DUTY} THEN 1 END)
+      `.as("on_duty"),
     })
     .from(schoolAttendancesSchema)
     .innerJoin(
@@ -384,41 +708,46 @@ export async function getAttendanceSummaryForStudent(
     )
     .get();
 
-  const present = rows?.present ?? 0;
-  const absent = rows?.absent ?? 0;
-  const late = rows?.late ?? 0;
-  const halfDay = rows?.halfDay ?? 0;
-  const markedDays = present + absent + late + halfDay;
+  const counts: StatusCounts = {
+    present: row?.present ?? 0,
+    late: row?.late ?? 0,
+    halfDay: row?.halfDay ?? 0,
+    absent: row?.absent ?? 0,
+    sick: row?.sick ?? 0,
+    suspended: row?.suspended ?? 0,
+    excused: row?.excused ?? 0,
+    holiday: row?.holiday ?? 0,
+    onDuty: row?.onDuty ?? 0,
+  };
+
+  const {
+    effectivePresent,
+    workingDays,
+    totalMarkedDays,
+    attendancePercentage,
+  } = deriveAttendanceStats(counts);
 
   return {
     month,
     year,
     totalDaysInMonth,
-    markedDays,
-    present,
-    absent,
-    late,
-    halfDay,
-    attendancePercentage:
-      markedDays > 0 ? Math.round((present / markedDays) * 100) : 0,
+    totalMarkedDays,
+    workingDays,
+    ...counts,
+    effectivePresent,
+    attendancePercentage,
   };
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE FOR PARENT CHILD VIEW (date range)
+//
+// Security:
+//   - parentUserId  from JWT (cannot be spoofed)
+//   - childStudentId from X-Active-Child-Id header
+//   - Parent–child link verified in student_parents table before any data is returned.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ==================== NEW: GET ATTENDANCE FOR PARENT (CHILD VIEW) ====================
-/**
- * GET ATTENDANCE FOR PARENT (CHILD VIEW)
- *
- * Purpose: Parent views their child's attendance.
- * Security:
- *   - parentId comes from JWT (cannot be spoofed).
- *   - childStudentId comes from X-Active-Child-Id header (set by auth-interceptor).
- *   - We verify the parent–child link in student_parents table before returning data.
- *     This prevents a parent from viewing another family's child by manipulating the header.
- *
- * @param parentUserId  - Authenticated parent's userId (from JWT)
- * @param childStudentId - Active child's userId (from X-Active-Child-Id header)
- */
 export async function getAttendanceForParentChildView(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -429,7 +758,7 @@ export async function getAttendanceForParentChildView(
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  // ── Security check: verify parent-child relationship ──────────────────────
+  // ── Security check: verify parent–child relationship ──────────────────────
   const link = await db
     .select({ id: studentParentsSchema.id })
     .from(studentParentsSchema)
@@ -450,6 +779,7 @@ export async function getAttendanceForParentChildView(
       id: schoolAttendancesSchema.id,
       date: schoolAttendancesSchema.date,
       status: schoolAttendancesSchema.status,
+      halfDaySession: schoolAttendancesSchema.halfDaySession,
       notes: schoolAttendancesSchema.notes,
       createdAt: schoolAttendancesSchema.createdAt,
     })
@@ -471,12 +801,12 @@ export async function getAttendanceForParentChildView(
     .orderBy(schoolAttendancesSchema.date);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ATTENDANCE SUMMARY FOR PARENT CHILD VIEW (monthly)
+//
+// Same security check as getAttendanceForParentChildView.
+// ─────────────────────────────────────────────────────────────────────────────
 
-// ==================== NEW: GET ATTENDANCE SUMMARY FOR PARENT (CHILD VIEW) ====================
-/**
- * Monthly summary for the parent's selected child.
- * Same security check as getAttendanceForParentChildView.
- */
 export async function getAttendanceSummaryForParentChild(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -506,16 +836,35 @@ export async function getAttendanceSummaryForParentChild(
   const datePattern = `${year}-${month.toString().padStart(2, "0")}-%`;
   const totalDaysInMonth = new Date(year, month, 0).getDate();
 
-  const rows = await db
+  const row = await db
     .select({
-      present:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'PRESENT' THEN 1 END)`.as("present"),
-      absent:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'ABSENT' THEN 1 END)`.as("absent"),
-      late:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'LATE' THEN 1 END)`.as("late"),
-      halfDay:
-        sql<number>`COUNT(CASE WHEN ${schoolAttendancesSchema.status} = 'HALF_DAY' THEN 1 END)`.as("half_day"),
+      present: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.PRESENT} THEN 1 END)
+      `.as("present"),
+      late: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.LATE} THEN 1 END)
+      `.as("late"),
+      halfDay: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.HALF_DAY} THEN 1 END)
+      `.as("half_day"),
+      absent: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.ABSENT} THEN 1 END)
+      `.as("absent"),
+      sick: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.SICK} THEN 1 END)
+      `.as("sick"),
+      suspended: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.SUSPENDED} THEN 1 END)
+      `.as("suspended"),
+      excused: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.EXCUSED} THEN 1 END)
+      `.as("excused"),
+      holiday: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.HOLIDAY} THEN 1 END)
+      `.as("holiday"),
+      onDuty: sql<number>`
+        COUNT(CASE WHEN ${schoolAttendancesSchema.status} = ${AttendanceStatus.ON_DUTY} THEN 1 END)
+      `.as("on_duty"),
     })
     .from(schoolAttendancesSchema)
     .innerJoin(
@@ -533,22 +882,33 @@ export async function getAttendanceSummaryForParentChild(
     )
     .get();
 
-  const present = rows?.present ?? 0;
-  const absent = rows?.absent ?? 0;
-  const late = rows?.late ?? 0;
-  const halfDay = rows?.halfDay ?? 0;
-  const markedDays = present + absent + late + halfDay;
+  const counts: StatusCounts = {
+    present: row?.present ?? 0,
+    late: row?.late ?? 0,
+    halfDay: row?.halfDay ?? 0,
+    absent: row?.absent ?? 0,
+    sick: row?.sick ?? 0,
+    suspended: row?.suspended ?? 0,
+    excused: row?.excused ?? 0,
+    holiday: row?.holiday ?? 0,
+    onDuty: row?.onDuty ?? 0,
+  };
+
+  const {
+    effectivePresent,
+    workingDays,
+    totalMarkedDays,
+    attendancePercentage,
+  } = deriveAttendanceStats(counts);
 
   return {
     month,
     year,
     totalDaysInMonth,
-    markedDays,
-    present,
-    absent,
-    late,
-    halfDay,
-    attendancePercentage:
-      markedDays > 0 ? Math.round((present / markedDays) * 100) : 0,
+    totalMarkedDays,
+    workingDays,
+    ...counts,
+    effectivePresent,
+    attendancePercentage,
   };
 }

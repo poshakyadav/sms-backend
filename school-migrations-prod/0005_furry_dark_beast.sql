@@ -1,1 +1,0 @@
-ALTER TABLE `schools` ADD `short_name` text DEFAULT '';

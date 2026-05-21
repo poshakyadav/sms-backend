@@ -1,3 +1,7 @@
+// …/school/auth/permission-helpers.ts
+// UPDATED: getUserPermissionsFromDB now subtracts denied permissions.
+// Denials are stored in user_permission_denials and always win over grants.
+
 import { eq, inArray } from "drizzle-orm";
 import {
   schoolPermissionsSchema,
@@ -7,6 +11,7 @@ import {
   schoolUserRolesSchema,
   schoolUsersSchema,
 } from "../../../db/schemas/school";
+import { schoolUserPermissionDenialsSchema } from "../../../db/schemas/school/school-user-permission-denials";
 import {
   PermissionSlugWithWildcard,
   WILDCARD_PERMISSION,
@@ -29,80 +34,106 @@ interface UserWithBasicInfo {
   email: string;
   isActive: boolean;
   tokenVersion: number;
+  primaryRole: string | null;
 }
 
 // ==================== FUNCTIONS ====================
 
 /**
- * PRODUCTION-GRADE PERMISSION FETCHER
+ * PRODUCTION-GRADE PERMISSION FETCHER (UPDATED)
  *
- * Fetches permissions from BOTH:
- * 1. User's roles (inherited permissions via role_permissions table)
- * 2. User's direct permission overrides (user_permissions table)
+ * Fetches effective permissions from:
+ *   1. Role-inherited permissions (via role_permissions table)
+ *   2. Direct user-level grants (user_permissions table)       ← adds slugs
+ *   3. Explicit denials (user_permission_denials table)        ← removes slugs (HIGHEST PRIORITY)
  *
- * ── SCHOOL_OWNER wildcard behaviour (FIXED) ─────────────────────────────────
- * Previously: Owner got ALL permission slugs including student/parent ones.
- *             This caused 'My Attendance' and 'fees.report' to appear in the
- *             Owner sidebar and allowed Owner to see consumer-scoped pages.
+ * A denial always wins — even if a permission appears in both grants and denials,
+ * the denial removes it from the effective set.
  *
- * Now: Owner gets all 'staff' category slugs + wildcard '*'.
- *      Student/parent category slugs are NEVER returned for any staff user,
- *      including the Owner. This is enforced at the DB query level by filtering
- *      on category = 'staff', not in application logic, so it cannot be bypassed.
+ * ── SCHOOL_OWNER wildcard behaviour ─────────────────────────────────────────
+ * Owner gets all 'staff' category slugs + wildcard '*'.
+ * Student/parent category slugs are NEVER returned for staff users.
+ * Denials still apply to the Owner (rare but supported).
  * ────────────────────────────────────────────────────────────────────────────
  *
  * @param db     - Drizzle database instance (school-specific)
  * @param userId - User ID to fetch permissions for
- * @returns Array of permission slugs (including '*' wildcard for Owner)
+ * @returns Array of effective permission slugs
+ *
  */
 export async function getUserPermissionsFromDB(
   db: any,
   userId: number
 ): Promise<PermissionSlugWithWildcard[]> {
-  // 1. Fetch user's assigned roles
-  const userRoles: UserRole[] = await db
-    .select({
-      roleId: schoolUserRolesSchema.roleId,
-      roleName: schoolRolesSchema.name,
-    })
-    .from(schoolUserRolesSchema)
-    .innerJoin(
-      schoolRolesSchema,
-      eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
-    )
-    .where(eq(schoolUserRolesSchema.userId, userId))
-    .all();
+  // ── Batch 1: roles + denials + direct grants in ONE round trip ──────────
+  const [userRoles, deniedPermissions, directPermissions] = (await db.batch([
+    db
+      .select({
+        roleId: schoolUserRolesSchema.roleId,
+        roleName: schoolRolesSchema.name,
+      })
+      .from(schoolUserRolesSchema)
+      .innerJoin(
+        schoolRolesSchema,
+        eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
+      )
+      .where(eq(schoolUserRolesSchema.userId, userId)),
 
-  // 2. SCHOOL_OWNER: return all STAFF-category slugs + wildcard
-  //
-  // The WHERE category = 'staff' filter is the critical security gate.
-  // It means even if a future code change accidentally inserts a student/parent
-  // slug into the permissions table without the correct category, the Owner
-  // will never receive it through this path.
+    db
+      .select({ slug: schoolPermissionsSchema.slug })
+      .from(schoolUserPermissionDenialsSchema)
+      .innerJoin(
+        schoolPermissionsSchema,
+        eq(
+          schoolUserPermissionDenialsSchema.permissionId,
+          schoolPermissionsSchema.id
+        )
+      )
+      .where(eq(schoolUserPermissionDenialsSchema.userId, userId)),
+
+    db
+      .select({ slug: schoolPermissionsSchema.slug })
+      .from(schoolUserPermissionsSchema)
+      .innerJoin(
+        schoolPermissionsSchema,
+        eq(schoolUserPermissionsSchema.permissionId, schoolPermissionsSchema.id)
+      )
+      .where(eq(schoolUserPermissionsSchema.userId, userId)),
+  ])) as [UserRole[], PermissionRecord[], PermissionRecord[]];
+
+  const deniedSlugs = new Set(deniedPermissions.map((p) => p.slug));
   const hasOwnerRole = userRoles.some(
     (r) => r.roleName === SchoolRole.SCHOOL_OWNER
   );
 
+  // ── SCHOOL_OWNER fast path ──────────────────────────────────────────────
   if (hasOwnerRole) {
+    // One extra query — unavoidable since we need hasOwnerRole first
     const staffPermissions: PermissionRecord[] = await db
       .select({ slug: schoolPermissionsSchema.slug })
       .from(schoolPermissionsSchema)
       .where(eq(schoolPermissionsSchema.category, "staff"))
       .all();
 
-    const staffSlugs = staffPermissions.map((p) => p.slug);
+    const staffSlugs = staffPermissions
+      .map((p) => p.slug)
+      .filter((s) => !deniedSlugs.has(s));
 
-    return [
+    const effectiveSlugs: PermissionSlugWithWildcard[] = [
       ...staffSlugs,
-      WILDCARD_PERMISSION,
     ] as PermissionSlugWithWildcard[];
+
+    if (!deniedSlugs.has(WILDCARD_PERMISSION as string)) {
+      effectiveSlugs.push(WILDCARD_PERMISSION);
+    }
+
+    return effectiveSlugs;
   }
 
-  // 3. Non-owner: fetch permissions inherited from assigned roles
+  // ── Non-owner: fetch role permissions (needs roleIds from batch above) ──
   const roleIds = userRoles.map((r) => r.roleId);
 
   let rolePermissions: PermissionRecord[] = [];
-
   if (roleIds.length > 0) {
     rolePermissions = await db
       .select({ slug: schoolPermissionsSchema.slug })
@@ -115,38 +146,36 @@ export async function getUserPermissionsFromDB(
       .all();
   }
 
-  // 4. Fetch direct user-level permission overrides
-  const directPermissions: PermissionRecord[] = await db
-    .select({ slug: schoolPermissionsSchema.slug })
-    .from(schoolUserPermissionsSchema)
-    .innerJoin(
-      schoolPermissionsSchema,
-      eq(schoolUserPermissionsSchema.permissionId, schoolPermissionsSchema.id)
-    )
-    .where(eq(schoolUserPermissionsSchema.userId, userId))
-    .all();
-
-  // 5. Merge and deduplicate
-  const allUserPermissions = [
+  // ── Merge, deduplicate, subtract denials ────────────────────────────────
+  const allSlugs = [
     ...rolePermissions.map((p) => p.slug),
     ...directPermissions.map((p) => p.slug),
   ];
 
-  const uniquePermissions = [...new Set(allUserPermissions)];
+  const uniqueSlugs = [...new Set(allSlugs)].filter((s) => !deniedSlugs.has(s));
 
-  if (uniquePermissions.length === 0 && userRoles.length === 0) {
+  if (uniqueSlugs.length === 0 && userRoles.length === 0) {
     console.warn(`⚠️ User ${userId} has no roles or permissions assigned`);
   }
 
-  return uniquePermissions as PermissionSlugWithWildcard[];
+  return uniqueSlugs as PermissionSlugWithWildcard[];
 }
-  
+
+// ==================== USER + PERMISSIONS IN ONE BATCH ====================
 
 /**
- * FAST USER LOOKUP WITH PERMISSIONS
+ * Fetches user record AND all permission data in a single db.batch() call.
  *
- * Combines a user record fetch with getUserPermissionsFromDB.
- * Used by the refresh token endpoint.
+ * Used by the refresh token endpoint. The user SELECT joins the same batch
+ * as the permission queries — everything resolves in 2 round trips total.
+ *
+ * Also returns primaryRole directly from school_users (same batch),
+ * eliminating the extra primaryRole query that was in the refresh handler.
+ *
+ * Round trips:
+ *   Batch 1: [user, roles, denials, directPerms]  ← 1 round trip
+ *   Query 2: rolePermissions (if non-owner)        ← 1 round trip
+ *   Total: 2 instead of 5
  */
 export async function getUserWithPermissions(
   db: any,
@@ -154,24 +183,120 @@ export async function getUserWithPermissions(
 ): Promise<
   (UserWithBasicInfo & { permissions: PermissionSlugWithWildcard[] }) | null
 > {
-  const user: UserWithBasicInfo | undefined = await db
-    .select({
-      id: schoolUsersSchema.id,
-      name: schoolUsersSchema.name,
-      email: schoolUsersSchema.email,
-      isActive: schoolUsersSchema.isActive,
-      tokenVersion: schoolUsersSchema.tokenVersion,
-    })
-    .from(schoolUsersSchema)
-    .where(eq(schoolUsersSchema.id, userId))
-    .get();
+  // ── Super-batch: user + all permission base queries in 1 round trip ─────
+  const [users, userRoles, deniedPermissions, directPermissions] =
+    (await db.batch([
+      // User record — includes primaryRole so caller doesn't need extra query
+      db
+        .select({
+          id: schoolUsersSchema.id,
+          name: schoolUsersSchema.name,
+          email: schoolUsersSchema.email,
+          isActive: schoolUsersSchema.isActive,
+          tokenVersion: schoolUsersSchema.tokenVersion,
+          primaryRole: schoolUsersSchema.primaryRole,
+        })
+        .from(schoolUsersSchema)
+        .where(eq(schoolUsersSchema.id, userId)),
 
+      // Roles
+      db
+        .select({
+          roleId: schoolUserRolesSchema.roleId,
+          roleName: schoolRolesSchema.name,
+        })
+        .from(schoolUserRolesSchema)
+        .innerJoin(
+          schoolRolesSchema,
+          eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
+        )
+        .where(eq(schoolUserRolesSchema.userId, userId)),
+
+      // Denied permissions
+      db
+        .select({ slug: schoolPermissionsSchema.slug })
+        .from(schoolUserPermissionDenialsSchema)
+        .innerJoin(
+          schoolPermissionsSchema,
+          eq(
+            schoolUserPermissionDenialsSchema.permissionId,
+            schoolPermissionsSchema.id
+          )
+        )
+        .where(eq(schoolUserPermissionDenialsSchema.userId, userId)),
+
+      // Direct grants
+      db
+        .select({ slug: schoolPermissionsSchema.slug })
+        .from(schoolUserPermissionsSchema)
+        .innerJoin(
+          schoolPermissionsSchema,
+          eq(
+            schoolUserPermissionsSchema.permissionId,
+            schoolPermissionsSchema.id
+          )
+        )
+        .where(eq(schoolUserPermissionsSchema.userId, userId)),
+    ])) as [
+      UserWithBasicInfo[],
+      UserRole[],
+      PermissionRecord[],
+      PermissionRecord[]
+    ];
+
+  const user = users[0];
   if (!user) return null;
 
-  const permissions = await getUserPermissionsFromDB(db, userId);
+  const deniedSlugs = new Set(deniedPermissions.map((p) => p.slug));
+  const hasOwnerRole = userRoles.some(
+    (r) => r.roleName === SchoolRole.SCHOOL_OWNER
+  );
 
-  return {
-    ...user,
-    permissions,
-  };
+  let permissions: PermissionSlugWithWildcard[];
+
+  if (hasOwnerRole) {
+    const staffPermissions: PermissionRecord[] = await db
+      .select({ slug: schoolPermissionsSchema.slug })
+      .from(schoolPermissionsSchema)
+      .where(eq(schoolPermissionsSchema.category, "staff"))
+      .all();
+
+    const staffSlugs = staffPermissions
+      .map((p) => p.slug)
+      .filter((s) => !deniedSlugs.has(s));
+
+    permissions = [...staffSlugs] as PermissionSlugWithWildcard[];
+    if (!deniedSlugs.has(WILDCARD_PERMISSION as string)) {
+      permissions.push(WILDCARD_PERMISSION);
+    }
+  } else {
+    const roleIds = userRoles.map((r) => r.roleId);
+
+    let rolePermissions: PermissionRecord[] = [];
+    if (roleIds.length > 0) {
+      rolePermissions = await db
+        .select({ slug: schoolPermissionsSchema.slug })
+        .from(schoolRolePermissionsSchema)
+        .innerJoin(
+          schoolPermissionsSchema,
+          eq(
+            schoolRolePermissionsSchema.permissionId,
+            schoolPermissionsSchema.id
+          )
+        )
+        .where(inArray(schoolRolePermissionsSchema.roleId, roleIds))
+        .all();
+    }
+
+    const allSlugs = [
+      ...rolePermissions.map((p) => p.slug),
+      ...directPermissions.map((p) => p.slug),
+    ];
+
+    permissions = [...new Set(allSlugs)].filter(
+      (s) => !deniedSlugs.has(s)
+    ) as PermissionSlugWithWildcard[];
+  }
+
+  return { ...user, permissions };
 }

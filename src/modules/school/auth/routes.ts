@@ -1,7 +1,6 @@
-
 // Backend .../school/auth/routes.ts
 import { zValidator } from "@hono/zod-validator";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import {
@@ -13,10 +12,8 @@ import {
 } from "../../../db";
 import {
   schoolRefreshTokensSchema,
-  schoolRolesSchema,
   schoolsSchema,
   schoolThemeConfigsSchema,
-  schoolUserRolesSchema,
 } from "../../../db/schemas/school";
 import { schoolUsersSchema } from "../../../db/schemas/school/school-users";
 import { getSchoolDB } from "../../../db/school-client";
@@ -35,7 +32,10 @@ import { generateSchoolTokens, validateSchoolCode } from "./services";
 
 const schoolAuthRouter = new Hono<SchoolEnv>();
 
-const FRONTEND_URL = "http://localhost:4200";
+// const FRONTEND_URL = "http://localhost:4200";
+
+const getFrontendUrl = (c: { env: SchoolEnv["Bindings"] }): string =>
+  c.env.FRONTEND_ORIGIN || "http://localhost:4200";
 
 interface SchoolBranding {
   name: string;
@@ -56,6 +56,7 @@ interface SchoolBranding {
 
 async function fetchSchoolBranding(db: any): Promise<SchoolBranding | null> {
   try {
+    // Single query with LEFT JOIN — was 2 sequential round trips, now 1
     const row = await db
       .select({
         name: schoolsSchema.name,
@@ -67,25 +68,22 @@ async function fetchSchoolBranding(db: any): Promise<SchoolBranding | null> {
         email: schoolsSchema.email,
         logoUrl: schoolsSchema.logoUrl,
         tagline: schoolsSchema.tagline,
+        // Theme via LEFT JOIN — null if no active theme
+        themeName: schoolThemeConfigsSchema.themeName,
+        themeConfig: schoolThemeConfigsSchema.config,
+        isCustomTheme: schoolThemeConfigsSchema.isCustomTheme,
       })
       .from(schoolsSchema)
+      .leftJoin(
+        schoolThemeConfigsSchema,
+        and(
+          eq(schoolThemeConfigsSchema.schoolId, schoolsSchema.id),
+          eq(schoolThemeConfigsSchema.isActive, true)
+        )
+      )
       .get();
 
     if (!row) return null;
-
-    // Also fetch the active theme so the frontend can apply CSS vars immediately
-    // after login — without this, the dashboard renders without school branding
-    // until the user toggles dark/light mode.
-    const themeRow = await db
-      .select({
-        themeName: schoolThemeConfigsSchema.themeName,
-        config: schoolThemeConfigsSchema.config,
-        isCustomTheme: schoolThemeConfigsSchema.isCustomTheme,
-      })
-      .from(schoolThemeConfigsSchema)
-      .where(eq(schoolThemeConfigsSchema.isActive, true))
-      .get();
-
 
     return {
       name: row.name,
@@ -97,17 +95,16 @@ async function fetchSchoolBranding(db: any): Promise<SchoolBranding | null> {
       email: row.email ?? "",
       logoUrl: row.logoUrl || null,
       tagline: row.tagline || null,
-      theme: themeRow
+      theme: row.themeName
         ? {
-            themeName: themeRow.themeName,
-            config: JSON.parse(themeRow.config || "{}"),
-            isCustomTheme: themeRow.isCustomTheme,
+            themeName: row.themeName,
+            config: JSON.parse(row.themeConfig || "{}"),
+            isCustomTheme: row.isCustomTheme,
           }
         : null,
     };
   } catch {
-    // Non-fatal — login still succeeds without branding
-    return null;
+    return null; // Non-fatal — login still succeeds without branding
   }
 }
 
@@ -398,18 +395,21 @@ schoolAuthRouter.get("/payment-status/:schoolCode", async (c) => {
 
     if (!school) return c.json({ error: "School not found" }, 404);
 
-    const paymentRecord = await commonDb
-      .select()
-      .from(schoolPaymentRecordsSchema)
-      .where(eq(schoolPaymentRecordsSchema.schoolId, school.id))
-      .orderBy(sql`${schoolPaymentRecordsSchema.createdAt} DESC`)
-      .get();
+    // paymentRecord and feeConfig are independent — fetch both at once
+    const [paymentRecord, feeConfig] = await Promise.all([
+      commonDb
+        .select()
+        .from(schoolPaymentRecordsSchema)
+        .where(eq(schoolPaymentRecordsSchema.schoolId, school.id))
+        .orderBy(sql`${schoolPaymentRecordsSchema.createdAt} DESC`)
+        .get(),
 
-    const feeConfig = await commonDb
-      .select()
-      .from(paymentConfigSchema)
-      .where(eq(paymentConfigSchema.id, 1))
-      .get();
+      commonDb
+        .select()
+        .from(paymentConfigSchema)
+        .where(eq(paymentConfigSchema.id, 1))
+        .get(),
+    ]);
 
     return c.json({
       success: true,
@@ -734,7 +734,8 @@ schoolAuthRouter.post(
       });
 
       // 6. Send payment instructions email
-      const paymentPageUrl = `${FRONTEND_URL}/school/payment?code=${schoolCode}`;
+      const frontendUrl = getFrontendUrl(c);
+      const paymentPageUrl = `${frontendUrl}/school/payment?code=${schoolCode}`;
       const confirmEmail: BrevoSendEmailRequest = {
         sender: {
           email: c.env.BREVO_SENDER_EMAIL,
@@ -870,6 +871,7 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         id: schoolUsersSchema.id,
         name: schoolUsersSchema.name,
         email: schoolUsersSchema.email,
+        primaryRole: schoolUsersSchema.primaryRole,
         isActive: schoolUsersSchema.isActive,
         passwordHash: schoolUsersSchema.passwordHash,
         tokenVersion: schoolUsersSchema.tokenVersion,
@@ -918,33 +920,35 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         .where(eq(schoolUsersSchema.id, user.id));
     }
 
+    // Optimising from here
     // === FETCH USER PERMISSIONS  ===
+    // Step 1: permissions (internally uses db.batch — 2 round trips total)
     const userPermissions = await getUserPermissionsFromDB(db, user.id);
 
-    // After fetching userPermissions, fetch primary role
-    // ── Fetch primaryRole from school_users directly (authoritative) ────────
-    const userPrimaryRole = await db
-      .select({ primaryRole: schoolUsersSchema.primaryRole })
-      .from(schoolUsersSchema)
-      .where(eq(schoolUsersSchema.id, user.id))
-      .get();
+    // Step 2: primaryRole — read directly from the user row we already fetched.
+    // user.primaryRole is already on the user object from the SELECT above,
+    // so NO extra round trip needed here at all.
+    const roleName = user.primaryRole ?? "";
 
-    const roleName = userPrimaryRole?.primaryRole ?? "";
-
-    // Generate tokens with real permissions
-    const { access_token, refresh_token } = await generateSchoolTokens(
-      db,
-      {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        schoolCode,
-        permissions: userPermissions,
-        tokenVersion: user.tokenVersion,
-        role: roleName,
-      },
-      c.env.JWT_SECRET
-    );
+    // Step 3+4 in parallel: generate tokens AND fetch branding simultaneously.
+    // Token generation (JWT sign + refresh token DB insert) and branding read
+    // are completely independent — run them at the same time.
+    const [{ access_token, refresh_token }, school] = await Promise.all([
+      generateSchoolTokens(
+        db,
+        {
+          id: user.id,
+          name: user.name,
+          email: user.email,
+          schoolCode,
+          permissions: userPermissions,
+          tokenVersion: user.tokenVersion,
+          role: roleName,
+        },
+        c.env.JWT_SECRET
+      ),
+      fetchSchoolBranding(db),
+    ]);
 
     // ── Typed child shape ──────────────────────────────────────────────────
     // Fetch children for STUDENT_PARENT — strongly typed to avoid ts(2589)
@@ -979,11 +983,6 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         children = [];
       }
     }
-
-    // ── Fetch school branding for localStorage cache ────────────────────
-    // This is a single lightweight read on the schools table (always 1 row).
-    // Piggybacking it on login means the header never needs a dedicated API call.
-    const school = await fetchSchoolBranding(db);
 
     // Explicit typed object — avoids Hono's infinite generic instantiation
     const responseBody: {
@@ -1031,15 +1030,16 @@ schoolAuthRouter.post(
 
       const db = await getSchoolDB(c.env, schoolCode);
 
-      // 1. Validate refresh token
+      // Step 1: validate refresh token (must happen first — gates everything)
       const payload = await validateSchoolRefreshToken(db, refresh_token);
       if (!payload) {
         return c.json({ error: "Invalid or expired refresh token" }, 401);
       }
 
-      // 2. Fetch user + permissions from DB
-      console.log(`🔍 Fetching user ${payload.userId} with permissions...`);
-
+      // Step 2: getUserWithPermissions now uses db.batch internally.
+      // It fetches user + roles + denials + directPerms in ONE round trip,
+      // then rolePerms in a second. It also returns primaryRole directly
+      // from school_users — no extra query needed.
       const userWithPermissions = await getUserWithPermissions(
         db,
         payload.userId
@@ -1048,46 +1048,38 @@ schoolAuthRouter.post(
       if (!userWithPermissions) {
         return c.json({ error: "User not found" }, 404);
       }
-
       if (!userWithPermissions.isActive) {
         return c.json({ error: "Account deactivated" }, 403);
       }
 
-      const userPrimaryRoleRow = await db
-        .select({ primaryRole: schoolUsersSchema.primaryRole })
-        .from(schoolUsersSchema)
-        .where(eq(schoolUsersSchema.id, payload.userId))
-        .get();
+      // primaryRole now comes from getUserWithPermissions — no extra DB call
+      const role = userWithPermissions.primaryRole ?? "";
 
-      const role = userPrimaryRoleRow?.primaryRole ?? "";
-
-      // 3. Generate new tokens with fresh permissions
-      const { access_token, refresh_token: newRefreshToken } =
-        await generateSchoolTokens(
-          db,
-          {
-            id: userWithPermissions.id,
-            name: userWithPermissions.name,
-            email: userWithPermissions.email,
-            schoolCode,
-            permissions: userWithPermissions.permissions as string[],
-            tokenVersion: userWithPermissions.tokenVersion,
-            role,
-          },
-          c.env.JWT_SECRET
-        );
-
-      // ── Fetch fresh school branding for frontend cache update ─────────
-      // On every token refresh the frontend receives the latest school data.
-      // If the owner updated name/logo/shortName between logins, all users
-      // see the change on their next refresh — no re-login required.
-      const school = await fetchSchoolBranding(db);
+      // Step 3+4 in parallel: generate new tokens AND fetch branding together.
+      // These are completely independent — run simultaneously.
+      const [{ access_token, refresh_token: newRefreshToken }, school] =
+        await Promise.all([
+          generateSchoolTokens(
+            db,
+            {
+              id: userWithPermissions.id,
+              name: userWithPermissions.name,
+              email: userWithPermissions.email,
+              schoolCode,
+              permissions: userWithPermissions.permissions as string[],
+              tokenVersion: userWithPermissions.tokenVersion,
+              role,
+            },
+            c.env.JWT_SECRET
+          ),
+          fetchSchoolBranding(db),
+        ]);
 
       return c.json({
         success: true,
         access_token,
         refresh_token: newRefreshToken,
-        school
+        school,
       });
     } catch (error: any) {
       console.error("Refresh token error:", error);

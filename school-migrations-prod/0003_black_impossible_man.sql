@@ -1,1 +1,0 @@
-ALTER TABLE `school_users` ADD `terms_accepted_at` text;

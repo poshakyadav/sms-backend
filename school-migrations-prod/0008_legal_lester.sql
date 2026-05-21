@@ -1,1 +1,0 @@
-ALTER TABLE `roles` ADD `category` text DEFAULT 'staff' NOT NULL;

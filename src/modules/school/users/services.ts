@@ -1,8 +1,4 @@
 // src/modules/school/users/services.ts
-// UPDATED: assignDirectPermissionsToUser now enforces category consistency.
-// The target user's primaryRole is read, mapped to a PermissionCategory via
-// getProfileCategory(), and all submitted permissionIds are validated against
-// that category before any write happens.
 
 import { and, eq, inArray, sql } from "drizzle-orm";
 import {
@@ -15,6 +11,7 @@ import {
   schoolPermissionsSchema,
   schoolRolesSchema,
   schoolStudentEnrollmentsSchema,
+  schoolUserPermissionDenialsSchema,
   schoolUserPermissionsSchema,
   schoolUserRolesSchema,
   schoolUsersSchema,
@@ -37,22 +34,21 @@ import { sendTransactionalEmail } from "../../../utils/sendEmail";
 import { getUserPermissionsFromDB } from "../auth/permission-helpers";
 import { PermissionCategory } from "../../../types/school-permissions";
 
-// ── Category label map for human-readable error messages ─────────────────────
+// Helper to get frontend URL
+const getFrontendUrlForUsers = (env: SchoolEnv["Bindings"]): string => {
+  return env.FRONTEND_ORIGIN || "http://localhost:4200";
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ─────────────────────────────────────────────────────────────────────────────
+
 const CATEGORY_LABELS: Record<PermissionCategory, string> = {
   staff: "Staff",
   student: "Student",
   parent: "Parent",
 };
 
-/**
- * Maps a ProfileTableCategory (from profile-mapping.ts) to the
- * PermissionCategory used by the permissions table.
- *
- * 'student' → 'student'
- * 'parent'  → 'parent'
- * 'teacher' → 'staff'  (teachers are staff-category users)
- * 'staff'   → 'staff'
- */
 function profileCategoryToPermissionCategory(
   profileCat: ProfileTableCategory
 ): PermissionCategory {
@@ -68,8 +64,12 @@ function profileCategoryToPermissionCategory(
   }
 }
 
-// ── Safe user fields (excludes passwordHash) ──────────────────────────────────
-// Use this everywhere users are returned to the API layer.
+// ─────────────────────────────────────────────────────────────────────────────
+// SAFE FIELD SELECTORS
+// schoolUsersSchema fields that are always safe to return (no passwordHash).
+// Now includes fatherName, motherName, guardianName, guardianRelation.
+// ─────────────────────────────────────────────────────────────────────────────
+
 const SAFE_USER_FIELDS = {
   id: schoolUsersSchema.id,
   schoolId: schoolUsersSchema.schoolId,
@@ -88,29 +88,84 @@ const SAFE_USER_FIELDS = {
   city: schoolUsersSchema.city,
   state: schoolUsersSchema.state,
   postalCode: schoolUsersSchema.postalCode,
+
+  // ── Parental / guardian fields (UDISE+ & general HR) ──────────────────────
+  fatherName: schoolUsersSchema.fatherName,
+  motherName: schoolUsersSchema.motherName,
+  guardianName: schoolUsersSchema.guardianName,
+  guardianRelation: schoolUsersSchema.guardianRelation,
+
+  // ── T&C + lifecycle ───────────────────────────────────────────────────────
+  termsAcceptedAt: schoolUsersSchema.termsAcceptedAt,
   isActive: schoolUsersSchema.isActive,
   createdAt: schoolUsersSchema.createdAt,
   updatedAt: schoolUsersSchema.updatedAt,
-  // termsAcceptedAt intentionally omitted (not needed in lists)
 } as const;
- 
-// ── Deletion check result — returned BEFORE any DELETE is performed ────────────
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INLINE ROLES SUB-SELECT
+// Returns a JSON array of all roles assigned to this user.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const rolesSubSelect = sql<string>`(
+  SELECT JSON_GROUP_ARRAY(
+    JSON_OBJECT(
+      'id',          r.id,
+      'name',        r.name,
+      'description', COALESCE(r.description, ''),
+      'isSystem',    r.is_system,
+      'category',    r.category
+    )
+  )
+  FROM user_roles ur
+  INNER JOIN roles r ON ur.role_id = r.id
+  WHERE ur.user_id = ${schoolUsersSchema.id}
+)`.as("roles_json");
+
+function parseRolesJson(raw: string | null): Array<{
+  id: number;
+  name: string;
+  description: string;
+  isSystem: boolean;
+  category: string;
+}> {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Parse facilitiesReceived JSON string → string array (safe). */
+function parseFacilities(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETION CHECK TYPES
+// ─────────────────────────────────────────────────────────────────────────────
+
 export interface DeletionCheckResult {
   canDelete: boolean;
-  // If canDelete is false, this is the blocking reason
   blockingReason?: string;
-  // Structured warnings shown in the confirmation popup even when canDelete=true
   warnings: DeletionWarning[];
-  // Summary counts for display in the popup
   summary: {
     enrollments: number;
     attendanceRecords: number;
     feePayments: number;
     examMarks: number;
-    assignments: number;        // only for teachers
-    submissions: number;        // only for students
-    linkedChildren: number;     // only for parents
-    linkedParents: number;      // only for students
+    assignments: number;
+    submissions: number;
+    linkedChildren: number;
+    linkedParents: number;
   };
   userInfo: {
     name: string;
@@ -118,19 +173,25 @@ export interface DeletionCheckResult {
     isActive: boolean;
   };
 }
- 
+
 export interface DeletionWarning {
   severity: "info" | "warning" | "danger";
   message: string;
 }
 
-// ==================== TYPE DEFINITIONS ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPE DEFINITIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
 interface CreateUserData {
+  // Core
   name: string;
   email: string;
   password: string;
   primaryRoleId: number;
   roleIds: number[];
+
+  // Common (school_users)
   phone?: string;
   alternatePhone?: string;
   dateOfBirth?: string;
@@ -142,18 +203,62 @@ interface CreateUserData {
   city?: string;
   state?: string;
   postalCode?: string;
-  // Student-specific
+
+  // ── NEW: Parental / guardian fields (school_users) ────────────────────────
+  fatherName?: string;
+  motherName?: string;
+  guardianName?: string;
+  guardianRelation?: string;
+
+  // ── Student school-internal fields (students) ─────────────────────────────
+  admissionNumber?: string;
   rollNumber?: string;
   admissionDate?: string;
   previousSchool?: string;
   medicalInfo?: string;
-  // Teacher-specific
+
+  // ── UDISE / National identity fields (students) ───────────────────────────
+  pen?: string | null;
+  apaarId?: string | null;
+  stateStudentId?: string | null;
+  aadhaarMasked?: string | null;
+  aadhaarName?: string | null;
+  previousSchoolUdiseCode?: string | null;
+
+  // ── UDISE+ demographic fields (students) ──────────────────────────────────
+  enrollmentType?: string;
+  previousClassResult?: string | null;
+  socialCategory?: number | null;
+  religion?: number | null;
+  isMinority?: boolean;
+  motherTongueCode?: number | null;
+
+  // ── Socio-economic (students) ─────────────────────────────────────────────
+  isBpl?: boolean;
+  localityType?: string | null;
+
+  // ── CWSN (students) ───────────────────────────────────────────────────────
+  isCwsn?: boolean;
+  disabilityType?: number | null;
+  hasDisabilityCertificate?: boolean;
+  udidNumber?: string | null;
+
+  // ── Facilities / schemes (students) ──────────────────────────────────────
+  facilitiesReceived?: string[];
+
+  // ── Verification flags (students) ─────────────────────────────────────────
+  isAadhaarVerified?: boolean;
+  udiseVerified?: boolean;
+
+  // ── Teacher profile ───────────────────────────────────────────────────────
   qualification?: string;
   experienceYears?: number;
   specialization?: string;
-  // Parent-specific
+
+  // ── Parent profile ────────────────────────────────────────────────────────
   occupation?: string;
-  // Staff-specific
+
+  // ── Staff profile ─────────────────────────────────────────────────────────
   department?: string;
   salary?: number;
   shift?: string;
@@ -161,9 +266,13 @@ interface CreateUserData {
 }
 
 interface UpdateUserData {
+  // Core (mutable)
   name?: string;
   email?: string;
   newPassword?: string;
+  isActive?: boolean;
+
+  // Common (school_users)
   phone?: string;
   alternatePhone?: string;
   dateOfBirth?: string;
@@ -175,89 +284,194 @@ interface UpdateUserData {
   city?: string;
   state?: string;
   postalCode?: string;
-  isActive?: boolean;
-  // Profile-specific fields (routed via primaryRole)
+
+  // ── NEW: Parental / guardian fields (school_users) ────────────────────────
+  fatherName?: string;
+  motherName?: string;
+  guardianName?: string;
+  guardianRelation?: string;
+
+  // ── Student school-internal ───────────────────────────────────────────────
+  admissionNumber?: string;
   rollNumber?: string;
   admissionDate?: string;
   previousSchool?: string;
   medicalInfo?: string;
+
+  // ── UDISE / National identity ─────────────────────────────────────────────
+  pen?: string | null;
+  apaarId?: string | null;
+  stateStudentId?: string | null;
+  aadhaarMasked?: string | null;
+  aadhaarName?: string | null;
+  previousSchoolUdiseCode?: string | null;
+
+  // ── UDISE+ demographic ────────────────────────────────────────────────────
+  enrollmentType?: string;
+  previousClassResult?: string | null;
+  socialCategory?: number | null;
+  religion?: number | null;
+  isMinority?: boolean;
+  motherTongueCode?: number | null;
+
+  // ── Socio-economic ────────────────────────────────────────────────────────
+  isBpl?: boolean;
+  localityType?: string | null;
+
+  // ── CWSN ─────────────────────────────────────────────────────────────────
+  isCwsn?: boolean;
+  disabilityType?: number | null;
+  hasDisabilityCertificate?: boolean;
+  udidNumber?: string | null;
+
+  // ── Facilities / schemes ──────────────────────────────────────────────────
+  facilitiesReceived?: string[];
+
+  // ── Verification flags ────────────────────────────────────────────────────
+  isAadhaarVerified?: boolean;
+  udiseVerified?: boolean;
+
+  // ── Teacher profile ───────────────────────────────────────────────────────
   qualification?: string;
   experienceYears?: number;
   specialization?: string;
+
+  // ── Parent profile ────────────────────────────────────────────────────────
   occupation?: string;
+
+  // ── Staff profile ─────────────────────────────────────────────────────────
   department?: string;
   salary?: number;
   shift?: string;
   joiningDate?: string;
 }
 
-// ── Internal helper: load roles for a batch of userIds ───────────────────────
-async function loadRolesForUsers(db: any, userIds: number[]) {
-  if (userIds.length === 0) return {} as Record<number, any[]>;
- 
-  const rolesData = await db
-    .select({
-      userId: schoolUserRolesSchema.userId,
-      roleId: schoolRolesSchema.id,
-      roleName: schoolRolesSchema.name,
-      roleDescription: schoolRolesSchema.description,
-      isSystem: schoolRolesSchema.isSystem,
-      category: schoolRolesSchema.category,
-    })
-    .from(schoolUserRolesSchema)
-    .innerJoin(
-      schoolRolesSchema,
-      eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
-    )
-    .where(inArray(schoolUserRolesSchema.userId, userIds))
-    .all();
- 
-  return rolesData.reduce((acc: Record<number, any[]>, role: any) => {
-    if (!acc[role.userId]) acc[role.userId] = [];
-    acc[role.userId].push({
-      id: role.roleId,
-      name: role.roleName,
-      description: role.roleDescription,
-      isSystem: role.isSystem,
-      category: role.category,
-    });
-    return acc;
-  }, {});
-}
- 
-// ── Internal helper: map a joined row to a safe user object ──────────────────
-function mapUserRow(
-  row: { user: any; student: any; teacher: any; parent: any; staff: any },
-  rolesByUser: Record<number, any[]>
-) {
-  // Destructure to explicitly exclude passwordHash
-  const {
-    passwordHash: _omit,
-    ...safeUser
-  } = row.user as any;
- 
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPLETE STUDENT FIELDS SELECTOR
+// Used in every SELECT that joins the students table.
+// All existing + new UDISE fields are projected here.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const STUDENT_SELECT_FIELDS = {
+  // Existing
+  studentUserId: studentsSchema.userId,
+  admissionNumber: studentsSchema.admissionNumber,
+  rollNumber: studentsSchema.rollNumber,
+  admissionDate: studentsSchema.admissionDate,
+  previousSchool: studentsSchema.previousSchool,
+  medicalInfo: studentsSchema.medicalInfo,
+  enrollmentType: studentsSchema.enrollmentType,
+
+  // UDISE / National identity
+  pen: studentsSchema.pen,
+  apaarId: studentsSchema.apaarId,
+  stateStudentId: studentsSchema.stateStudentId,
+  aadhaarMasked: studentsSchema.aadhaarMasked,
+  aadhaarName: studentsSchema.aadhaarName,
+  previousSchoolUdiseCode: studentsSchema.previousSchoolUdiseCode,
+
+  // UDISE+ demographic
+  previousClassResult: studentsSchema.previousClassResult,
+  socialCategory: studentsSchema.socialCategory,
+  religion: studentsSchema.religion,
+  isMinority: studentsSchema.isMinority,
+  motherTongueCode: studentsSchema.motherTongueCode,
+
+  // Socio-economic
+  isBpl: studentsSchema.isBpl,
+  localityType: studentsSchema.localityType,
+
+  // CWSN
+  isCwsn: studentsSchema.isCwsn,
+  disabilityType: studentsSchema.disabilityType,
+  hasDisabilityCertificate: studentsSchema.hasDisabilityCertificate,
+  udidNumber: studentsSchema.udidNumber,
+
+  // Facilities
+  facilitiesReceived: studentsSchema.facilitiesReceived,
+
+  // Verification flags
+  isAadhaarVerified: studentsSchema.isAadhaarVerified,
+  udiseVerified: studentsSchema.udiseVerified,
+} as const;
+
+/** Map raw DB row fields → a typed student profile data object. */
+function extractStudentProfile(row: any): Record<string, any> | null {
+  if (row.studentUserId == null) return null;
   return {
-    ...safeUser,
-    roles: rolesByUser[safeUser.id] || [],
-    profile: determineProfileFromPrimaryRole(row, safeUser.primaryRole),
+    userId: row.studentUserId,
+    admissionNumber: row.admissionNumber,
+    rollNumber: row.rollNumber,
+    admissionDate: row.admissionDate,
+    previousSchool: row.previousSchool,
+    medicalInfo: row.medicalInfo,
+    enrollmentType: row.enrollmentType ?? "REGULAR",
+    // UDISE / National identity
+    pen: row.pen,
+    apaarId: row.apaarId,
+    stateStudentId: row.stateStudentId,
+    aadhaarMasked: row.aadhaarMasked,
+    aadhaarName: row.aadhaarName,
+    previousSchoolUdiseCode: row.previousSchoolUdiseCode,
+    // UDISE+ demographic
+    previousClassResult: row.previousClassResult,
+    socialCategory: row.socialCategory,
+    religion: row.religion,
+    isMinority: row.isMinority ?? false,
+    motherTongueCode: row.motherTongueCode,
+    // Socio-economic
+    isBpl: row.isBpl ?? false,
+    localityType: row.localityType,
+    // CWSN
+    isCwsn: row.isCwsn ?? false,
+    disabilityType: row.disabilityType,
+    hasDisabilityCertificate: row.hasDisabilityCertificate ?? false,
+    udidNumber: row.udidNumber,
+    // Facilities
+    facilitiesReceived: parseFacilities(row.facilitiesReceived),
+    // Verification flags
+    isAadhaarVerified: row.isAadhaarVerified ?? false,
+    udiseVerified: row.udiseVerified ?? false,
   };
 }
 
-// ==================== GET ALL USERS (WITH ROLES) ====================
-/** 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET ALL USERS
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getSchoolUsers(
   env: SchoolEnv["Bindings"],
   schoolCode: string
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  const usersWithProfiles = await db
+  const rows = await db
     .select({
-      user: schoolUsersSchema,
-      student: studentsSchema,
-      teacher: teachersSchema,
-      parent: parentsSchema,
-      staff: staffSchema,
+      ...SAFE_USER_FIELDS,
+      rolesJson: rolesSubSelect,
+
+      // ── Student profile (full — including all UDISE fields) ───────────────
+      ...STUDENT_SELECT_FIELDS,
+
+      // ── Teacher profile ───────────────────────────────────────────────────
+      teacherUserId: teachersSchema.userId,
+      qualification: teachersSchema.qualification,
+      experienceYears: teachersSchema.experienceYears,
+      teacherJoiningDate: teachersSchema.joiningDate,
+      specialization: teachersSchema.specialization,
+
+      // ── Parent profile ────────────────────────────────────────────────────
+      parentUserId: parentsSchema.userId,
+      occupation: parentsSchema.occupation,
+      address: parentsSchema.address,
+
+      // ── Staff profile ─────────────────────────────────────────────────────
+      staffUserId: staffSchema.userId,
+      designation: staffSchema.designation,
+      department: staffSchema.department,
+      staffJoiningDate: staffSchema.joiningDate,
+      salary: staffSchema.salary,
+      shift: staffSchema.shift,
     })
     .from(schoolUsersSchema)
     .leftJoin(studentsSchema, eq(schoolUsersSchema.id, studentsSchema.userId))
@@ -267,134 +481,179 @@ export async function getSchoolUsers(
     .orderBy(schoolUsersSchema.name)
     .all();
 
-  const userIds = usersWithProfiles.map((u) => u.user.id);
-
-  const rolesData =
-    userIds.length > 0
-      ? await db
-          .select({
-            userId: schoolUserRolesSchema.userId,
-            roleId: schoolRolesSchema.id,
-            roleName: schoolRolesSchema.name,
-            roleDescription: schoolRolesSchema.description,
-            isSystem: schoolRolesSchema.isSystem,
-            category: schoolRolesSchema.category,
-          })
-          .from(schoolUserRolesSchema)
-          .innerJoin(
-            schoolRolesSchema,
-            eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
-          )
-          .where(inArray(schoolUserRolesSchema.userId, userIds))
-          .all()
-      : [];
-
-  const rolesByUser = rolesData.reduce((acc, role) => {
-    if (!acc[role.userId]) acc[role.userId] = [];
-    acc[role.userId].push({
-      id: role.roleId,
-      name: role.roleName,
-      description: role.roleDescription,
-      isSystem: role.isSystem,
-      category: role.category,
-    });
-    return acc;
-  }, {} as Record<number, any[]>);
-
-  return usersWithProfiles.map((row) => ({
-    ...row.user,
-    roles: rolesByUser[row.user.id] || [],
-    profile: determineProfileFromPrimaryRole(row, row.user.primaryRole),
-  }));
-}
-*/
-
-// ==================== GET ALL USERS (WITH ROLES, NO PASSWORD) ====================
-export async function getSchoolUsers(
-  env: SchoolEnv["Bindings"],
-  schoolCode: string
-) {
-  const db = await getSchoolDB(env, schoolCode);
- 
-  const usersWithProfiles = await db
-    .select({
-      user: schoolUsersSchema,   // passwordHash excluded via mapUserRow
-      student: studentsSchema,
-      teacher: teachersSchema,
-      parent: parentsSchema,
-      staff: staffSchema,
-    })
-    .from(schoolUsersSchema)
-    .leftJoin(studentsSchema, eq(schoolUsersSchema.id, studentsSchema.userId))
-    .leftJoin(teachersSchema, eq(schoolUsersSchema.id, teachersSchema.userId))
-    .leftJoin(parentsSchema, eq(schoolUsersSchema.id, parentsSchema.userId))
-    .leftJoin(staffSchema, eq(schoolUsersSchema.id, staffSchema.userId))
-    .orderBy(schoolUsersSchema.name)
-    .all();
- 
-  const userIds = usersWithProfiles.map((u) => u.user.id);
-  const rolesByUser = await loadRolesForUsers(db, userIds);
- 
-  return usersWithProfiles.map((row) => mapUserRow(row, rolesByUser));
+  return rows.map(mapAllCategoriesRow);
 }
 
-// ==================== GET USERS BY CATEGORY (tab-based) =======================
-//
-// category: 'staff' | 'student' | 'parent'
-//
-// Maps to primaryRole universe:
-//   staff   → primaryRole NOT IN (STUDENT, STUDENT_PARENT)
-//   student → primaryRole = STUDENT (or any role with student profile category)
-//   parent  → primaryRole = STUDENT_PARENT (or any role with parent profile category)
-//
-// NEVER returns passwordHash.
+// ─────────────────────────────────────────────────────────────────────────────
+// GET USERS BY CATEGORY
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getSchoolUsersByCategory(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   category: PermissionCategory
 ) {
   const db = await getSchoolDB(env, schoolCode);
- 
-  // Determine which primaryRole values belong to this category.
-  // We query the roles table so custom roles created by the school owner
-  // are also handled correctly.
-  const rolesInCategory = await db
+
+  const rolesInCategory: { name: string }[] = await db
     .select({ name: schoolRolesSchema.name })
     .from(schoolRolesSchema)
     .where(eq(schoolRolesSchema.category, category))
     .all();
- 
-  const roleNames = rolesInCategory.map((r: { name: string }) => r.name);
- 
-  if (roleNames.length === 0) {
-    return [];
+
+  const roleNames = rolesInCategory.map((r) => r.name);
+  if (roleNames.length === 0) return [];
+
+  switch (category) {
+    // ── STUDENT — full UDISE fields ───────────────────────────────────────────
+    case "student": {
+      const rows = await db
+        .select({
+          ...SAFE_USER_FIELDS,
+          rolesJson: rolesSubSelect,
+          ...STUDENT_SELECT_FIELDS,
+        })
+        .from(schoolUsersSchema)
+        .leftJoin(
+          studentsSchema,
+          eq(schoolUsersSchema.id, studentsSchema.userId)
+        )
+        .where(inArray(schoolUsersSchema.primaryRole, roleNames))
+        .orderBy(schoolUsersSchema.name)
+        .all();
+
+      return rows.map((row: any) => {
+        const { rolesJson, ...rest } = row;
+        const studentProfile = extractStudentProfile(rest);
+
+        // Strip all student-specific fields from the base user object
+        const safeUser = omitStudentFields(rest);
+
+        return {
+          ...safeUser,
+          roles: parseRolesJson(rolesJson),
+          profile: studentProfile
+            ? { type: "student", data: studentProfile }
+            : null,
+        };
+      });
+    }
+
+    // ── PARENT ────────────────────────────────────────────────────────────────
+    case "parent": {
+      const rows = await db
+        .select({
+          ...SAFE_USER_FIELDS,
+          rolesJson: rolesSubSelect,
+          parentUserId: parentsSchema.userId,
+          occupation: parentsSchema.occupation,
+          address: parentsSchema.address,
+        })
+        .from(schoolUsersSchema)
+        .leftJoin(parentsSchema, eq(schoolUsersSchema.id, parentsSchema.userId))
+        .where(inArray(schoolUsersSchema.primaryRole, roleNames))
+        .orderBy(schoolUsersSchema.name)
+        .all();
+
+      return rows.map((row: any) => {
+        const { rolesJson, parentUserId, occupation, address, ...safeUser } =
+          row;
+        return {
+          ...safeUser,
+          roles: parseRolesJson(rolesJson),
+          profile:
+            parentUserId != null
+              ? {
+                  type: "parent",
+                  data: { userId: parentUserId, occupation, address },
+                }
+              : null,
+        };
+      });
+    }
+
+    // ── STAFF ─────────────────────────────────────────────────────────────────
+    case "staff":
+    default: {
+      const rows = await db
+        .select({
+          ...SAFE_USER_FIELDS,
+          rolesJson: rolesSubSelect,
+          teacherUserId: teachersSchema.userId,
+          qualification: teachersSchema.qualification,
+          experienceYears: teachersSchema.experienceYears,
+          teacherJoiningDate: teachersSchema.joiningDate,
+          specialization: teachersSchema.specialization,
+          staffUserId: staffSchema.userId,
+          designation: staffSchema.designation,
+          department: staffSchema.department,
+          staffJoiningDate: staffSchema.joiningDate,
+          salary: staffSchema.salary,
+          shift: staffSchema.shift,
+        })
+        .from(schoolUsersSchema)
+        .leftJoin(
+          teachersSchema,
+          eq(schoolUsersSchema.id, teachersSchema.userId)
+        )
+        .leftJoin(staffSchema, eq(schoolUsersSchema.id, staffSchema.userId))
+        .where(inArray(schoolUsersSchema.primaryRole, roleNames))
+        .orderBy(schoolUsersSchema.name)
+        .all();
+
+      return rows.map((row: any) => {
+        const {
+          rolesJson,
+          teacherUserId,
+          qualification,
+          experienceYears,
+          teacherJoiningDate,
+          specialization,
+          staffUserId,
+          designation,
+          department,
+          staffJoiningDate,
+          salary,
+          shift,
+          ...safeUser
+        } = row;
+
+        let profile: { type: string; data: Record<string, any> } | null = null;
+        if (teacherUserId != null) {
+          profile = {
+            type: "teacher",
+            data: {
+              userId: teacherUserId,
+              qualification,
+              experienceYears,
+              joiningDate: teacherJoiningDate,
+              specialization,
+            },
+          };
+        } else if (staffUserId != null) {
+          profile = {
+            type: "staff",
+            data: {
+              userId: staffUserId,
+              designation,
+              department,
+              joiningDate: staffJoiningDate,
+              salary,
+              shift,
+            },
+          };
+        }
+
+        return { ...safeUser, roles: parseRolesJson(rolesJson), profile };
+      });
+    }
   }
- 
-  const usersWithProfiles = await db
-    .select({
-      user: schoolUsersSchema,
-      student: studentsSchema,
-      teacher: teachersSchema,
-      parent: parentsSchema,
-      staff: staffSchema,
-    })
-    .from(schoolUsersSchema)
-    .leftJoin(studentsSchema, eq(schoolUsersSchema.id, studentsSchema.userId))
-    .leftJoin(teachersSchema, eq(schoolUsersSchema.id, teachersSchema.userId))
-    .leftJoin(parentsSchema, eq(schoolUsersSchema.id, parentsSchema.userId))
-    .leftJoin(staffSchema, eq(schoolUsersSchema.id, staffSchema.userId))
-    .where(inArray(schoolUsersSchema.primaryRole, roleNames))
-    .orderBy(schoolUsersSchema.name)
-    .all();
- 
-  const userIds = usersWithProfiles.map((u: any) => u.user.id);
-  const rolesByUser = await loadRolesForUsers(db, userIds);
- 
-  return usersWithProfiles.map((row: any) => mapUserRow(row, rolesByUser));
 }
 
-// ==================== GET USER BY ID (WITH ROLES) ====================
-/** 
+// ─────────────────────────────────────────────────────────────────────────────
+// GET USER BY ID — full UDISE fields for student profile
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getSchoolUserById(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -402,13 +661,33 @@ export async function getSchoolUserById(
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  const userWithProfile = await db
+  const row = await db
     .select({
-      user: schoolUsersSchema,
-      student: studentsSchema,
-      teacher: teachersSchema,
-      parent: parentsSchema,
-      staff: staffSchema,
+      ...SAFE_USER_FIELDS,
+      rolesJson: rolesSubSelect,
+
+      // Student — full
+      ...STUDENT_SELECT_FIELDS,
+
+      // Teacher
+      teacherUserId: teachersSchema.userId,
+      qualification: teachersSchema.qualification,
+      experienceYears: teachersSchema.experienceYears,
+      teacherJoiningDate: teachersSchema.joiningDate,
+      specialization: teachersSchema.specialization,
+
+      // Parent
+      parentUserId: parentsSchema.userId,
+      occupation: parentsSchema.occupation,
+      address: parentsSchema.address,
+
+      // Staff
+      staffUserId: staffSchema.userId,
+      designation: staffSchema.designation,
+      department: staffSchema.department,
+      staffJoiningDate: staffSchema.joiningDate,
+      salary: staffSchema.salary,
+      shift: staffSchema.shift,
     })
     .from(schoolUsersSchema)
     .leftJoin(studentsSchema, eq(schoolUsersSchema.id, studentsSchema.userId))
@@ -418,110 +697,124 @@ export async function getSchoolUserById(
     .where(eq(schoolUsersSchema.id, id))
     .get();
 
-  if (!userWithProfile) return null;
-
-  const roles = await db
-    .select({
-      id: schoolRolesSchema.id,
-      name: schoolRolesSchema.name,
-      description: schoolRolesSchema.description,
-      isSystem: schoolRolesSchema.isSystem,
-      category: schoolRolesSchema.category,
-    })
-    .from(schoolUserRolesSchema)
-    .innerJoin(
-      schoolRolesSchema,
-      eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
-    )
-    .where(eq(schoolUserRolesSchema.userId, id))
-    .all();
-
-  return {
-    ...userWithProfile.user,
-    roles,
-    profile: determineProfileFromPrimaryRole(
-      userWithProfile,
-      userWithProfile.user.primaryRole
-    ),
-  };
-}
-*/
-
-// ==================== GET USER BY ID (WITH ROLES, NO PASSWORD) ================
-export async function getSchoolUserById(
-  env: SchoolEnv["Bindings"],
-  schoolCode: string,
-  id: number
-) {
-  const db = await getSchoolDB(env, schoolCode);
- 
-  const userWithProfile = await db
-    .select({
-      user: schoolUsersSchema,
-      student: studentsSchema,
-      teacher: teachersSchema,
-      parent: parentsSchema,
-      staff: staffSchema,
-    })
-    .from(schoolUsersSchema)
-    .leftJoin(studentsSchema, eq(schoolUsersSchema.id, studentsSchema.userId))
-    .leftJoin(teachersSchema, eq(schoolUsersSchema.id, teachersSchema.userId))
-    .leftJoin(parentsSchema, eq(schoolUsersSchema.id, parentsSchema.userId))
-    .leftJoin(staffSchema, eq(schoolUsersSchema.id, staffSchema.userId))
-    .where(eq(schoolUsersSchema.id, id))
-    .get();
- 
-  if (!userWithProfile) return null;
- 
-  const roles = await db
-    .select({
-      id: schoolRolesSchema.id,
-      name: schoolRolesSchema.name,
-      description: schoolRolesSchema.description,
-      isSystem: schoolRolesSchema.isSystem,
-      category: schoolRolesSchema.category,
-    })
-    .from(schoolUserRolesSchema)
-    .innerJoin(
-      schoolRolesSchema,
-      eq(schoolUserRolesSchema.roleId, schoolRolesSchema.id)
-    )
-    .where(eq(schoolUserRolesSchema.userId, id))
-    .all();
- 
-  // Exclude passwordHash
-  const { passwordHash: _omit, ...safeUser } = userWithProfile.user as any;
- 
-  return {
-    ...safeUser,
-    roles,
-    profile: determineProfileFromPrimaryRole(
-      userWithProfile,
-      userWithProfile.user.primaryRole
-    ),
-  };
+  if (!row) return null;
+  return mapAllCategoriesRow(row);
 }
 
-// ==================== PRE-DELETE DEPENDENCY CHECK ============================
-//
-// Call this BEFORE attempting deletion. Returns a DeletionCheckResult that
-// the frontend uses to build a rich confirmation dialog.
-//
-// Blocking conditions (canDelete = false):
-//   - Student has active (isActive=true) enrollments
-//   - Teacher is the sole class teacher for any active class-section
-//     (not blocking but a strong warning)
-//
-// Non-blocking warnings:
-//   - Any historical data will become orphaned / anonymised
+// ─────────────────────────────────────────────────────────────────────────────
+// INTERNAL MAP — flat row → shaped user object
+// ─────────────────────────────────────────────────────────────────────────────
+
+function omitStudentFields(row: any): any {
+  // Remove all student-specific fields from the top-level user object
+  const {
+    studentUserId,
+    admissionNumber,
+    rollNumber,
+    admissionDate,
+    previousSchool,
+    medicalInfo,
+    enrollmentType,
+    pen,
+    apaarId,
+    stateStudentId,
+    aadhaarMasked,
+    aadhaarName,
+    previousSchoolUdiseCode,
+    previousClassResult,
+    socialCategory,
+    religion,
+    isMinority,
+    motherTongueCode,
+    isBpl,
+    localityType,
+    isCwsn,
+    disabilityType,
+    hasDisabilityCertificate,
+    udidNumber,
+    facilitiesReceived,
+    isAadhaarVerified,
+    udiseVerified,
+    ...rest
+  } = row;
+  return rest;
+}
+
+function mapAllCategoriesRow(row: any) {
+  const {
+    rolesJson,
+    // teacher fields
+    teacherUserId,
+    qualification,
+    experienceYears,
+    teacherJoiningDate,
+    specialization,
+    // parent fields
+    parentUserId,
+    occupation,
+    address,
+    // staff fields
+    staffUserId,
+    designation,
+    department,
+    staffJoiningDate,
+    salary,
+    shift,
+    ...rest
+  } = row;
+
+  // Extract student profile (includes all UDISE fields) — then strip from base
+  const studentProfile = extractStudentProfile(rest);
+  const safeUser = omitStudentFields(rest);
+
+  let profile: { type: string; data: Record<string, any> } | null = null;
+
+  if (studentProfile) {
+    profile = { type: "student", data: studentProfile };
+  } else if (teacherUserId != null) {
+    profile = {
+      type: "teacher",
+      data: {
+        userId: teacherUserId,
+        qualification,
+        experienceYears,
+        joiningDate: teacherJoiningDate,
+        specialization,
+      },
+    };
+  } else if (parentUserId != null) {
+    profile = {
+      type: "parent",
+      data: { userId: parentUserId, occupation, address },
+    };
+  } else if (staffUserId != null) {
+    profile = {
+      type: "staff",
+      data: {
+        userId: staffUserId,
+        designation,
+        department,
+        joiningDate: staffJoiningDate,
+        salary,
+        shift,
+      },
+    };
+  }
+
+  return { ...safeUser, roles: parseRolesJson(rolesJson), profile };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRE-DELETE DEPENDENCY CHECK
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function checkUserDeletionImpact(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   userId: number
 ): Promise<DeletionCheckResult> {
   const db = await getSchoolDB(env, schoolCode);
- 
-  // 1. Load user
+
   const user = await db
     .select({
       id: schoolUsersSchema.id,
@@ -532,23 +825,31 @@ export async function checkUserDeletionImpact(
     .from(schoolUsersSchema)
     .where(eq(schoolUsersSchema.id, userId))
     .get();
- 
+
   if (!user) {
     return {
       canDelete: false,
       blockingReason: "User not found.",
       warnings: [],
-      summary: { enrollments: 0, attendanceRecords: 0, feePayments: 0, examMarks: 0, assignments: 0, submissions: 0, linkedChildren: 0, linkedParents: 0 },
+      summary: {
+        enrollments: 0,
+        attendanceRecords: 0,
+        feePayments: 0,
+        examMarks: 0,
+        assignments: 0,
+        submissions: 0,
+        linkedChildren: 0,
+        linkedParents: 0,
+      },
       userInfo: { name: "Unknown", primaryRole: "Unknown", isActive: false },
     };
   }
- 
+
   const profileCat = getProfileCategory(user.primaryRole);
   const warnings: DeletionWarning[] = [];
   let canDelete = true;
   let blockingReason: string | undefined;
- 
-  // ── Counts ────────────────────────────────────────────────────────────────
+
   let enrollmentCount = 0;
   let activeEnrollmentCount = 0;
   let attendanceCount = 0;
@@ -558,8 +859,7 @@ export async function checkUserDeletionImpact(
   let submissionCount = 0;
   let linkedChildrenCount = 0;
   let linkedParentsCount = 0;
- 
-  // ── 2. STUDENT CHECKS ─────────────────────────────────────────────────────
+
   if (profileCat === "student") {
     const enrollments = await db
       .select({
@@ -569,171 +869,141 @@ export async function checkUserDeletionImpact(
       .from(schoolStudentEnrollmentsSchema)
       .where(eq(schoolStudentEnrollmentsSchema.studentId, userId))
       .all();
- 
+
     enrollmentCount = enrollments.length;
     activeEnrollmentCount = enrollments.filter((e: any) => e.isActive).length;
- 
+
     if (activeEnrollmentCount > 0) {
       canDelete = false;
-      blockingReason = `This student has ${activeEnrollmentCount} active enrollment${activeEnrollmentCount > 1 ? "s" : ""}. You must unenroll the student before deletion. Consider deactivating the account instead.`;
+      blockingReason = `This student has ${activeEnrollmentCount} active enrollment${
+        activeEnrollmentCount > 1 ? "s" : ""
+      }. You must unenroll the student before deletion. Consider deactivating the account instead.`;
     }
- 
-    // Fee payments
-    const feePaymentsRows = enrollments.length > 0
-      ? await db
-          .select({ id: schoolFeePaymentsSchema.id })
-          .from(schoolFeePaymentsSchema)
-          .where(
-            inArray(
-              schoolFeePaymentsSchema.enrollmentId,
-              enrollments.map((e: any) => e.id)
-            )
-          )
-          .all()
-      : [];
+
+    const enrollmentIds = enrollments.map((e: any) => e.id);
+
+    const feePaymentsRows =
+      enrollmentIds.length > 0
+        ? await db
+            .select({ id: schoolFeePaymentsSchema.id })
+            .from(schoolFeePaymentsSchema)
+            .where(inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds))
+            .all()
+        : [];
     feePaymentCount = feePaymentsRows.length;
- 
-    // Attendance
-    const attendanceRows = enrollments.length > 0
-      ? await db
-          .select({ id: schoolAttendancesSchema.id })
-          .from(schoolAttendancesSchema)
-          .where(
-            inArray(
-              schoolAttendancesSchema.enrollmentId,
-              enrollments.map((e: any) => e.id)
-            )
-          )
-          .all()
-      : [];
+
+    const attendanceRows =
+      enrollmentIds.length > 0
+        ? await db
+            .select({ id: schoolAttendancesSchema.id })
+            .from(schoolAttendancesSchema)
+            .where(inArray(schoolAttendancesSchema.enrollmentId, enrollmentIds))
+            .all()
+        : [];
     attendanceCount = attendanceRows.length;
- 
-    // Exam marks
-    const examMarkRows = enrollments.length > 0
-      ? await db
-          .select({ id: schoolExamMarksSchema.id })
-          .from(schoolExamMarksSchema)
-          .where(
-            inArray(
-              schoolExamMarksSchema.enrollmentId,
-              enrollments.map((e: any) => e.id)
-            )
-          )
-          .all()
-      : [];
+
+    const examMarkRows =
+      enrollmentIds.length > 0
+        ? await db
+            .select({ id: schoolExamMarksSchema.id })
+            .from(schoolExamMarksSchema)
+            .where(inArray(schoolExamMarksSchema.enrollmentId, enrollmentIds))
+            .all()
+        : [];
     examMarkCount = examMarkRows.length;
- 
-    // Assignment submissions
-    const submissionRows = enrollments.length > 0
-      ? await db
-          .select({ id: schoolAssignmentSubmissionsSchema.id })
-          .from(schoolAssignmentSubmissionsSchema)
-          .where(
-            inArray(
-              schoolAssignmentSubmissionsSchema.enrollmentId,
-              enrollments.map((e: any) => e.id)
+
+    const submissionRows =
+      enrollmentIds.length > 0
+        ? await db
+            .select({ id: schoolAssignmentSubmissionsSchema.id })
+            .from(schoolAssignmentSubmissionsSchema)
+            .where(
+              inArray(
+                schoolAssignmentSubmissionsSchema.enrollmentId,
+                enrollmentIds
+              )
             )
-          )
-          .all()
-      : [];
+            .all()
+        : [];
     submissionCount = submissionRows.length;
- 
-    // Linked parents
+
     const linkedParentRows = await db
       .select({ parentId: studentParentsSchema.parentId })
       .from(studentParentsSchema)
       .where(eq(studentParentsSchema.studentId, userId))
       .all();
     linkedParentsCount = linkedParentRows.length;
- 
-    // Build warnings
-    if (!canDelete && activeEnrollmentCount > 0) {
+
+    if (activeEnrollmentCount > 0)
       warnings.push({
         severity: "danger",
         message: `Student has ${activeEnrollmentCount} active enrollment(s). Deletion is blocked until unenrolled.`,
       });
-    }
-    if (feePaymentCount > 0) {
+    if (feePaymentCount > 0)
       warnings.push({
         severity: "warning",
         message: `${feePaymentCount} fee payment record(s) will be permanently deleted. This cannot be undone.`,
       });
-    }
-    if (attendanceCount > 0) {
+    if (attendanceCount > 0)
       warnings.push({
         severity: "warning",
         message: `${attendanceCount} attendance record(s) across all enrollments will be deleted.`,
       });
-    }
-    if (examMarkCount > 0) {
+    if (examMarkCount > 0)
       warnings.push({
         severity: "warning",
         message: `${examMarkCount} exam mark record(s) will be permanently deleted.`,
       });
-    }
-    if (submissionCount > 0) {
+    if (submissionCount > 0)
       warnings.push({
         severity: "warning",
         message: `${submissionCount} assignment submission(s) will be deleted.`,
       });
-    }
-    if (linkedParentsCount > 0) {
+    if (linkedParentsCount > 0)
       warnings.push({
         severity: "info",
         message: `${linkedParentsCount} linked parent account(s) will be unlinked but not deleted.`,
       });
-    }
   }
- 
-  // ── 3. TEACHER / STAFF CHECKS ─────────────────────────────────────────────
+
   if (profileCat === "teacher") {
-    // Check assignments created by this teacher
     const assignmentRows = await db
       .select({ id: schoolAssignmentsSchema.id })
       .from(schoolAssignmentsSchema)
       .where(eq(schoolAssignmentsSchema.enteredBy, userId))
       .all();
     assignmentCount = assignmentRows.length;
- 
-    if (assignmentCount > 0) {
+    if (assignmentCount > 0)
       warnings.push({
         severity: "warning",
         message: `${assignmentCount} assignment(s) created by this teacher will be deleted along with all student submissions.`,
       });
-    }
- 
-    // Attendance records marked by this teacher
+
     const attendanceRows = await db
       .select({ id: schoolAttendancesSchema.id })
       .from(schoolAttendancesSchema)
       .where(eq(schoolAttendancesSchema.markedBy, userId))
       .all();
     attendanceCount = attendanceRows.length;
- 
-    if (attendanceCount > 0) {
+    if (attendanceCount > 0)
       warnings.push({
         severity: "warning",
         message: `${attendanceCount} attendance record(s) marked by this teacher — the 'marked by' reference will be cleared.`,
       });
-    }
- 
-    // Exam marks entered by this teacher
+
     const examMarkRows = await db
       .select({ id: schoolExamMarksSchema.id })
       .from(schoolExamMarksSchema)
       .where(eq(schoolExamMarksSchema.enteredBy, userId))
       .all();
     examMarkCount = examMarkRows.length;
- 
-    if (examMarkCount > 0) {
+    if (examMarkCount > 0)
       warnings.push({
         severity: "warning",
         message: `${examMarkCount} exam mark entry/entries recorded by this teacher — the 'entered by' reference will be cleared.`,
       });
-    }
   }
- 
-  // ── 4. PARENT CHECKS ──────────────────────────────────────────────────────
+
   if (profileCat === "parent") {
     const childRows = await db
       .select({ studentId: studentParentsSchema.studentId })
@@ -741,30 +1011,28 @@ export async function checkUserDeletionImpact(
       .where(eq(studentParentsSchema.parentId, userId))
       .all();
     linkedChildrenCount = childRows.length;
- 
-    if (linkedChildrenCount > 0) {
+    if (linkedChildrenCount > 0)
       warnings.push({
         severity: "warning",
         message: `This parent is linked to ${linkedChildrenCount} student(s). Deleting will remove all parent-child links. Student accounts will NOT be deleted.`,
       });
-    }
   }
- 
-  // ── 5. Universal warning for any non-trivial user ─────────────────────────
+
   if (canDelete) {
     warnings.push({
       severity: "danger",
-      message: "This action is permanent and cannot be undone. The account will be completely removed from the system.",
+      message:
+        "This action is permanent and cannot be undone. The account will be completely removed from the system.",
     });
   }
- 
   if (user.isActive && canDelete) {
     warnings.push({
       severity: "info",
-      message: "Tip: Consider deactivating the account instead of deleting if you may need to restore this user's data in the future.",
+      message:
+        "Tip: Consider deactivating the account instead of deleting if you may need to restore this user's data in the future.",
     });
   }
- 
+
   return {
     canDelete,
     blockingReason,
@@ -787,7 +1055,10 @@ export async function checkUserDeletionImpact(
   };
 }
 
-// ==================== CREATE USER (PRODUCTION-GRADE) ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// CREATE USER
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function createSchoolUser(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -797,14 +1068,14 @@ export async function createSchoolUser(
   const db = await getSchoolDB(env, schoolCode);
 
   return await db.transaction(async (tx) => {
-    // ── 1. VALIDATE: primaryRoleId must be in roleIds ──────────────────────
+    // ── Guard: primaryRoleId must be in roleIds ─────────────────────────────
     if (!data.roleIds.includes(data.primaryRoleId)) {
       throw new Error(
         "Primary role must be included in the assigned roles list."
       );
     }
 
-    // ── 2. VALIDATE ALL ROLE IDs EXIST ────────────────────────────────────
+    // ── Validate role IDs ───────────────────────────────────────────────────
     const validRoles = await tx
       .select({ id: schoolRolesSchema.id, name: schoolRolesSchema.name })
       .from(schoolRolesSchema)
@@ -815,34 +1086,29 @@ export async function createSchoolUser(
       throw new Error("One or more invalid role IDs provided.");
     }
 
-    // ── 3. VALIDATE PRIMARY ROLE EXISTS IN FETCHED ROLES ─────────────────
     const primaryRoleRecord = validRoles.find(
       (r) => r.id === data.primaryRoleId
     );
-    if (!primaryRoleRecord) {
-      throw new Error("Primary role ID is invalid.");
-    }
+    if (!primaryRoleRecord) throw new Error("Primary role ID is invalid.");
 
     const primaryRoleName = primaryRoleRecord.name;
     const profileCategory = getProfileCategory(primaryRoleName);
 
-    // ── 4. CHECK EMAIL UNIQUENESS ──────────────────────────────────────────
+    // ── Guard: unique email ─────────────────────────────────────────────────
     const existingUser = await tx
       .select({ id: schoolUsersSchema.id })
       .from(schoolUsersSchema)
       .where(eq(schoolUsersSchema.email, data.email))
       .get();
-
     if (existingUser) {
       throw new Error(
         "This email address is already registered in this school."
       );
     }
 
-    // ── 5. HASH PASSWORD ───────────────────────────────────────────────────
     const passwordHash = await hashPassword(data.password);
 
-    // ── 6. CREATE BASE USER (with primaryRole persisted) ──────────────────
+    // ── Insert school_users row (includes new guardian/parent name fields) ──
     const [newUser] = await tx
       .insert(schoolUsersSchema)
       .values({
@@ -853,7 +1119,7 @@ export async function createSchoolUser(
         phone: data.phone || "",
         alternatePhone: data.alternatePhone || "",
         dateOfBirth: data.dateOfBirth || "",
-        gender: data.gender || "",
+        gender: (data.gender as any) || "",
         addressLineOne: data.addressLineOne || "",
         addressLineTwo: data.addressLineTwo || "",
         city: data.city || "",
@@ -861,19 +1127,23 @@ export async function createSchoolUser(
         postalCode: data.postalCode || "",
         bloodGroup: data.bloodGroup || "",
         avatarUrl: data.avatarUrl || "",
+
+        // ── NEW: Guardian/parent names ──────────────────────────────────────
+        fatherName: data.fatherName || "",
+        motherName: data.motherName || "",
+        guardianName: data.guardianName || "",
+        guardianRelation: data.guardianRelation || "",
+
         tokenVersion: 0,
       })
       .returning();
 
-    // ── 7. ASSIGN ALL ROLES ────────────────────────────────────────────────
-    await tx.insert(schoolUserRolesSchema).values(
-      data.roleIds.map((roleId) => ({
-        userId: newUser.id,
-        roleId,
-      }))
-    );
+    // ── Assign roles ────────────────────────────────────────────────────────
+    await tx
+      .insert(schoolUserRolesSchema)
+      .values(data.roleIds.map((roleId) => ({ userId: newUser.id, roleId })));
 
-    // ── 8. CREATE PROFILE based on profileCategory ─────────────────────────
+    // ── Create profile row ──────────────────────────────────────────────────
     await createUserProfile(
       tx,
       newUser.id,
@@ -882,8 +1152,7 @@ export async function createSchoolUser(
       data
     );
 
-    // ── 9. SEND WELCOME EMAIL ──────────────────────────────────────────────
-    const roleNames = validRoles.map((r) => r.name).join(", ");
+    // ── Welcome email ───────────────────────────────────────────────────────
     const emailData: BrevoSendEmailRequest = {
       sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
       to: [{ email: data.email, name: data.name }],
@@ -915,26 +1184,32 @@ export async function createSchoolUser(
               )}</td>
             </tr>
           </table>
+
+          <p style="margin: 24px 0;">
+            <a href="${getFrontendUrlForUsers(env)}/school/auth/login" 
+              style="background:#1e40af;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:600;">
+              Login to Your Account
+            </a>
+          </p>
+
           <p style="color: #dc2626;"><strong>Important:</strong> Please change your password after your first login.</p>
         </div>
       `,
     };
-
     await sendTransactionalEmail(env, emailData).catch((err) => {
       console.error("Welcome email failed (non-fatal):", err);
     });
 
     return {
-      user: {
-        ...newUser,
-        roles: validRoles,
-        primaryRole: primaryRoleName,
-      },
+      user: { ...newUser, roles: validRoles, primaryRole: primaryRoleName },
     };
   });
 }
 
-// ==================== UPDATE USER ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// UPDATE USER
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function updateSchoolUser(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -945,7 +1220,6 @@ export async function updateSchoolUser(
   const db = await getSchoolDB(env, schoolCode);
 
   return await db.transaction(async (tx) => {
-    // ── 1. FETCH EXISTING USER (including primaryRole) ────────────────────
     const existingUser = await tx
       .select({
         id: schoolUsersSchema.id,
@@ -958,11 +1232,9 @@ export async function updateSchoolUser(
       .where(eq(schoolUsersSchema.id, id))
       .get();
 
-    if (!existingUser) {
-      throw new Error("User not found.");
-    }
+    if (!existingUser) throw new Error("User not found.");
 
-    // ── 2. CHECK EMAIL UNIQUENESS ──────────────────────────────────────────
+    // ── Guard: email uniqueness ─────────────────────────────────────────────
     if (data.email && data.email !== existingUser.email) {
       const emailTaken = await tx
         .select({ id: schoolUsersSchema.id })
@@ -974,23 +1246,30 @@ export async function updateSchoolUser(
           )
         )
         .get();
-
-      if (emailTaken) {
-        throw new Error("This email address is already in use.");
-      }
+      if (emailTaken) throw new Error("This email address is already in use.");
     }
 
-    // ── 3. BUILD UPDATE DATA ───────────────────────────────────────────────
+    // ── Build school_users update payload ───────────────────────────────────
     const updateData: any = { updatedAt: sql`CURRENT_TIMESTAMP` };
 
+    // Core
     if (data.name !== undefined) updateData.name = data.name;
     if (data.email !== undefined) updateData.email = data.email;
+    if (data.isActive !== undefined) updateData.isActive = data.isActive;
+
+    // Contact
     if (data.phone !== undefined) updateData.phone = data.phone;
     if (data.alternatePhone !== undefined)
       updateData.alternatePhone = data.alternatePhone;
+
+    // Personal
     if (data.dateOfBirth !== undefined)
       updateData.dateOfBirth = data.dateOfBirth;
     if (data.gender !== undefined) updateData.gender = data.gender;
+    if (data.bloodGroup !== undefined) updateData.bloodGroup = data.bloodGroup;
+    if (data.avatarUrl !== undefined) updateData.avatarUrl = data.avatarUrl;
+
+    // Address
     if (data.addressLineOne !== undefined)
       updateData.addressLineOne = data.addressLineOne;
     if (data.addressLineTwo !== undefined)
@@ -998,27 +1277,31 @@ export async function updateSchoolUser(
     if (data.city !== undefined) updateData.city = data.city;
     if (data.state !== undefined) updateData.state = data.state;
     if (data.postalCode !== undefined) updateData.postalCode = data.postalCode;
-    if (data.bloodGroup !== undefined) updateData.bloodGroup = data.bloodGroup;
-    if (data.avatarUrl !== undefined) updateData.avatarUrl = data.avatarUrl;
-    if (data.isActive !== undefined) updateData.isActive = data.isActive;
 
-    // ── 4. PASSWORD CHANGE → increment tokenVersion ────────────────────────
+    // ── NEW: Guardian/parent name fields ─────────────────────────────────────
+    if (data.fatherName !== undefined) updateData.fatherName = data.fatherName;
+    if (data.motherName !== undefined) updateData.motherName = data.motherName;
+    if (data.guardianName !== undefined)
+      updateData.guardianName = data.guardianName;
+    if (data.guardianRelation !== undefined)
+      updateData.guardianRelation = data.guardianRelation;
+
+    // Password change — bump tokenVersion to invalidate all active sessions
     if (data.newPassword) {
       updateData.passwordHash = await hashPassword(data.newPassword);
       updateData.tokenVersion = existingUser.tokenVersion + 1;
     }
 
-    // ── 5. UPDATE BASE USER ────────────────────────────────────────────────
     await tx
       .update(schoolUsersSchema)
       .set(updateData)
       .where(eq(schoolUsersSchema.id, id));
 
-    // ── 6. UPDATE PROFILE using primaryRole ───────────────────────────────
+    // ── Update profile table ────────────────────────────────────────────────
     const profileCategory = getProfileCategory(existingUser.primaryRole);
     await updateUserProfile(tx, id, profileCategory, data);
 
-    // ── 7. SEND EMAIL IF PASSWORD CHANGED ─────────────────────────────────
+    // ── Password-change notification email ──────────────────────────────────
     if (data.newPassword) {
       const emailData: BrevoSendEmailRequest = {
         sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
@@ -1036,7 +1319,6 @@ export async function updateSchoolUser(
           <p><em>Please log in and change it immediately for security.</em></p>
         `,
       };
-
       await sendTransactionalEmail(env, emailData).catch((err) => {
         console.error("Password update email failed (non-fatal):", err);
       });
@@ -1046,7 +1328,10 @@ export async function updateSchoolUser(
   });
 }
 
-// ==================== ASSIGN ROLES TO USER ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// ASSIGN ROLES TO USER
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function assignRolesToUser(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
@@ -1057,7 +1342,6 @@ export async function assignRolesToUser(
   const db = await getSchoolDB(env, schoolCode);
 
   return await db.transaction(async (tx) => {
-    // ── 1. FETCH USER ─────────────────────────────────────────────────────
     const user = await tx
       .select({
         id: schoolUsersSchema.id,
@@ -1069,48 +1353,35 @@ export async function assignRolesToUser(
       .from(schoolUsersSchema)
       .where(eq(schoolUsersSchema.id, userId))
       .get();
+    if (!user) throw new Error("User not found.");
 
-    if (!user) {
-      throw new Error("User not found.");
-    }
-
-    // ── 2. VALIDATE ALL INCOMING ROLE IDs ─────────────────────────────────
     const validRoles = await tx
       .select({ id: schoolRolesSchema.id, name: schoolRolesSchema.name })
       .from(schoolRolesSchema)
       .where(inArray(schoolRolesSchema.id, roleIds))
       .all();
-
-    if (validRoles.length !== roleIds.length) {
+    if (validRoles.length !== roleIds.length)
       throw new Error("One or more invalid role IDs provided.");
-    }
 
-    // ── 3. PRIMARY ROLE IMMUTABILITY GUARD ────────────────────────────────
+    // ── Guard: primary role cannot be removed ───────────────────────────────
     const primaryRoleRecord = await tx
       .select({ id: schoolRolesSchema.id, name: schoolRolesSchema.name })
       .from(schoolRolesSchema)
       .where(eq(schoolRolesSchema.name, user.primaryRole))
       .get();
-
-    if (!primaryRoleRecord) {
+    if (!primaryRoleRecord)
       throw new Error(
-        `Integrity error: primary role "${user.primaryRole}" no longer exists in the roles table. ` +
-          `Please contact support.`
+        `Integrity error: primary role "${user.primaryRole}" no longer exists in the roles table. Please contact support.`
       );
-    }
-
-    if (!roleIds.includes(primaryRoleRecord.id)) {
+    if (!roleIds.includes(primaryRoleRecord.id))
       throw new Error(
         `Cannot remove the primary role "${user.primaryRole.replace(
           /_/g,
           " "
-        )}" from this user. ` +
-          `The primary role is permanent and defines the user's identity in this school. ` +
-          `If this user's role needs to fundamentally change, please create a new account.`
+        )}" from this user. The primary role is permanent and defines the user's identity in this school. If this user's role needs to fundamentally change, please create a new account.`
       );
-    }
 
-    // ── 4. SCHOOL_OWNER LAST-OWNER GUARD ──────────────────────────────────
+    // ── Guard: last SCHOOL_OWNER ────────────────────────────────────────────
     if (user.primaryRole === SchoolRole.SCHOOL_OWNER) {
       const otherOwners = await tx
         .select({ id: schoolUsersSchema.id })
@@ -1123,37 +1394,32 @@ export async function assignRolesToUser(
           )
         )
         .all();
-
       if (otherOwners.length === 0) {
         const incomingHasOwner = validRoles.some(
           (r) => r.name === SchoolRole.SCHOOL_OWNER
         );
-        if (!incomingHasOwner) {
+        if (!incomingHasOwner)
           throw new Error(
-            "Cannot remove the School Owner role from the last active school owner. " +
-              "Please assign another user as School Owner first."
+            "Cannot remove the School Owner role from the last active school owner. Please assign another user as School Owner first."
           );
-        }
       }
     }
 
-    // ── 5. REPLACE ROLE ASSIGNMENTS ───────────────────────────────────────
+    // ── Swap roles ──────────────────────────────────────────────────────────
     await tx
       .delete(schoolUserRolesSchema)
       .where(eq(schoolUserRolesSchema.userId, userId));
-
     await tx
       .insert(schoolUserRolesSchema)
       .values(roleIds.map((roleId) => ({ userId, roleId })));
 
-    // ── 6. INVALIDATE TOKENS ───────────────────────────────────────────────
+    // Bump tokenVersion to invalidate all current sessions
     const newTokenVersion = user.tokenVersion + 1;
     await tx
       .update(schoolUsersSchema)
       .set({ tokenVersion: newTokenVersion })
       .where(eq(schoolUsersSchema.id, userId));
 
-    // ── 7. FETCH NEW PERMISSIONS (for logging) ─────────────────────────────
     const newPermissions = await getUserPermissionsFromDB(tx, userId);
     console.log(
       `🔄 Role update for user ${userId} | primaryRole: ${
@@ -1163,7 +1429,7 @@ export async function assignRolesToUser(
         .join(", ")} | permissions: ${newPermissions.length}`
     );
 
-    // ── 8. SEND NOTIFICATION EMAIL ─────────────────────────────────────────
+    // ── Role-update notification email ──────────────────────────────────────
     const emailData: BrevoSendEmailRequest = {
       sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
       to: [{ email: user.email, name: user.name }],
@@ -1182,7 +1448,6 @@ export async function assignRolesToUser(
         <p><em>Your previous sessions have been invalidated for security. Please log in again.</em></p>
       `,
     };
-
     await sendTransactionalEmail(env, emailData).catch((err) => {
       console.error("Role update email failed (non-fatal):", err);
     });
@@ -1196,14 +1461,16 @@ export async function assignRolesToUser(
   });
 }
 
-// ==================== GET USER ROLES ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET USER ROLES
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getUserRoles(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   userId: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
-
   return await db
     .select({
       id: schoolRolesSchema.id,
@@ -1221,14 +1488,16 @@ export async function getUserRoles(
     .all();
 }
 
-// ==================== GET USER DIRECT PERMISSIONS ====================
+// ─────────────────────────────────────────────────────────────────────────────
+// GET USER DIRECT PERMISSIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function getUserDirectPermissions(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   userId: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
-
   return await db
     .select({
       id: schoolPermissionsSchema.id,
@@ -1246,20 +1515,51 @@ export async function getUserDirectPermissions(
     .all();
 }
 
-// ==================== ASSIGN DIRECT PERMISSIONS ====================
-// UPDATED: Enforces category consistency — submitted permissionIds must all
-// belong to the same permission universe as the user's primaryRole.
+// ─────────────────────────────────────────────────────────────────────────────
+// GET USER DENIED PERMISSIONS
+// ─────────────────────────────────────────────────────────────────────────────
+
+export async function getUserDeniedPermissions(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number
+) {
+  const db = await getSchoolDB(env, schoolCode);
+  return await db
+    .select({
+      id: schoolPermissionsSchema.id,
+      slug: schoolPermissionsSchema.slug,
+      name: schoolPermissionsSchema.name,
+      module: schoolPermissionsSchema.module,
+      category: schoolPermissionsSchema.category,
+    })
+    .from(schoolUserPermissionDenialsSchema)
+    .innerJoin(
+      schoolPermissionsSchema,
+      eq(
+        schoolUserPermissionDenialsSchema.permissionId,
+        schoolPermissionsSchema.id
+      )
+    )
+    .where(eq(schoolUserPermissionDenialsSchema.userId, userId))
+    .all();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ASSIGN DIRECT PERMISSIONS + DENIALS
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function assignDirectPermissionsToUser(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   userId: number,
   permissionIds: number[],
+  deniedPermissionIds: number[],
   updatedBy: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
   return await db.transaction(async (tx) => {
-    // 1. Verify user exists and read their primaryRole
     const user = await tx
       .select({
         id: schoolUsersSchema.id,
@@ -1269,17 +1569,13 @@ export async function assignDirectPermissionsToUser(
       .from(schoolUsersSchema)
       .where(eq(schoolUsersSchema.id, userId))
       .get();
+    if (!user) throw new Error("User not found");
 
-    if (!user) {
-      throw new Error("User not found");
-    }
-
-    // 2. Derive the expected permission category from the user's primaryRole
     const profileCat = getProfileCategory(user.primaryRole);
     const expectedCategory = profileCategoryToPermissionCategory(profileCat);
+    const allIds = [...new Set([...permissionIds, ...deniedPermissionIds])];
 
-    // 3. Validate permissions exist AND belong to the correct category
-    if (permissionIds.length > 0) {
+    if (allIds.length > 0) {
       const perms = await tx
         .select({
           id: schoolPermissionsSchema.id,
@@ -1287,20 +1583,15 @@ export async function assignDirectPermissionsToUser(
           category: schoolPermissionsSchema.category,
         })
         .from(schoolPermissionsSchema)
-        .where(inArray(schoolPermissionsSchema.id, permissionIds))
+        .where(inArray(schoolPermissionsSchema.id, allIds))
         .all();
-
-      // Check for IDs that don't exist in the DB at all
-      if (perms.length !== permissionIds.length) {
+      if (perms.length !== allIds.length)
         throw new Error("One or more invalid permission IDs");
-      }
 
-      // Check for category mismatches
       const wrongCategory = perms.filter(
         (p: { id: number; slug: string; category: string }) =>
           p.category !== expectedCategory
       );
-
       if (wrongCategory.length > 0) {
         const slugList = wrongCategory
           .map(
@@ -1310,58 +1601,61 @@ export async function assignDirectPermissionsToUser(
               })`
           )
           .join(", ");
-
         throw new Error(
-          `Category mismatch: The following permissions do not belong to the ` +
-            `"${CATEGORY_LABELS[expectedCategory]}" category: ${slugList}. ` +
-            `Only ${CATEGORY_LABELS[expectedCategory]} permissions can be assigned to this user ` +
-            `(their primary role is "${user.primaryRole}").`
+          `Category mismatch: The following permissions do not belong to the "${CATEGORY_LABELS[expectedCategory]}" category: ${slugList}. Only ${CATEGORY_LABELS[expectedCategory]} permissions can be assigned to this user (their primary role is "${user.primaryRole}").`
         );
       }
     }
 
-    // 4. Delete existing direct permissions
+    // ── Replace grants ──────────────────────────────────────────────────────
     await tx
       .delete(schoolUserPermissionsSchema)
       .where(eq(schoolUserPermissionsSchema.userId, userId));
-
-    // 5. Insert new permissions
     if (permissionIds.length > 0) {
-      await tx.insert(schoolUserPermissionsSchema).values(
-        permissionIds.map((permissionId) => ({
-          userId,
-          permissionId,
-        }))
-      );
+      await tx
+        .insert(schoolUserPermissionsSchema)
+        .values(
+          permissionIds.map((permissionId) => ({ userId, permissionId }))
+        );
     }
 
-    // 6. Increment token version to invalidate existing sessions
+    // ── Replace denials ─────────────────────────────────────────────────────
+    await tx
+      .delete(schoolUserPermissionDenialsSchema)
+      .where(eq(schoolUserPermissionDenialsSchema.userId, userId));
+    if (deniedPermissionIds.length > 0) {
+      await tx
+        .insert(schoolUserPermissionDenialsSchema)
+        .values(
+          deniedPermissionIds.map((permissionId) => ({ userId, permissionId }))
+        );
+    }
+
+    // Bump tokenVersion so the next token refresh picks up new permissions
     await tx
       .update(schoolUsersSchema)
       .set({ tokenVersion: user.tokenVersion + 1 })
       .where(eq(schoolUsersSchema.id, userId));
 
     console.log(
-      `🔄 Updated direct permissions for user ${userId} ` +
-        `(primaryRole: ${user.primaryRole}, category: ${expectedCategory}, ` +
-        `count: ${permissionIds.length})`
+      `🔄 Updated permissions for user ${userId} (primaryRole: ${user.primaryRole}, category: ${expectedCategory}, grants: ${permissionIds.length}, denials: ${deniedPermissionIds.length})`
     );
 
     return { message: "Permissions updated successfully" };
   });
 }
 
-// ==================== DELETE USER =============================================
-// NOTE: Call checkUserDeletionImpact() first and present results to the user.
-// This function should only be called after explicit confirmation.
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE USER
+// ─────────────────────────────────────────────────────────────────────────────
+
 export async function deleteSchoolUser(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   id: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
- 
-  // Final safety check — active enrollments are a hard block
+
   const activeEnrollment = await db
     .select({ id: schoolStudentEnrollmentsSchema.id })
     .from(schoolStudentEnrollmentsSchema)
@@ -1373,34 +1667,19 @@ export async function deleteSchoolUser(
     )
     .limit(1)
     .get();
- 
-  if (activeEnrollment) {
+
+  if (activeEnrollment)
     throw new Error(
       "Cannot delete a student with active enrollments. Please unenroll the student first, or deactivate the account instead."
     );
-  }
- 
+
   await db.delete(schoolUsersSchema).where(eq(schoolUsersSchema.id, id));
   return { message: "User deleted successfully" };
 }
 
-// ==================== PROFILE HELPERS ====================
-
-function determineProfileFromPrimaryRole(row: any, primaryRole: string) {
-  const category = getProfileCategory(primaryRole || "");
-  switch (category) {
-    case "student":
-      return row.student ? { type: "student", data: row.student } : null;
-    case "teacher":
-      return row.teacher ? { type: "teacher", data: row.teacher } : null;
-    case "parent":
-      return row.parent ? { type: "parent", data: row.parent } : null;
-    case "staff":
-      return row.staff ? { type: "staff", data: row.staff } : null;
-    default:
-      return null;
-  }
-}
+// ─────────────────────────────────────────────────────────────────────────────
+// PROFILE HELPERS
+// ─────────────────────────────────────────────────────────────────────────────
 
 async function createUserProfile(
   tx: any,
@@ -1413,10 +1692,46 @@ async function createUserProfile(
     case "student":
       await tx.insert(studentsSchema).values({
         userId,
+
+        // ── School-internal ─────────────────────────────────────────────────
+        admissionNumber: data.admissionNumber || null,
         rollNumber: data.rollNumber || "",
         admissionDate: data.admissionDate || "",
         previousSchool: data.previousSchool || "",
         medicalInfo: data.medicalInfo || "",
+        enrollmentType: data.enrollmentType || "REGULAR",
+
+        // ── UDISE / National identity ───────────────────────────────────────
+        pen: data.pen || null,
+        apaarId: data.apaarId || null,
+        stateStudentId: data.stateStudentId || null,
+        aadhaarMasked: data.aadhaarMasked || null,
+        aadhaarName: data.aadhaarName || null,
+        previousSchoolUdiseCode: data.previousSchoolUdiseCode || null,
+
+        // ── UDISE+ demographic ──────────────────────────────────────────────
+        previousClassResult: data.previousClassResult || null,
+        socialCategory: data.socialCategory ?? null,
+        religion: data.religion ?? null,
+        isMinority: data.isMinority ?? false,
+        motherTongueCode: data.motherTongueCode ?? null,
+
+        // ── Socio-economic ──────────────────────────────────────────────────
+        isBpl: data.isBpl ?? false,
+        localityType: data.localityType || null,
+
+        // ── CWSN ───────────────────────────────────────────────────────────
+        isCwsn: data.isCwsn ?? false,
+        disabilityType: data.disabilityType ?? null,
+        hasDisabilityCertificate: data.hasDisabilityCertificate ?? false,
+        udidNumber: data.udidNumber || null,
+
+        // ── Facilities ─────────────────────────────────────────────────────
+        facilitiesReceived: JSON.stringify(data.facilitiesReceived ?? []),
+
+        // ── Verification flags ──────────────────────────────────────────────
+        isAadhaarVerified: data.isAadhaarVerified ?? false,
+        udiseVerified: data.udiseVerified ?? false,
       });
       break;
 
@@ -1461,7 +1776,10 @@ async function updateUserProfile(
   const updateData: any = {};
 
   switch (category) {
-    case "student":
+    case "student": {
+      // ── School-internal ───────────────────────────────────────────────────
+      if (data.admissionNumber !== undefined)
+        updateData.admissionNumber = data.admissionNumber || null;
       if (data.rollNumber !== undefined)
         updateData.rollNumber = data.rollNumber;
       if (data.admissionDate !== undefined)
@@ -1470,6 +1788,56 @@ async function updateUserProfile(
         updateData.previousSchool = data.previousSchool;
       if (data.medicalInfo !== undefined)
         updateData.medicalInfo = data.medicalInfo;
+      if (data.enrollmentType !== undefined)
+        updateData.enrollmentType = data.enrollmentType;
+
+      // ── UDISE / National identity ─────────────────────────────────────────
+      if (data.pen !== undefined) updateData.pen = data.pen || null;
+      if (data.apaarId !== undefined) updateData.apaarId = data.apaarId || null;
+      if (data.stateStudentId !== undefined)
+        updateData.stateStudentId = data.stateStudentId || null;
+      if (data.aadhaarMasked !== undefined)
+        updateData.aadhaarMasked = data.aadhaarMasked || null;
+      if (data.aadhaarName !== undefined)
+        updateData.aadhaarName = data.aadhaarName || null;
+      if (data.previousSchoolUdiseCode !== undefined)
+        updateData.previousSchoolUdiseCode =
+          data.previousSchoolUdiseCode || null;
+
+      // ── UDISE+ demographic ────────────────────────────────────────────────
+      if (data.previousClassResult !== undefined)
+        updateData.previousClassResult = data.previousClassResult;
+      if (data.socialCategory !== undefined)
+        updateData.socialCategory = data.socialCategory;
+      if (data.religion !== undefined) updateData.religion = data.religion;
+      if (data.isMinority !== undefined)
+        updateData.isMinority = data.isMinority;
+      if (data.motherTongueCode !== undefined)
+        updateData.motherTongueCode = data.motherTongueCode;
+
+      // ── Socio-economic ────────────────────────────────────────────────────
+      if (data.isBpl !== undefined) updateData.isBpl = data.isBpl;
+      if (data.localityType !== undefined)
+        updateData.localityType = data.localityType;
+
+      // ── CWSN ──────────────────────────────────────────────────────────────
+      if (data.isCwsn !== undefined) updateData.isCwsn = data.isCwsn;
+      if (data.disabilityType !== undefined)
+        updateData.disabilityType = data.disabilityType;
+      if (data.hasDisabilityCertificate !== undefined)
+        updateData.hasDisabilityCertificate = data.hasDisabilityCertificate;
+      if (data.udidNumber !== undefined)
+        updateData.udidNumber = data.udidNumber || null;
+
+      // ── Facilities (serialise array → JSON string) ────────────────────────
+      if (data.facilitiesReceived !== undefined)
+        updateData.facilitiesReceived = JSON.stringify(data.facilitiesReceived);
+
+      // ── Verification flags ────────────────────────────────────────────────
+      if (data.isAadhaarVerified !== undefined)
+        updateData.isAadhaarVerified = data.isAadhaarVerified;
+      if (data.udiseVerified !== undefined)
+        updateData.udiseVerified = data.udiseVerified;
 
       if (Object.keys(updateData).length > 0) {
         await tx
@@ -1478,6 +1846,7 @@ async function updateUserProfile(
           .where(eq(studentsSchema.userId, userId));
       }
       break;
+    }
 
     case "teacher":
       if (data.qualification !== undefined)

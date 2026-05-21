@@ -1,1 +1,0 @@
-ALTER TABLE `card_templates` ADD `template_key` text;

@@ -1,1 +1,0 @@
-ALTER TABLE `school_users` ADD `primary_role` text DEFAULT '' NOT NULL;

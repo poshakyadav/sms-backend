@@ -29,6 +29,7 @@ import {
   updateExam,
   updateExamStatus,
 } from "./services";
+import { registerMarksExcelRoutes } from "./marks-excel.routes";
 
 const examsRouter = new Hono<SchoolEnv>();
 
@@ -157,6 +158,9 @@ examsRouter.get(
     }
   }
 );
+
+// Register the marks Excel upload/download routes
+registerMarksExcelRoutes(examsRouter);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // STAFF: Admit Card & Report Card  (no publication gate — staff always sees)

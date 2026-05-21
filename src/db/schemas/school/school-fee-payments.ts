@@ -1,7 +1,9 @@
+// src/db/schemas/school/school-fee-payments.ts  (UPDATED)
 import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { schoolStudentEnrollmentsSchema } from "./school-student-enrollments";
 import { schoolFeeStructuresSchema } from "./school-fee-structures";
+import { schoolStudentFeeAssignmentsSchema } from "./school-student-fee-assignments";
 import { schoolUsersSchema } from "./school-users";
 import { schoolsSchema } from "./schools";
 
@@ -16,19 +18,32 @@ export const schoolFeePaymentsSchema = sqliteTable("fee_payments", {
       onDelete: "cascade",
     })
     .notNull(),
-  feeStructureId: integer("fee_structure_id")
-    .references(() => schoolFeeStructuresSchema.id, { onDelete: "cascade" })
-    .notNull(),
+
+  // ── PAYMENT SOURCE (exactly one must be non-null) ────────────────────────
+  // For class-section fee structure payments:
+  feeStructureId: integer("fee_structure_id").references(
+    () => schoolFeeStructuresSchema.id,
+    { onDelete: "cascade" }
+  ),
+  // CHANGED: was .notNull() — now nullable to support student fee assignments
+
+  // For per-student custom fee payments (transport, hostel, etc.):
+  studentFeeAssignmentId: integer("student_fee_assignment_id").references(
+    () => schoolStudentFeeAssignmentsSchema.id,
+    { onDelete: "cascade" }
+  ),
+  // NEW column
+
   amountPaid: integer("amount_paid").notNull(),
   paymentDate: text("payment_date")
     .default(sql`CURRENT_DATE`)
     .notNull(),
-  paymentMethod: text("payment_method").default("CASH").notNull(), // "CASH", "CHECK", "BANK_TRANSFER"
+  paymentMethod: text("payment_method").default("CASH").notNull(), // "CASH" | "CHECK" | "BANK_TRANSFER"
   receiptNumber: text("receipt_number").unique().notNull(),
   notes: text("notes"),
   recordedBy: integer("recorded_by")
     .references(() => schoolUsersSchema.id)
-    .notNull(), // Accountant ID
+    .notNull(),
   isVoid: integer("is_void", { mode: "boolean" }).default(false).notNull(),
   createdAt: text("created_at")
     .default(sql`CURRENT_TIMESTAMP`)

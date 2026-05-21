@@ -1,7 +1,14 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
-import { SchoolRole } from "../../../types/school-role";
+import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { schoolsSchema } from "./schools";
+
+export const Gender = {
+  MALE: "MALE", // UDISE+ code: 1
+  FEMALE: "FEMALE", // UDISE+ code: 2
+  TRANSGENDER: "TRANSGENDER", // UDISE+ code: 3
+} as const;
+
+export type GenderValue = (typeof Gender)[keyof typeof Gender];
 
 export const schoolUsersSchema = sqliteTable("school_users", {
   id: integer("id").primaryKey({ autoIncrement: true }),
@@ -24,23 +31,61 @@ export const schoolUsersSchema = sqliteTable("school_users", {
   // source of truth for permissions; this field is purely for profile routing.
   primaryRole: text("primary_role").notNull().default(""),
 
-  // REMOVED: role column → now handled by user_roles junction
-  // role: text("role").$type<SchoolRole>().notNull(),   ← deleted
-
   // Token version for instant permission invalidation when owner changes roles
   tokenVersion: integer("token_version").default(0).notNull(),
 
-  phone: text("phone").notNull().default(""),
+  phone: text("phone").notNull().default(""), // This is the primary contact phone number for the user. For students, it's usually the parent's phone.
   alternatePhone: text("alternate_phone").default(""), // Optional second phone number (Alternate contact phone)
-  dateOfBirth: text("date_of_birth").default(""), // Added: Common DOB for all users (moved from students for simplicity)
-  gender: text("gender").default(""), // Added: Common gender
+  dateOfBirth: text("date_of_birth").default(""), // Added: Common DOB for all users
+  gender: text("gender")
+    .$type<GenderValue>()
+    .default("" as GenderValue), // Common gender for all users
+
+  // ── ADDRESS FIELDS ─────────────────────────────────────────────────────────
   addressLineOne: text("address_line_one").default(""), // Address line 1
   addressLineTwo: text("address_line_two").default(""), // Address line 2
   city: text("city").default(""), // City
-  state: text("state").default(""), // State/Province
   postalCode: text("postal_code").default(""), // Postal/ZIP code
-  bloodGroup: text("blood_group").default(""), // Added: Optional for all, but relevant for students/staff
+  state: text("state").default(""), // State/Province
+
+  // ── COMMON IDENTITY FIELDS (relevant across all user types) ───────────────
+  bloodGroup: text("blood_group").default(""), // A+, A-, B+, B-, O+, O-, AB+, AB-
   avatarUrl: text("avatar_url").default(""), // URL to user avatar image
+
+  // ── PARENTAL / GUARDIAN FIELDS ─────────────────────────────────────────────
+  // Stored on school_users because:
+  //   • Students need them for UDISE+, TC, admit cards, and emergency contact.
+  //   • Teachers/Staff need them for HR records (emergency contact).
+  //   • Parents filling forms may also have their own guardian recorded.
+  // These are nullable — they are only relevant where the school captures them.
+
+  /**
+   * Father's full name.
+   * UDISE+ mandates this for every student record.
+   * Also used in TC generation, admit cards, and parent-facing reports.
+   */
+  fatherName: text("father_name").default(""),
+
+  /**
+   * Mother's full name.
+   * UDISE+ explicitly requires the mother's name as a separate field
+   * (not just "parent name"). Critical for government data submissions.
+   */
+  motherName: text("mother_name").default(""),
+
+  /**
+   * Guardian's full name.
+   * Used when neither parent is the primary caregiver (e.g., grandparent,
+   * uncle/aunt, legal guardian). Optional — filled only when applicable.
+   */
+  guardianName: text("guardian_name").default(""),
+
+  /**
+   * Guardian's relationship to the student.
+   * e.g., "Grandfather", "Uncle", "Legal Guardian", "Elder Sibling".
+   * Only relevant when guardianName is populated.
+   */
+  guardianRelation: text("guardian_relation").default(""),
 
   /**
    * ISO timestamp of when this user first accepted the Terms & Conditions
@@ -48,10 +93,14 @@ export const schoolUsersSchema = sqliteTable("school_users", {
    * pending acceptance). Set once and never overwritten.
    */
   termsAcceptedAt: text("terms_accepted_at"), // ISO timestamp e.g. "2026-04-22T10:30:00.000Z"
-  
+
   isActive: integer("is_active", { mode: "boolean" }).default(true).notNull(),
-  createdAt: text("created_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
-  updatedAt: text("updated_at").default(sql`CURRENT_TIMESTAMP`).notNull(),
+  createdAt: text("created_at")
+    .default(sql`CURRENT_TIMESTAMP`)
+    .notNull(),
+  updatedAt: text("updated_at")
+    .default(sql`CURRENT_TIMESTAMP`)
+    .notNull(),
 });
 
 export type SchoolUser = typeof schoolUsersSchema.$inferSelect;

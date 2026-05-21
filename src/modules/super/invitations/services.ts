@@ -9,7 +9,12 @@ import { superUsersSchema } from "../../../db/schemas/super/super-users";
 import { sendTransactionalEmail } from "../../../utils/sendEmail";
 import { BrevoSendEmailRequest } from "../../../types/brevo";
 
-const FRONTEND_URL = "http://localhost:4200"; // Replace with env var in production
+// const FRONTEND_URL = "http://localhost:4200"; 
+
+// Helper function to get Frontend URL from environment
+const getFrontendUrl = (env: { FRONTEND_ORIGIN?: string }): string => {
+  return env.FRONTEND_ORIGIN || "http://localhost:4200";
+};
 
 // ── List all invitations with school info ────────────────────────────────────
 
@@ -191,7 +196,8 @@ export async function createInvitation(
   });
 
   // 7. Send invite email — FIXED: use /school/register?token= (new URL)
-  const registrationLink = `${FRONTEND_URL}/school/register?token=${inviteToken}`;
+  const frontendUrl = getFrontendUrl(env);
+  const registrationLink = `${frontendUrl}/school/register?token=${inviteToken}`;
   const emailResult = await sendInviteEmail(env, {
     to: data.schoolEmail,
     schoolName: data.schoolName,
@@ -250,7 +256,8 @@ export async function resendInvitation(db: any, env: any, id: number) {
     .get();
  
   // FIXED: use /school/register?token= (new URL)
-  const registrationLink = `${FRONTEND_URL}/school/register?token=${inv.inviteToken}`;
+  const frontendUrl = getFrontendUrl(env);
+  const registrationLink = `${frontendUrl}/school/register?token=${inv.inviteToken}`;
  
   const daysLeft = Math.ceil(
     (new Date(inv.expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)

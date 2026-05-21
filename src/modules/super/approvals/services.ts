@@ -23,7 +23,12 @@ import { seedPermissionsAndRoles } from "../../school/permissions/services";
 import { schoolSettingsService } from "../../school/settings/services";
 import { getUserPermissionsFromDB } from "../../school/auth/permission-helpers";
 
-const FRONTEND_URL = "http://localhost:4200";
+// const FRONTEND_URL = "http://localhost:4200";
+
+// Helper function to get Frontend URL from environment
+const getFrontendUrl = (env: { FRONTEND_ORIGIN?: string }): string => {
+  return env.FRONTEND_ORIGIN || "http://localhost:4200";
+};
 
 // ── List all payment records (pending + all) ─────────────────────────────────
 
@@ -265,7 +270,8 @@ export async function approvePayment(
   }
 
   // 8. Send activation email
-  const loginLink = `${FRONTEND_URL}/login`;
+  const frontendUrl = getFrontendUrl(env);
+  const loginLink = `${frontendUrl}/school/auth/login`;
   await sendActivationEmail(env, {
     to: school.email,
     ownerEmail: ownerData.ownerEmail,
@@ -389,19 +395,19 @@ async function provisionSchoolDatabase(
     .get();
 
   if (!existingStaffProfile) {
-    await schoolDb
-      .insert(staffSchema)
-      .values({
-        userId,
-        designation: SchoolRole.SCHOOL_OWNER,
-        department: "",
-        joiningDate: "",
-        salary: 0,
-        shift: "",
-      });
+    await schoolDb.insert(staffSchema).values({
+      userId,
+      designation: SchoolRole.SCHOOL_OWNER,
+      department: "",
+      joiningDate: "",
+      salary: 0,
+      shift: "",
+    });
     console.log(`✅ Staff profile created for SCHOOL_OWNER (userId=${userId})`);
   } else {
-    console.log(`✅ Staff profile already exists for SCHOOL_OWNER (userId=${userId}), skipping`);
+    console.log(
+      `✅ Staff profile already exists for SCHOOL_OWNER (userId=${userId}), skipping`
+    );
   }
 
   // ── Step 3: Seed permissions & roles ─────────────────────────────────────

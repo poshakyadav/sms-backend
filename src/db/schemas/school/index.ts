@@ -10,6 +10,7 @@ export * from "./school-roles";
 export * from "./school-role-permissions";
 export * from "./school-user-roles";
 export * from "./school-user-permissions";
+export * from "./school-user-permission-denials";
 
 // About Us (singleton)
 export * from "./school-about-us";
@@ -33,13 +34,16 @@ export * from "./student-parents"; // Depends on students, parents
 export * from "./school-student-enrollments"; // Depends on students, academic_years, classes, sections
 export * from "./school-class-section-mappings";
 export * from "./school-fee-structures"; // Depends on academic_years, classes
+export * from "./school-fee-concessions";        // per-student discounts
+export * from "./school-student-fee-assignments"; // transport/hostel/custom fees
 export * from "./school-teacher-assignments"; // Depends on teachers, class_subjects
 export * from "./school-notifications"; // Depends on school-users
 export * from "./school-notification-interactions"; // Depends on notifications, school-users
 export * from "./school-attendances"; // Depends on student_enrollments, school-users
-export * from "./school-fee-payments"; // Depends on student_enrollments, fee_structures, school-users
+export * from "./school-fee-payments"; // Depends on student_enrollments, fee_structures,  school-users and nullable feeStructureId + studentFeeAssignmentId
 export * from "./school-exams"; // Depends on academic_years, class_subjects
 export * from "./school-exam-marks"; // Depends on exams, student_enrollments, school-users
+export * from "./school-exam-subjects"; // Depends on exams, class_section_subjects
 export * from "./school-assignments"; // Depends on teacher_assignments, school-users
 export * from "./school-assignment-submissions"; // Depends on assignments, student_enrollments, school-users
 
