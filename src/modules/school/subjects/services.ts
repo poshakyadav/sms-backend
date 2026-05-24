@@ -4,6 +4,7 @@ import {
   schoolClassSectionsSchema,
   schoolClassSectionSubjectsSchema,
   schoolSectionsSchema,
+  SchoolSubject,
   schoolSubjectsSchema,
   schoolTeacherAssignmentsSchema,
   schoolUsersSchema,
@@ -26,6 +27,289 @@ export async function createSubject(
     .returning();
 
   return { subject: newSubject, message: "Subject created successfully" };
+}
+
+// ==================== BULK CREATE SUBJECTS ====================
+/**
+ * Bulk-create subjects in a single request.
+ *
+ * Strategy:
+ *   1. Normalise names (trim, collapse whitespace).
+ *   2. Fetch all existing subject names once (single round trip).
+ *   3. Split input into "to insert" vs "skipped" (already exist).
+ *   4. Insert only new subjects.
+ *   5. Return created rows + list of skipped names.
+ *
+ * The unique constraint on `code` is enforced per-row in the insert:
+ * if two rows in the same batch share a code, the second one is skipped
+ * with an explanatory message in the `errors` array.
+ */
+export async function bulkCreateSubjects(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  subjects: Array<{ name: string; code?: string; description?: string }>
+): Promise<{
+  subjects: SchoolSubject[];
+  skipped: string[];
+  errors: string[];
+  message: string;
+}> {
+  if (!subjects || subjects.length === 0) {
+    throw new Error("No subjects provided");
+  }
+  if (subjects.length > 100) {
+    throw new Error("Cannot create more than 100 subjects at once");
+  }
+
+  const db = await getSchoolDB(env, schoolCode);
+
+  // 1. Normalise input — trim whitespace, build unique name map
+  const normalised = subjects.map((s) => ({
+    name: s.name.trim(),
+    code: s.code?.trim() || undefined,
+    description: s.description?.trim() || undefined,
+  }));
+
+  // 2. Fetch all existing names in one query
+  const existing = await db
+    .select({
+      name: schoolSubjectsSchema.name,
+      code: schoolSubjectsSchema.code,
+    })
+    .from(schoolSubjectsSchema)
+    .all();
+
+  const existingNames = new Set(existing.map((e) => e.name.toLowerCase()));
+  const existingCodes = new Set(
+    existing.filter((e) => e.code).map((e) => e.code!.toLowerCase())
+  );
+
+  // 3. Classify: skip duplicates, collect errors, build insert list
+  const toInsert: Array<{ name: string; code?: string; description?: string }> =
+    [];
+  const skipped: string[] = [];
+  const errors: string[] = [];
+  const seenNamesInBatch = new Set<string>();
+  const seenCodesInBatch = new Set<string>();
+
+  for (const s of normalised) {
+    const nameLower = s.name.toLowerCase();
+    const codeLower = s.code?.toLowerCase();
+
+    if (!s.name) {
+      errors.push(`Empty subject name skipped`);
+      continue;
+    }
+
+    if (existingNames.has(nameLower) || seenNamesInBatch.has(nameLower)) {
+      skipped.push(s.name);
+      continue;
+    }
+
+    if (codeLower) {
+      if (existingCodes.has(codeLower) || seenCodesInBatch.has(codeLower)) {
+        errors.push(
+          `"${s.name}" skipped — subject code "${s.code}" already exists`
+        );
+        continue;
+      }
+      seenCodesInBatch.add(codeLower);
+    }
+
+    seenNamesInBatch.add(nameLower);
+    toInsert.push(s);
+  }
+
+  if (toInsert.length === 0) {
+    return {
+      subjects: [],
+      skipped,
+      errors,
+      message:
+        skipped.length > 0
+          ? `All ${skipped.length} subject(s) already exist`
+          : "Nothing to create",
+    };
+  }
+
+  // 4. Insert in a single statement (Drizzle batches values internally)
+  const created = await db
+    .insert(schoolSubjectsSchema)
+    .values(toInsert)
+    .returning();
+
+  const total = created.length;
+  const skipCount = skipped.length;
+  const errCount = errors.length;
+
+  let message = `${total} subject(s) created successfully`;
+  if (skipCount > 0) message += `, ${skipCount} skipped (already exist)`;
+  if (errCount > 0) message += `, ${errCount} error(s)`;
+
+  return { subjects: created, skipped, errors, message };
+}
+
+// ==================== BULK UPDATE SUBJECTS ====================
+/**
+ * Bulk-update subjects in a single request.
+ *
+ * Each item MUST include its `id`. Fields omitted from the payload are left
+ * unchanged (partial update per row). Rows whose id is not found are collected
+ * in `notFound`.
+ *
+ * Code uniqueness: if a new code collides with another existing subject
+ * (different id), that row is placed in `errors` and skipped.
+ *
+ * Round trips:
+ *   1. Fetch all existing rows (names + codes + ids) — 1 query
+ *   2. One UPDATE per changed row (Drizzle/SQLite doesn't support multi-row
+ *      UPDATE with different values per row in a single statement)
+ *   We use db.batch() to send all UPDATEs in one network round trip.
+ */
+export async function bulkUpdateSubjects(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  subjects: Array<{
+    id: number;
+    name?: string;
+    code?: string | null;
+    description?: string | null;
+  }>
+): Promise<{
+  subjects: SchoolSubject[];
+  notFound: number[];
+  errors: string[];
+  message: string;
+}> {
+  if (!subjects || subjects.length === 0) {
+    throw new Error("No subjects provided");
+  }
+  if (subjects.length > 100) {
+    throw new Error("Cannot update more than 100 subjects at once");
+  }
+
+  const db = await getSchoolDB(env, schoolCode);
+
+  // 1. Fetch all current subjects for collision checks
+  const allExisting = await db
+    .select({
+      id: schoolSubjectsSchema.id,
+      name: schoolSubjectsSchema.name,
+      code: schoolSubjectsSchema.code,
+    })
+    .from(schoolSubjectsSchema)
+    .all();
+
+  const existingById = new Map(allExisting.map((e) => [e.id, e]));
+
+  // Build lookup: name → id and code → id (excluding the row being updated)
+  // We check these per-row to detect conflicts.
+  const notFound: number[] = [];
+  const errors: string[] = [];
+  const updateStatements: any[] = [];
+  const updatedRows: SchoolSubject[] = [];
+
+  // Track names/codes chosen in THIS batch to catch intra-batch collisions
+  const batchNames = new Map<string, number>(); // name_lower → id
+  const batchCodes = new Map<string, number>(); // code_lower → id
+
+  for (const s of subjects) {
+    const existing = existingById.get(s.id);
+
+    if (!existing) {
+      notFound.push(s.id);
+      continue;
+    }
+
+    const newName = s.name?.trim() ?? existing.name;
+    const newCode =
+      s.code !== undefined
+        ? s.code === null || s.code === ""
+          ? null
+          : s.code.trim()
+        : existing.code;
+    const newDescription =
+      s.description !== undefined ? s.description : undefined; // handled below
+
+    // ── Name collision check ─────────────────────────────────────────────
+    const newNameLower = newName.toLowerCase();
+    const existingWithName = allExisting.find(
+      (e) => e.id !== s.id && e.name.toLowerCase() === newNameLower
+    );
+    const batchConflictName = batchNames.get(newNameLower);
+    if (existingWithName || (batchConflictName && batchConflictName !== s.id)) {
+      errors.push(
+        `Subject id ${s.id} skipped — name "${newName}" conflicts with another subject`
+      );
+      continue;
+    }
+
+    // ── Code collision check ─────────────────────────────────────────────
+    if (newCode) {
+      const newCodeLower = newCode.toLowerCase();
+      const existingWithCode = allExisting.find(
+        (e) => e.id !== s.id && e.code && e.code.toLowerCase() === newCodeLower
+      );
+      const batchConflictCode = batchCodes.get(newCodeLower);
+      if (
+        existingWithCode ||
+        (batchConflictCode && batchConflictCode !== s.id)
+      ) {
+        errors.push(
+          `Subject id ${s.id} skipped — code "${newCode}" conflicts with another subject`
+        );
+        continue;
+      }
+      batchCodes.set(newCodeLower, s.id);
+    }
+
+    batchNames.set(newNameLower, s.id);
+
+    // Build the SET payload — only include fields present in input
+    const setPayload: Record<string, any> = {
+      name: newName,
+      code: newCode,
+      updatedAt: new Date().toISOString(),
+    };
+    if (s.description !== undefined) {
+      setPayload["description"] = s.description;
+    }
+
+    updateStatements.push(
+      db
+        .update(schoolSubjectsSchema)
+        .set(setPayload)
+        .where(eq(schoolSubjectsSchema.id, s.id))
+        .returning()
+    );
+  }
+
+  if (updateStatements.length === 0) {
+    return {
+      subjects: [],
+      notFound,
+      errors,
+      message:
+        notFound.length > 0
+          ? `No subjects updated — ${notFound.length} id(s) not found`
+          : "Nothing to update",
+    };
+  }
+
+  // 2. Execute all updates in one batch round trip
+  const batchResults = await db.batch(updateStatements);
+  for (const result of batchResults) {
+    if (Array.isArray(result) && result.length > 0) {
+      updatedRows.push(result[0] as SchoolSubject);
+    }
+  }
+
+  const total = updatedRows.length;
+  let message = `${total} subject(s) updated successfully`;
+  if (notFound.length > 0) message += `, ${notFound.length} not found`;
+  if (errors.length > 0) message += `, ${errors.length} error(s)`;
+
+  return { subjects: updatedRows, notFound, errors, message };
 }
 
 // ==================== GET SUBJECTS ====================

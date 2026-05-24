@@ -10,6 +10,8 @@ import { SchoolEnv } from "../../../types/common-types";
 import {
   assignSubjectToClass,
   assignTeacherToSubject,
+  bulkCreateSubjects,
+  bulkUpdateSubjects,
   createSubject,
   deleteSubject,
   getAllClassSubjects,
@@ -33,12 +35,12 @@ const subjectSchema = z.object({
   name: z.string().min(3).max(50),
 
   code: z.preprocess(
-    (v) => (v === '' || v === null || v === undefined ? undefined : v),
+    (v) => (v === "" || v === null || v === undefined ? undefined : v),
     z.string().min(3).max(10).optional()
   ),
 
   description: z.preprocess(
-    (v) => (v === '' || v === null || v === undefined ? undefined : v),
+    (v) => (v === "" || v === null || v === undefined ? undefined : v),
     z.string().min(1).optional()
   ),
 });
@@ -72,6 +74,110 @@ subjectsRouter.get(
       return c.json({ subjects });
     } catch (error: any) {
       return c.json({ error: error.message }, 500);
+    }
+  }
+);
+
+// ==================== BULK CREATE SUBJECTS ====================
+/**
+ * POST /school/subjects/bulk
+ *
+ * Bulk-create up to 100 subjects in a single request.
+ *
+ * Request body:
+ *   { subjects: Array<{ name: string; code?: string; description?: string }> }
+ *
+ * Response (201):
+ *   {
+ *     subjects: SchoolSubject[];   // newly created rows
+ *     skipped: string[];           // names that already existed
+ *     errors: string[];            // code-collision messages etc.
+ *     message: string;
+ *   }
+ */
+const bulkSubjectSchema = z.object({
+  subjects: z
+    .array(
+      z.object({
+        name: z.string().min(1).max(100),
+        code: z.preprocess(
+          (v) => (v === "" || v === null || v === undefined ? undefined : v),
+          z.string().min(2).max(10).optional()
+        ),
+        description: z.preprocess(
+          (v) => (v === "" || v === null || v === undefined ? undefined : v),
+          z.string().min(1).max(500).optional()
+        ),
+      })
+    )
+    .min(1)
+    .max(100, "Cannot submit more than 100 subjects at once"),
+});
+
+subjectsRouter.post(
+  "/bulk",
+  requirePermission("academics.subjects.manage"),
+  zValidator("json", bulkSubjectSchema),
+  async (c) => {
+    try {
+      const { subjects } = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await bulkCreateSubjects(c.env, schoolCode, subjects);
+      // Return 201 if anything was created; 200 if everything was skipped
+      const status = result.subjects.length > 0 ? 201 : 200;
+      return c.json(result, status);
+    } catch (error: any) {
+      console.error("Bulk subject creation error:", error);
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// ==================== BULK UPDATE SUBJECTS ====================
+/**
+ * PUT /school/subjects/bulk
+ *
+ * Bulk-update up to 100 subjects in a single request.
+ * Each item must include its `id`. Only provided fields are updated.
+ *
+ * Request body:
+ *   { subjects: Array<{ id: number; name?: string; code?: string | null; description?: string | null }> }
+ *
+ * Response (200):
+ *   {
+ *     subjects: SchoolSubject[];   // updated rows
+ *     notFound: number[];          // ids that don't exist
+ *     errors: string[];            // collision / validation messages
+ *     message: string;
+ *   }
+ */
+const bulkUpdateSubjectSchema = z.object({
+  subjects: z
+    .array(
+      z.object({
+        id: z.number().int().positive(),
+        name: z.string().min(1).max(100).optional(),
+        code: z.union([z.string().min(2).max(10), z.null()]).optional(),
+        description: z.union([z.string().min(1).max(500), z.null()]).optional(),
+      })
+    )
+    .min(1)
+    .max(100, "Cannot update more than 100 subjects at once"),
+});
+
+subjectsRouter.put(
+  "/bulk",
+  requirePermission("academics.subjects.manage"),
+  zValidator("json", bulkUpdateSubjectSchema),
+  async (c) => {
+    try {
+      const { subjects } = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await bulkUpdateSubjects(c.env, schoolCode, subjects);
+      return c.json(result, 200);
+    } catch (error: any) {
+      console.error("Bulk subject update error:", error);
+      return c.json({ error: error.message }, 400);
     }
   }
 );
