@@ -1,9 +1,4 @@
-import { getSchoolDB } from "../../../db/school-client";
-import { SchoolEnv } from "../../../types/common-types";
 import { and, asc, eq } from "drizzle-orm"; // Fixed: Import and, eq
-import { schoolUsersSchema } from "../../../db/schemas/school/school-users";
-import { studentsSchema } from "../../../db/schemas/school/students";
-import { SchoolRole } from "../../../types/school-role";
 import {
   parentsSchema,
   schoolAcademicYearsSchema,
@@ -13,12 +8,85 @@ import {
   schoolStudentEnrollmentsSchema,
   studentParentsSchema,
 } from "../../../db/schemas/school";
+import { schoolUsersSchema } from "../../../db/schemas/school/school-users";
+import { studentsSchema } from "../../../db/schemas/school/students";
+import { getSchoolDB } from "../../../db/school-client";
+import { SchoolEnv } from "../../../types/common-types";
+
+// ── Helper ────────────────────────────────────────────────────────────────────
+function parseFacilities(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+// ── COMPLETE student fields selector (school_users + students join) ────────────
+// Used in every SELECT that needs the full student data set.
+const STUDENT_CORE_FIELDS = {
+  // school_users — identity
+  id: schoolUsersSchema.id,
+  name: schoolUsersSchema.name,
+  email: schoolUsersSchema.email,
+  phone: schoolUsersSchema.phone,
+  alternatePhone: schoolUsersSchema.alternatePhone,
+  gender: schoolUsersSchema.gender,
+  dateOfBirth: schoolUsersSchema.dateOfBirth,
+  bloodGroup: schoolUsersSchema.bloodGroup,
+  avatarUrl: schoolUsersSchema.avatarUrl,
+  isActive: schoolUsersSchema.isActive,
+  // school_users — address
+  addressLineOne: schoolUsersSchema.addressLineOne,
+  addressLineTwo: schoolUsersSchema.addressLineTwo,
+  city: schoolUsersSchema.city,
+  state: schoolUsersSchema.state,
+  postalCode: schoolUsersSchema.postalCode,
+  // school_users — parental/guardian
+  fatherName: schoolUsersSchema.fatherName,
+  motherName: schoolUsersSchema.motherName,
+  guardianName: schoolUsersSchema.guardianName,
+  guardianRelation: schoolUsersSchema.guardianRelation,
+  // students — school-internal
+  admissionNumber: studentsSchema.admissionNumber,
+  admissionDate: studentsSchema.admissionDate,
+  rollNumber: studentsSchema.rollNumber,
+  enrollmentType: studentsSchema.enrollmentType,
+  previousSchool: studentsSchema.previousSchool,
+  previousSchoolUdiseCode: studentsSchema.previousSchoolUdiseCode,
+  previousClassResult: studentsSchema.previousClassResult,
+  medicalInfo: studentsSchema.medicalInfo,
+  // students — UDISE / National identity
+  pen: studentsSchema.pen,
+  apaarId: studentsSchema.apaarId,
+  stateStudentId: studentsSchema.stateStudentId,
+  aadhaarMasked: studentsSchema.aadhaarMasked,
+  aadhaarName: studentsSchema.aadhaarName,
+  isAadhaarVerified: studentsSchema.isAadhaarVerified,
+  udiseVerified: studentsSchema.udiseVerified,
+  // students — UDISE+ demographic
+  socialCategory: studentsSchema.socialCategory,
+  religion: studentsSchema.religion,
+  isMinority: studentsSchema.isMinority,
+  motherTongueCode: studentsSchema.motherTongueCode,
+  // students — Socio-economic
+  isBpl: studentsSchema.isBpl,
+  localityType: studentsSchema.localityType,
+  // students — CWSN
+  isCwsn: studentsSchema.isCwsn,
+  disabilityType: studentsSchema.disabilityType,
+  hasDisabilityCertificate: studentsSchema.hasDisabilityCertificate,
+  udidNumber: studentsSchema.udidNumber,
+  // students — Facilities
+  facilitiesReceived: studentsSchema.facilitiesReceived,
+};
 
 // ==================== GET ALL STUDENTS ====================
 /**
  * Returns all users who have a student profile (joined via `students` table).
- * No longer filters by role column — role column was removed in PBAC migration.
- * Being in the `students` table is the canonical signal that a user is a student.
+ * Includes all UDISE+ fields and guardian/parental fields from school_users.
  */
 export async function getStudents(
   env: SchoolEnv["Bindings"],
@@ -26,24 +94,9 @@ export async function getStudents(
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  const students = await db
-    .select({
-      id: schoolUsersSchema.id,
-      name: schoolUsersSchema.name,
-      email: schoolUsersSchema.email,
-      phone: schoolUsersSchema.phone,
-      gender: schoolUsersSchema.gender,
-      dateOfBirth: schoolUsersSchema.dateOfBirth,
-      bloodGroup: schoolUsersSchema.bloodGroup,
-      avatarUrl: schoolUsersSchema.avatarUrl,
-      isActive: schoolUsersSchema.isActive,
-      // Student-specific fields
-      rollNumber: studentsSchema.rollNumber,
-      admissionDate: studentsSchema.admissionDate,
-      previousSchool: studentsSchema.previousSchool,
-      medicalInfo: studentsSchema.medicalInfo,
-    })
-    .from(studentsSchema) // ← anchor on students table (identity = student)
+  const rows = await db
+    .select(STUDENT_CORE_FIELDS)
+    .from(studentsSchema)
     .innerJoin(
       schoolUsersSchema,
       eq(studentsSchema.userId, schoolUsersSchema.id)
@@ -52,13 +105,18 @@ export async function getStudents(
     .orderBy(asc(schoolUsersSchema.name))
     .all();
 
-  return students;
+  return rows.map((row) => ({
+    ...row,
+    facilitiesReceived: parseFacilities(
+      row.facilitiesReceived as string | null
+    ),
+  }));
 }
 
 // ==================== GET STUDENT BY ID ====================
 /**
- * Returns a single student with their profile, current enrollment,
- * and parent information.
+ * Returns a single student with full profile (all UDISE+ fields),
+ * current enrollment(s), and parent information.
  */
 export async function getStudentById(
   env: SchoolEnv["Bindings"],
@@ -67,30 +125,11 @@ export async function getStudentById(
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  // 1. Base student record
+  // 1. Base student record — full UDISE fields
   const student = await db
     .select({
-      id: schoolUsersSchema.id,
-      name: schoolUsersSchema.name,
-      email: schoolUsersSchema.email,
-      phone: schoolUsersSchema.phone,
-      alternatePhone: schoolUsersSchema.alternatePhone,
-      gender: schoolUsersSchema.gender,
-      dateOfBirth: schoolUsersSchema.dateOfBirth,
-      bloodGroup: schoolUsersSchema.bloodGroup,
-      avatarUrl: schoolUsersSchema.avatarUrl,
-      addressLineOne: schoolUsersSchema.addressLineOne,
-      addressLineTwo: schoolUsersSchema.addressLineTwo,
-      city: schoolUsersSchema.city,
-      state: schoolUsersSchema.state,
-      postalCode: schoolUsersSchema.postalCode,
-      isActive: schoolUsersSchema.isActive,
+      ...STUDENT_CORE_FIELDS,
       createdAt: schoolUsersSchema.createdAt,
-      // Student-specific
-      rollNumber: studentsSchema.rollNumber,
-      admissionDate: studentsSchema.admissionDate,
-      previousSchool: studentsSchema.previousSchool,
-      medicalInfo: studentsSchema.medicalInfo,
     })
     .from(studentsSchema)
     .innerJoin(
@@ -102,8 +141,8 @@ export async function getStudentById(
 
   if (!student) return null;
 
-  // 2. Current active enrollment (class + section info)
-  const enrollment = await db
+  // 2. All enrollments (class + section info) — not just active
+  const enrollments = await db
     .select({
       enrollmentId: schoolStudentEnrollmentsSchema.id,
       classSectionId: schoolStudentEnrollmentsSchema.classSectionId,
@@ -157,14 +196,18 @@ export async function getStudentById(
 
   return {
     ...student,
-    enrollments: enrollment,
+    facilitiesReceived: parseFacilities(
+      student.facilitiesReceived as string | null
+    ),
+    enrollments,
     parents,
   };
 }
 
+// ==================== GET STUDENTS BY CLASS-SECTION ====================
 /**
  * Get all students enrolled in a specific class-section (current academic year).
- * Returns enriched data including fee summary, attendance %, etc.
+ * Now returns the full UDISE+ field set along with enrollment details.
  */
 export async function getStudentsByClassSection(
   env: SchoolEnv["Bindings"],
@@ -182,22 +225,12 @@ export async function getStudentsByClassSection(
 
   if (!currentYear) throw new Error("No current academic year found");
 
-  const students = await db
+  const rows = await db
     .select({
-      id: schoolUsersSchema.id,
-      name: schoolUsersSchema.name,
-      email: schoolUsersSchema.email,
-      phone: schoolUsersSchema.phone,
-      gender: schoolUsersSchema.gender,
-      dateOfBirth: schoolUsersSchema.dateOfBirth,
-      bloodGroup: schoolUsersSchema.bloodGroup,
-      avatarUrl: schoolUsersSchema.avatarUrl,
-      isActive: schoolUsersSchema.isActive,
-      // Student profile
+      // All core student fields
+      ...STUDENT_CORE_FIELDS,
+      // Override rollNumber with the enrollment-level roll number
       rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
-      admissionDate: studentsSchema.admissionDate,
-      previousSchool: studentsSchema.previousSchool,
-      medicalInfo: studentsSchema.medicalInfo,
       // Enrollment details
       enrollmentId: schoolStudentEnrollmentsSchema.id,
       classSectionId: schoolStudentEnrollmentsSchema.classSectionId,
@@ -237,7 +270,13 @@ export async function getStudentsByClassSection(
         eq(schoolStudentEnrollmentsSchema.isActive, true)
       )
     )
-    .orderBy(schoolStudentEnrollmentsSchema.rollNumber, schoolUsersSchema.name);
+    .orderBy(schoolStudentEnrollmentsSchema.rollNumber, schoolUsersSchema.name)
+    .all();
 
-  return students;
+  return rows.map((row) => ({
+    ...row,
+    facilitiesReceived: parseFacilities(
+      row.facilitiesReceived as string | null
+    ),
+  }));
 }

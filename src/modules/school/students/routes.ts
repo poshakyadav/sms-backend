@@ -5,9 +5,8 @@ import {
   schoolTokenValidationMiddleware,
 } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
-import { SchoolRole } from "../../../types/school-role";
-import { getStudentById, getStudents, getStudentsByClassSection } from "./services";
 import bulkUploadRouter from "./bulk-upload/routes";
+import { getStudentById, getStudents, getStudentsByClassSection } from "./services";
 
 const studentsRouter = new Hono<SchoolEnv>();
 
