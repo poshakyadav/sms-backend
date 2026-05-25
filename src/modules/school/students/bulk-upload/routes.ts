@@ -1,12 +1,4 @@
 // src/modules/school/students/bulk-upload/routes.ts
-// PRODUCTION-GRADE — v2
-//
-// Changes from v1:
-//   • HTTP status codes typed correctly (no `as any` casts)
-//   • File-size limit raised to 10 MB (large cohorts with all UDISE columns)
-//   • Explicit content-type check error message improved
-//   • academicYearId parsed with fallback undefined check
-//   • Structured error logging with context
 
 import { Hono } from "hono";
 import {
