@@ -2321,6 +2321,9 @@ export async function getStudentsByClassSection(
 
   if (enrollments.length === 0) return [];
 
+  const enrollmentIds = enrollments.map((e: any) => e.enrollmentId);
+
+  // ── 1. Standard fee structures for this class-section ────────────────────
   const feeStructures = await db
     .select({
       id: schoolFeeStructuresSchema.id,
@@ -2340,9 +2343,9 @@ export async function getStudentsByClassSection(
     0
   );
   const feeStructureIds = feeStructures.map((f: any) => f.id);
-  const enrollmentIds = enrollments.map((e: any) => e.enrollmentId);
 
-  const paymentRows =
+  // ── 2. Standard fee payments per enrollment ───────────────────────────────
+  const structurePaymentRows =
     feeStructureIds.length > 0
       ? await db
           .select({
@@ -2361,11 +2364,12 @@ export async function getStudentsByClassSection(
           .all()
       : [];
 
-  const paidMap = new Map<number, number>(
-    paymentRows.map((r: any) => [r.enrollmentId, r.totalPaid])
+  const structurePaidMap = new Map<number, number>(
+    structurePaymentRows.map((r: any) => [r.enrollmentId, r.totalPaid])
   );
 
-  const allConcessions =
+  // ── 3. Standard fee concessions per enrollment ────────────────────────────
+  const allStructureConcessions =
     feeStructureIds.length > 0 && enrollmentIds.length > 0
       ? await db
           .select({
@@ -2385,39 +2389,172 @@ export async function getStudentsByClassSection(
           .all()
       : [];
 
-  const concessionsByEnrollment = new Map<number, Map<number, any>>();
-  allConcessions.forEach((c: any) => {
-    if (!concessionsByEnrollment.has(c.enrollmentId))
-      concessionsByEnrollment.set(c.enrollmentId, new Map());
-    concessionsByEnrollment.get(c.enrollmentId)!.set(c.feeStructureId, c);
+  const structureConcessionsByEnrollment = new Map<number, Map<number, any>>();
+  allStructureConcessions.forEach((c: any) => {
+    if (!structureConcessionsByEnrollment.has(c.enrollmentId))
+      structureConcessionsByEnrollment.set(c.enrollmentId, new Map());
+    structureConcessionsByEnrollment
+      .get(c.enrollmentId)!
+      .set(c.feeStructureId, c);
   });
 
+  // ── 4. Custom fee assignments per enrollment ──────────────────────────────
+  const customAssignments =
+    enrollmentIds.length > 0
+      ? await db
+          .select({
+            id: schoolStudentFeeAssignmentsSchema.id,
+            enrollmentId: schoolStudentFeeAssignmentsSchema.enrollmentId,
+            amount: schoolStudentFeeAssignmentsSchema.amount,
+          })
+          .from(schoolStudentFeeAssignmentsSchema)
+          .where(
+            and(
+              inArray(
+                schoolStudentFeeAssignmentsSchema.enrollmentId,
+                enrollmentIds
+              ),
+              eq(
+                schoolStudentFeeAssignmentsSchema.academicYearId,
+                currentYear.id
+              ),
+              eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
+            )
+          )
+          .all()
+      : [];
+
+  // Map: enrollmentId → total original custom amount
+  const customOriginalMap = new Map<number, number>();
+  const customAssignmentIds: number[] = [];
+  customAssignments.forEach((a: any) => {
+    customOriginalMap.set(
+      a.enrollmentId,
+      (customOriginalMap.get(a.enrollmentId) ?? 0) + a.amount
+    );
+    customAssignmentIds.push(a.id);
+  });
+
+  // ── 5. Assignment-level concessions ──────────────────────────────────────
+  const allAssignmentConcessions =
+    customAssignmentIds.length > 0
+      ? await db
+          .select({
+            enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
+            studentFeeAssignmentId:
+              schoolFeeConcessionsSchema.studentFeeAssignmentId,
+            concessionType: schoolFeeConcessionsSchema.concessionType,
+            concessionValue: schoolFeeConcessionsSchema.concessionValue,
+          })
+          .from(schoolFeeConcessionsSchema)
+          .where(
+            and(
+              inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
+              inArray(
+                schoolFeeConcessionsSchema.studentFeeAssignmentId,
+                customAssignmentIds
+              ),
+              eq(schoolFeeConcessionsSchema.isActive, true)
+            )
+          )
+          .all()
+      : [];
+
+  // Map: enrollmentId → Map<assignmentId, concession>
+  const assignmentConcessionsByEnrollment = new Map<number, Map<number, any>>();
+  allAssignmentConcessions.forEach((c: any) => {
+    if (!assignmentConcessionsByEnrollment.has(c.enrollmentId))
+      assignmentConcessionsByEnrollment.set(c.enrollmentId, new Map());
+    assignmentConcessionsByEnrollment
+      .get(c.enrollmentId)!
+      .set(c.studentFeeAssignmentId, c);
+  });
+
+  // ── 6. Custom fee payments per enrollment ─────────────────────────────────
+  const customPaymentRows =
+    customAssignmentIds.length > 0
+      ? await db
+          .select({
+            enrollmentId: schoolFeePaymentsSchema.enrollmentId,
+            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+          })
+          .from(schoolFeePaymentsSchema)
+          .where(
+            and(
+              inArray(
+                schoolFeePaymentsSchema.studentFeeAssignmentId,
+                customAssignmentIds
+              ),
+              eq(schoolFeePaymentsSchema.isVoid, false)
+            )
+          )
+          .groupBy(schoolFeePaymentsSchema.enrollmentId)
+          .all()
+      : [];
+
+  const customPaidMap = new Map<number, number>(
+    customPaymentRows.map((r: any) => [r.enrollmentId, r.totalPaid])
+  );
+
+  // ── 7. Assemble per-student row ───────────────────────────────────────────
   return enrollments.map((e: any) => {
-    const enrollmentConcessions =
-      concessionsByEnrollment.get(e.enrollmentId) ?? new Map();
-    let totalConcession = 0;
+    // Standard fee concessions for this enrollment
+    const enrollmentStructureConcessions =
+      structureConcessionsByEnrollment.get(e.enrollmentId) ?? new Map();
+    let stdConcession = 0;
     feeStructures.forEach((fee: any) => {
-      const conc = enrollmentConcessions.get(fee.id);
+      const conc = enrollmentStructureConcessions.get(fee.id);
       if (conc) {
         const d =
           conc.concessionType === "FIXED"
             ? conc.concessionValue
             : Math.floor((fee.amount * conc.concessionValue) / 100);
-        totalConcession += Math.min(d, fee.amount);
+        stdConcession += Math.min(d, fee.amount);
       }
     });
-    const totalAssigned = baseTotalPerStudent - totalConcession;
-    const totalPaid = paidMap.get(e.enrollmentId) ?? 0;
+
+    // Custom fee concessions for this enrollment
+    const enrollmentAssignmentConcessions =
+      assignmentConcessionsByEnrollment.get(e.enrollmentId) ?? new Map();
+    const enrollmentAssignments = customAssignments.filter(
+      (a: any) => a.enrollmentId === e.enrollmentId
+    );
+    let customConcession = 0;
+    enrollmentAssignments.forEach((a: any) => {
+      const conc = enrollmentAssignmentConcessions.get(a.id);
+      if (conc) {
+        const d =
+          conc.concessionType === "FIXED"
+            ? conc.concessionValue
+            : Math.floor((a.amount * conc.concessionValue) / 100);
+        customConcession += Math.min(d, a.amount);
+      }
+    });
+
+    const totalConcession = stdConcession + customConcession;
+
+    const stdOriginal = baseTotalPerStudent;
+    const customOriginal = customOriginalMap.get(e.enrollmentId) ?? 0;
+    const totalOriginal = stdOriginal + customOriginal;
+
+    const stdEffective = stdOriginal - stdConcession;
+    const customEffective = customOriginal - customConcession;
+    const totalAssigned = stdEffective + customEffective; // net due after all concessions
+
+    const stdPaid = structurePaidMap.get(e.enrollmentId) ?? 0;
+    const customPaid = customPaidMap.get(e.enrollmentId) ?? 0;
+    const totalPaid = stdPaid + customPaid;
+
     return {
       id: e.studentId,
       name: e.name,
       email: e.email,
       rollNumber: e.rollNumber ?? null,
       enrollmentId: e.enrollmentId,
-      totalOriginal: baseTotalPerStudent,
-      totalConcession,
-      totalAssigned,
-      totalPaid,
+      totalOriginal, // standard + custom original amounts
+      totalConcession, // standard + custom concessions
+      totalAssigned, // net due (after all concessions)
+      totalPaid, // standard + custom paid
       balance: totalAssigned - totalPaid,
     };
   });

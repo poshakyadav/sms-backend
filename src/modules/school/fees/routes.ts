@@ -196,24 +196,53 @@ feesRouter.delete(
 
 /**
  * POST /fees/concessions
- * Grant a per-student discount on a specific fee structure.
+ * Grant a per-student discount on a specific fee structure OR a custom fee
+ * assignment. Exactly one of feeStructureId or studentFeeAssignmentId must
+ * be provided — never both, never neither.
  *
  * Body:
  *   enrollmentId:    number
  *   feeStructureId:  number
+ *  OR studentFeeAssignmentId: number
  *   concessionType:  "PERCENTAGE" | "FIXED"
  *   concessionValue: number  — % (1-100) for PERCENTAGE, paise for FIXED
  *   reason:          string  — mandatory (audit trail)
  *
+ *
+ * * ── Why a discriminated union schema? ────────────────────────────────────────
+ * The previous schema only had `feeStructureId: z.number().int().positive()`
+ * which is REQUIRED with no optional alternative. Any ASSIGNMENT-mode request
+ * (which sends `studentFeeAssignmentId` instead) was immediately rejected by
+ * Zod with a 400 validation error whose body is a Zod issues array — an
+ * object, not a string — so the frontend displayed "[object Object]".
+ *
+ * The fix: use z.union with two branches, each requiring exactly one field and
+ * forbidding the other via .refine(). The service layer already supports both
+ * branches; this was purely a missing route schema.
+ *
+ *
  * Guard: fees.structures.manage
  */
-const createConcessionSchema = z.object({
-  enrollmentId: z.number().int().positive(),
-  feeStructureId: z.number().int().positive(),
-  concessionType: z.enum(["PERCENTAGE", "FIXED"]),
-  concessionValue: z.number().positive(),
-  reason: z.string().min(5, "Reason must be at least 5 characters"),
-});
+const createConcessionSchema = z
+  .object({
+    enrollmentId: z.number().int().positive(),
+    // Exactly one of these must be present (validated by .refine below)
+    feeStructureId: z.number().int().positive().optional(),
+    studentFeeAssignmentId: z.number().int().positive().optional(),
+    concessionType: z.enum(["PERCENTAGE", "FIXED"]),
+    concessionValue: z.number().positive(),
+    reason: z.string().min(5, "Reason must be at least 5 characters"),
+  })
+  .refine(
+    (d) =>
+      (d.feeStructureId !== undefined) !==
+      (d.studentFeeAssignmentId !== undefined),
+    {
+      message:
+        "Provide exactly one of feeStructureId or studentFeeAssignmentId — not both, not neither.",
+      path: ["feeStructureId"],
+    }
+  );
 
 feesRouter.post(
   "/concessions",
@@ -583,7 +612,13 @@ feesRouter.patch(
       const { reason } = c.req.valid("json");
       const user = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
-      const result = await voidFeePayment(c.env, schoolCode, paymentId, user.id, reason);
+      const result = await voidFeePayment(
+        c.env,
+        schoolCode,
+        paymentId,
+        user.id,
+        reason
+      );
       return c.json(result);
     } catch (error: any) {
       return c.json({ error: error.message }, 400);
