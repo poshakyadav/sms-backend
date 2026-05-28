@@ -1,7 +1,7 @@
 // src/modules/school/dashboard/services.ts
 // Production-grade, persona-aware dashboard service
 
-import { and, desc, eq, sql } from "drizzle-orm";
+import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { getSchoolDB } from "../../../db/school-client";
 import {
   schoolAcademicYearsSchema,
@@ -22,6 +22,8 @@ import {
   schoolUsersSchema,
   studentParentsSchema,
   studentsSchema,
+  schoolFeeConcessionsSchema,
+  schoolStudentFeeAssignmentsSchema,
 } from "../../../db/schemas/school";
 import { SchoolEnv } from "../../../types/common-types";
 import { SchoolRole } from "../../../types/school-role";
@@ -763,38 +765,172 @@ async function buildParentDashboard(
   const attendancePercentage =
     totalDays > 0 ? Math.round((presentDays / totalDays) * 100) : 0;
 
-  const totalDue =
-    (
-      await db
-        .select({
-          total: sql<number>`coalesce(sum(${schoolFeeStructuresSchema.amount}), 0)`,
-        })
-        .from(schoolFeeStructuresSchema)
-        .where(
-          and(
-            eq(
-              schoolFeeStructuresSchema.classSectionId,
-              enrollment.classSectionId
-            ),
-            eq(schoolFeeStructuresSchema.academicYearId, currentYear.id)
+  // ── Fees: structure fees + custom assignments, both concession-aware ────
+  // Step 1: Standard fee structures for this class-section
+  const feeStructures = await db
+    .select({
+      id: schoolFeeStructuresSchema.id,
+      amount: schoolFeeStructuresSchema.amount,
+    })
+    .from(schoolFeeStructuresSchema)
+    .where(
+      and(
+        eq(schoolFeeStructuresSchema.classSectionId, enrollment.classSectionId),
+        eq(schoolFeeStructuresSchema.academicYearId, currentYear.id)
+      )
+    )
+    .all();
+
+  // Step 2: Structure-level concessions for this enrollment
+  const structureConcessions =
+    feeStructures.length > 0
+      ? await db
+          .select({
+            feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
+            concessionType: schoolFeeConcessionsSchema.concessionType,
+            concessionValue: schoolFeeConcessionsSchema.concessionValue,
+          })
+          .from(schoolFeeConcessionsSchema)
+          .where(
+            and(
+              eq(
+                schoolFeeConcessionsSchema.enrollmentId,
+                enrollment.enrollmentId
+              ),
+              eq(schoolFeeConcessionsSchema.isActive, true),
+              sql`${schoolFeeConcessionsSchema.feeStructureId} IS NOT NULL`
+            )
           )
-        )
-        .get()
-    )?.total ?? 0;
+          .all()
+      : [];
 
+  const structureConcessionMap = new Map<number, any>(
+    structureConcessions.map((c: any) => [c.feeStructureId, c])
+  );
+
+  let totalStructureOriginal = 0;
+  let totalStructureConcession = 0;
+
+  for (const fee of feeStructures) {
+    totalStructureOriginal += fee.amount;
+    const conc = structureConcessionMap.get(fee.id);
+    if (conc) {
+      const d =
+        conc.concessionType === "FIXED"
+          ? conc.concessionValue
+          : Math.floor((fee.amount * conc.concessionValue) / 100);
+      totalStructureConcession += Math.min(d, fee.amount);
+    }
+  }
+
+  // Step 3: Custom fee assignments for this enrollment
+  const assignments = await db
+    .select({
+      id: schoolStudentFeeAssignmentsSchema.id,
+      amount: schoolStudentFeeAssignmentsSchema.amount,
+    })
+    .from(schoolStudentFeeAssignmentsSchema)
+    .where(
+      and(
+        eq(
+          schoolStudentFeeAssignmentsSchema.enrollmentId,
+          enrollment.enrollmentId
+        ),
+        eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
+      )
+    )
+    .all();
+
+  // Step 4: Assignment-level concessions for this enrollment
+  const assignmentConcessions =
+    assignments.length > 0
+      ? await db
+          .select({
+            studentFeeAssignmentId:
+              schoolFeeConcessionsSchema.studentFeeAssignmentId,
+            concessionType: schoolFeeConcessionsSchema.concessionType,
+            concessionValue: schoolFeeConcessionsSchema.concessionValue,
+          })
+          .from(schoolFeeConcessionsSchema)
+          .where(
+            and(
+              eq(
+                schoolFeeConcessionsSchema.enrollmentId,
+                enrollment.enrollmentId
+              ),
+              eq(schoolFeeConcessionsSchema.isActive, true),
+              sql`${schoolFeeConcessionsSchema.studentFeeAssignmentId} IS NOT NULL`
+            )
+          )
+          .all()
+      : [];
+
+  const assignmentConcessionMap = new Map<number, any>(
+    assignmentConcessions.map((c: any) => [c.studentFeeAssignmentId, c])
+  );
+
+  let totalAssignmentOriginal = 0;
+  let totalAssignmentConcession = 0;
+
+  for (const a of assignments) {
+    totalAssignmentOriginal += a.amount;
+    const conc = assignmentConcessionMap.get(a.id);
+    if (conc) {
+      const d =
+        conc.concessionType === "FIXED"
+          ? conc.concessionValue
+          : Math.floor((a.amount * conc.concessionValue) / 100);
+      totalAssignmentConcession += Math.min(d, a.amount);
+    }
+  }
+
+  // Step 5: Payments — structure fees (void-filtered)
+  const structureFeeIds = feeStructures.map((f: any) => f.id);
+  const structurePaidResult =
+    structureFeeIds.length > 0
+      ? await db
+          .select({
+            total: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+          })
+          .from(schoolFeePaymentsSchema)
+          .where(
+            and(
+              eq(schoolFeePaymentsSchema.enrollmentId, enrollment.enrollmentId),
+              inArray(schoolFeePaymentsSchema.feeStructureId, structureFeeIds),
+              eq(schoolFeePaymentsSchema.isVoid, false)
+            )
+          )
+          .get()
+      : { total: 0 };
+
+  // Step 6: Payments — custom assignments (void-filtered)
+  const assignmentIds = assignments.map((a: any) => a.id);
+  const assignmentPaidResult =
+    assignmentIds.length > 0
+      ? await db
+          .select({
+            total: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+          })
+          .from(schoolFeePaymentsSchema)
+          .where(
+            and(
+              eq(schoolFeePaymentsSchema.enrollmentId, enrollment.enrollmentId),
+              inArray(
+                schoolFeePaymentsSchema.studentFeeAssignmentId,
+                assignmentIds
+              ),
+              eq(schoolFeePaymentsSchema.isVoid, false)
+            )
+          )
+          .get()
+      : { total: 0 };
+
+  // Step 7: Aggregate — all in paise
+  const totalOriginal = totalStructureOriginal + totalAssignmentOriginal;
+  const totalConcession = totalStructureConcession + totalAssignmentConcession;
+  const totalDue = totalOriginal - totalConcession;
   const totalPaid =
-    (
-      await db
-        .select({
-          total: sql<number>`coalesce(sum(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-        })
-        .from(schoolFeePaymentsSchema)
-        .where(
-          eq(schoolFeePaymentsSchema.enrollmentId, enrollment.enrollmentId)
-        )
-        .get()
-    )?.total ?? 0;
-
+    (structurePaidResult?.total ?? 0) + (assignmentPaidResult?.total ?? 0);
   const feesPending = Math.max(0, totalDue - totalPaid);
 
   const pendingAssignments =
@@ -842,9 +978,11 @@ async function buildParentDashboard(
       totalDaysTracked: totalDays,
       presentDays,
       absentDays,
-      feesCollected: totalPaid,
-      feesPending,
-      totalFeeDue: totalDue,
+      feesCollected: totalPaid, // paise
+      feesPending, // paise
+      totalFeeDue: totalDue, // paise (effective after concessions)
+      totalOriginal, // paise (before concessions)
+      totalConcession, // paise
       pendingAssignments,
     },
     lists: { recentGrades, recentNotifications },
