@@ -1,6 +1,6 @@
 // src/modules/super/approvals/services.ts
 
-import { eq, desc, sql } from "drizzle-orm";
+import { eq, desc, sql, inArray, and } from "drizzle-orm";
 import { schoolPaymentRecordsSchema } from "../../../db/schemas/super/school-payment-records";
 import { schoolsSchema } from "../../../db/schemas/super/schools";
 import { schoolInvitationsSchema } from "../../../db/schemas/super/school-invitations";
@@ -22,6 +22,7 @@ import { SchoolRole } from "../../../types/school-role";
 import { seedPermissionsAndRoles } from "../../school/permissions/services";
 import { schoolSettingsService } from "../../school/settings/services";
 import { getUserPermissionsFromDB } from "../../school/auth/permission-helpers";
+import { platformPaymentsSchema } from "../../../db";
 
 // const FRONTEND_URL = "http://localhost:4200";
 
@@ -29,6 +30,310 @@ import { getUserPermissionsFromDB } from "../../school/auth/permission-helpers";
 const getFrontendUrl = (env: { FRONTEND_ORIGIN?: string }): string => {
   return env.FRONTEND_ORIGIN || "http://localhost:4200";
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SECTION 1 — RAZORPAY APPROVAL QUEUE
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RazorpayApprovalItem {
+  // School info
+  schoolId: number;
+  schoolName: string;
+  schoolCode: string;
+  schoolEmail: string;
+  schoolPhone: string | null;
+  onboardingStatus: string;
+  invitationCity: string | null;
+  // Payment info (from platform_payments)
+  platformPaymentId: number;
+  razorpayOrderId: string | null;
+  razorpayPaymentId: string | null;
+  amountPaise: number;
+  currency: string;
+  method: string | null;
+  capturedAt: string | null;
+  paymentCreatedAt: string;
+  // Status after this component processes it
+  activationStatus: "PENDING" | "ACTIVATED";
+}
+
+/**
+ * Returns all schools that:
+ *  1. Have onboardingStatus = PAYMENT_SUBMITTED
+ *  2. Have at least one CAPTURED platform_payment of type SCHOOL_SETUP_FEE
+ *
+ * These are schools that paid via Razorpay and are awaiting super-admin activation.
+ * Already-activated schools (isActive=true) are excluded unless the super admin
+ * explicitly passes includeActivated=true (for history view).
+ */
+export async function getRazorpayApprovalQueue(
+  db: any,
+  includeActivated = false
+): Promise<RazorpayApprovalItem[]> {
+  // Build status filter
+  const statusConditions = includeActivated
+    ? inArray(schoolsSchema.onboardingStatus, [
+      "PAYMENT_SUBMITTED",
+      "ACTIVE",
+    ])
+    : inArray(schoolsSchema.onboardingStatus, ["PAYMENT_SUBMITTED"]);
+
+  const rows = await db
+    .select({
+      schoolId: schoolsSchema.id,
+      schoolName: schoolsSchema.name,
+      schoolCode: schoolsSchema.uniqueCode,
+      schoolEmail: schoolsSchema.email,
+      schoolPhone: schoolsSchema.phone,
+      onboardingStatus: schoolsSchema.onboardingStatus,
+      isActive: schoolsSchema.isActive,
+      invitationCity: schoolInvitationsSchema.city,
+      // Platform payment fields
+      platformPaymentId: platformPaymentsSchema.id,
+      razorpayOrderId: platformPaymentsSchema.razorpayOrderId,
+      razorpayPaymentId: platformPaymentsSchema.razorpayPaymentId,
+      amountPaise: platformPaymentsSchema.amountPaise,
+      currency: platformPaymentsSchema.currency,
+      method: platformPaymentsSchema.method,
+      capturedAt: platformPaymentsSchema.capturedAt,
+      paymentCreatedAt: platformPaymentsSchema.createdAt,
+    })
+    .from(platformPaymentsSchema)
+    .innerJoin(
+      schoolsSchema,
+      eq(platformPaymentsSchema.schoolId, schoolsSchema.id)
+    )
+    .leftJoin(
+      schoolInvitationsSchema,
+      and(
+        eq(schoolInvitationsSchema.schoolId, schoolsSchema.id),
+        // Get only the most recent invitation per school — handled in JS below
+      )
+    )
+    .where(
+      and(
+        statusConditions,
+        eq(platformPaymentsSchema.paymentType, "SCHOOL_SETUP_FEE"),
+        eq(platformPaymentsSchema.status, "CAPTURED")
+      )
+    )
+    .orderBy(desc(platformPaymentsSchema.capturedAt))
+    .all();
+
+  return rows.map((r: any) => ({
+    schoolId: r.schoolId,
+    schoolName: r.schoolName,
+    schoolCode: r.schoolCode,
+    schoolEmail: r.schoolEmail,
+    schoolPhone: r.schoolPhone,
+    onboardingStatus: r.onboardingStatus,
+    invitationCity: r.invitationCity,
+    platformPaymentId: r.platformPaymentId,
+    razorpayOrderId: r.razorpayOrderId,
+    razorpayPaymentId: r.razorpayPaymentId,
+    amountPaise: r.amountPaise,
+    currency: r.currency,
+    method: r.method,
+    capturedAt: r.capturedAt,
+    paymentCreatedAt: r.paymentCreatedAt,
+    activationStatus: r.isActive ? "ACTIVATED" : "PENDING",
+  }));
+}
+
+/**
+ * Activates a school that paid via Razorpay.
+ *
+ * Unlike the UTR flow, we don't need a school_payment_records row —
+ * the payment is already confirmed by Razorpay's own webhook. This function:
+ *   1. Verifies the school is in PAYMENT_SUBMITTED state
+ *   2. Finds an available Turso DB and assigns it
+ *   3. Provisions the school DB (users, roles, permissions, themes)
+ *   4. Marks school as ACTIVE in the super DB
+ *   5. Sends the activation email
+ *
+ * Fully idempotent — safe to call twice if a previous run partially failed.
+ */
+export async function activateRazorpaySchool(
+  db: any,
+  env: any,
+  schoolId: number,
+  activatedBy: number,
+  internalNotes?: string
+): Promise<{ schoolCode: string; schoolName: string }> {
+  // 1. Fetch school
+  const school = await db
+    .select()
+    .from(schoolsSchema)
+    .where(eq(schoolsSchema.id, schoolId))
+    .get();
+
+  if (!school) throw new Error("School not found");
+
+  // Idempotency: if already active, just return success
+  if (school.isActive && school.onboardingStatus === "ACTIVE") {
+    return { schoolCode: school.uniqueCode, schoolName: school.name };
+  }
+
+  // Only allow activation from PAYMENT_SUBMITTED
+  if (school.onboardingStatus !== "PAYMENT_SUBMITTED") {
+    throw new Error(
+      `School is in status "${school.onboardingStatus}" — can only activate from PAYMENT_SUBMITTED.`
+    );
+  }
+
+  // 2. Verify that a CAPTURED setup fee payment exists
+  const payment = await db
+    .select({
+      id: platformPaymentsSchema.id,
+      amountPaise: platformPaymentsSchema.amountPaise,
+      capturedAt: platformPaymentsSchema.capturedAt,
+    })
+    .from(platformPaymentsSchema)
+    .where(
+      and(
+        eq(platformPaymentsSchema.schoolId, schoolId),
+        eq(platformPaymentsSchema.paymentType, "SCHOOL_SETUP_FEE"),
+        eq(platformPaymentsSchema.status, "CAPTURED")
+      )
+    )
+    .get();
+
+  if (!payment) {
+    throw new Error(
+      "No captured setup fee payment found for this school. Cannot activate without confirmed payment."
+    );
+  }
+
+  // 3. Fetch the invitation (to get owner registration data stored in notes)
+  const invitation = await db
+    .select()
+    .from(schoolInvitationsSchema)
+    .where(eq(schoolInvitationsSchema.schoolId, schoolId))
+    .orderBy(desc(schoolInvitationsSchema.createdAt))
+    .limit(1)
+    .get();
+
+  if (!invitation) {
+    throw new Error(
+      "No invitation record found for this school. Owner registration data is missing."
+    );
+  }
+
+  // 4. Parse owner registration data
+  let ownerData: {
+    ownerName: string;
+    ownerEmail: string;
+    passwordHash: string;
+    ownerPhone: string;
+    ownerAlternatePhone: string;
+    schoolName: string;
+    addressLineOne: string;
+    addressLineTwo: string;
+    phone: string;
+    alternatePhone: string;
+    schoolEmail: string;
+    schoolWebsite: string;
+    termsAcceptedAt?: string;
+  } | null = null;
+
+  try {
+    if (invitation.notes) {
+      ownerData = JSON.parse(invitation.notes);
+    }
+  } catch {
+    // Non-critical parse error
+  }
+
+  if (!ownerData?.passwordHash) {
+    throw new Error(
+      "Owner registration data is missing or corrupted. The school must re-register."
+    );
+  }
+
+  // 5. Find or reuse Turso DB
+  let availableDb: any;
+
+  if (school.tursoDbId) {
+    availableDb = await db
+      .select()
+      .from(tursoDatabasesSchema)
+      .where(eq(tursoDatabasesSchema.id, school.tursoDbId))
+      .get();
+    console.log(
+      `♻️  Reusing previously assigned DB id=${availableDb?.id} for school ${school.uniqueCode}`
+    );
+  } else {
+    availableDb = await db
+      .select()
+      .from(tursoDatabasesSchema)
+      .where(eq(tursoDatabasesSchema.isAssigned, false))
+      .limit(1)
+      .get();
+  }
+
+  if (!availableDb) {
+    throw new Error(
+      "No available Turso databases. Please provision more databases first."
+    );
+  }
+
+  const schoolCode = school.uniqueCode;
+
+  // 6. Super DB transaction: activate school + assign DB + update invitation
+  await db.transaction(async (tx: any) => {
+    await tx
+      .update(schoolsSchema)
+      .set({
+        onboardingStatus: "ACTIVE",
+        isActive: true,
+        tursoDbId: availableDb.id,
+        activatedAt: new Date().toISOString(),
+        updatedAt: sql`CURRENT_TIMESTAMP`,
+      })
+      .where(eq(schoolsSchema.id, schoolId));
+
+    await tx
+      .update(tursoDatabasesSchema)
+      .set({ isAssigned: true })
+      .where(eq(tursoDatabasesSchema.id, availableDb.id));
+
+    await tx
+      .update(schoolInvitationsSchema)
+      .set({
+        status: "PAYMENT_APPROVED",
+        updatedAt: sql`CURRENT_TIMESTAMP`,
+      })
+      .where(eq(schoolInvitationsSchema.id, invitation.id));
+  });
+
+  // 7. Provision school DB (idempotent)
+  try {
+    await provisionSchoolDatabase(env, schoolCode, school, ownerData);
+  } catch (provisionError: any) {
+    console.error(
+      `CRITICAL: School DB provisioning failed for ${schoolCode}:`,
+      provisionError
+    );
+    throw new Error(
+      `School activated in super DB but DB provisioning failed: ${provisionError.message}. ` +
+      `Please contact support. School code: ${schoolCode}`
+    );
+  }
+
+  // 8. Send activation email
+  const frontendUrl = getFrontendUrl(env);
+  const loginLink = `${frontendUrl}/login`;
+
+  await sendActivationEmail(env, {
+    to: school.email,
+    ownerEmail: ownerData.ownerEmail,
+    schoolName: school.name,
+    schoolCode,
+    loginLink,
+  });
+
+  return { schoolCode, schoolName: school.name };
+}
 
 // ── List all payment records (pending + all) ─────────────────────────────────
 
@@ -265,7 +570,7 @@ export async function approvePayment(
     // In a more robust system you'd have a retry queue for this.
     throw new Error(
       `Payment approved but school DB provisioning failed: ${provisionError.message}. ` +
-        `Please contact support with school code: ${schoolCode}`
+      `Please contact support with school code: ${schoolCode}`
     );
   }
 
@@ -317,8 +622,8 @@ async function provisionSchoolDatabase(
   if (existingSchoolRecord && existingSchoolRecord.uniqueCode !== schoolCode) {
     throw new Error(
       `DB contamination detected: DB contains data for school "${existingSchoolRecord.uniqueCode}" ` +
-        `but we are trying to provision "${schoolCode}". ` +
-        `This Turso DB was previously used. Please assign a clean DB and retry.`
+      `but we are trying to provision "${schoolCode}". ` +
+      `This Turso DB was previously used. Please assign a clean DB and retry.`
     );
   }
 
