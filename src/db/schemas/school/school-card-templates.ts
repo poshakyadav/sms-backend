@@ -2,6 +2,7 @@ import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { schoolsSchema } from "./schools";
 
+// This table stores the HTML templates for school cards (admit cards, report cards, etc.) for each school.
 export const schoolCardTemplatesSchema = sqliteTable("card_templates", {
   id: integer("id").primaryKey({ autoIncrement: true }),
   schoolId: integer("school_id")

@@ -1,3 +1,5 @@
+// src/modules/super/auth/services.ts
+
 import { eq } from "drizzle-orm";
 import {
   superUsersSchema,
@@ -14,6 +16,7 @@ import { seedSuperPermissionsAndRoles } from "../permissions/services";
 import { SuperRoleEnum } from "../../../types/super-role";
 import { superRolesSchema } from "../../../db/schemas/super/super-roles";
 import { refreshTokensSchema } from "../../../db/schemas/super/refresh-tokens";
+import { seedRazorpayDefaults } from "./razorpay-seeder";
 
 // ── Token pair generator ──────────────────────────────────────────────────────
 
@@ -48,6 +51,27 @@ export async function registerSuperUser(
 ) {
   // Ensure permissions + roles are seeded before first user
   await seedSuperPermissionsAndRoles(db);
+
+  // ── WHY WE CALL seedRazorpayDefaults HERE ─────────────────────────────────
+  //
+  // The seeder creates two rows in access_plans (MONTHLY ₹599 / YEARLY ₹8985)
+  // and four starter WhatsApp bundles in message_bundles. Without these rows,
+  // the payment routes would throw "Access plan not found" or "Bundle not found"
+  // on the first real payment attempt.
+  //
+  // We call it inside registerSuperUser (which runs on first-ever setup) rather
+  // than on every request boot because:
+  //   1. It's idempotent — will no-op on subsequent calls if rows exist.
+  //   2. Cloudflare Workers have no "boot" lifecycle hook — you can't reliably
+  //      run one-time setup code in module-level scope across all worker instances.
+  //   3. registerSuperUser already runs seedSuperPermissionsAndRoles, so this
+  //      is the established pattern in your codebase for one-time DB setup.
+  //
+  // If you want belt-and-suspenders safety (e.g. if someone manually deletes
+  // the rows), you can also call seedRazorpayDefaults at the top of the
+  // /auth/setup route or in a dedicated /super/seed endpoint.
+  // ──────────────────────────────────────────────────────────────────────────
+  await seedRazorpayDefaults(db);
 
   const existing = await db
     .select({ id: superUsersSchema.id })

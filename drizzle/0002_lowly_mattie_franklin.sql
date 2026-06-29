@@ -1,1 +1,0 @@
-ALTER TABLE `school_invitations` ADD `owner_terms_accepted_at` text;

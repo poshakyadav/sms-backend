@@ -313,6 +313,7 @@ feesRouter.get(
         schoolCode,
         enrollmentId
       );
+      // console.log("student concessions:", concessions);
       return c.json({ concessions });
     } catch (error: any) {
       return c.json({ error: error.message }, 400);

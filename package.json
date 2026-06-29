@@ -17,8 +17,10 @@
     "test:run": "vitest run --coverage"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.1075.0",
     "@hono/zod-validator": "^0.7.6",
     "@libsql/client": "^0.17.0",
+    "aws4fetch": "^1.0.20",
     "bcryptjs": "^3.0.3",
     "drizzle-orm": "^0.45.1",
     "exceljs": "^4.4.0",

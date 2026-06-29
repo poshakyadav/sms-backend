@@ -52,6 +52,15 @@ export const schoolUsersSchema = sqliteTable("school_users", {
   bloodGroup: text("blood_group").default(""), // A+, A-, B+, B-, O+, O-, AB+, AB-
   avatarUrl: text("avatar_url").default(""), // URL to user avatar image
 
+  /**
+   * R2 object key for the user's profile photo, e.g.
+   * "avatars/<schoolId>/<userId>/<uuid>.webp"
+   * NULL/empty when no avatar has been uploaded yet.
+   * Stored so the backend can call r2.delete(avatarKey) when the photo is
+   * replaced or removed — mirrors school_feed_posts.imageKey.
+   */
+  avatarKey: text("avatar_key").default(""),
+
   // ── PARENTAL / GUARDIAN FIELDS ─────────────────────────────────────────────
   // Stored on school_users because:
   //   • Students need them for UDISE+, TC, admit cards, and emergency contact.

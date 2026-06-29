@@ -33,6 +33,7 @@ import {
 import { sendTransactionalEmail } from "../../../utils/sendEmail";
 import { getUserPermissionsFromDB } from "../auth/permission-helpers";
 import { PermissionCategory } from "../../../types/school-permissions";
+import { deleteUserAvatar, uploadUserAvatar } from "../../../utils/school/avatar-storage";
 
 // Helper to get frontend URL
 const getFrontendUrlForUsers = (env: SchoolEnv["Bindings"]): string => {
@@ -1326,6 +1327,107 @@ export async function updateSchoolUser(
 
     return { message: "User updated successfully" };
   });
+}
+
+/**
+ * Uploads (or replaces) a user's profile photo.
+ *
+ * Single-photo invariant: a user has at most ONE avatar at a time. If an
+ * avatar already exists, the OLD R2 object is deleted only AFTER the new
+ * one uploads successfully — this ordering means a failed upload never
+ * leaves the user without their previous photo.
+ *
+ * `bytes` is expected to already be compressed/resized client-side (≤ ~50KB,
+ * WebP) per the same convention as school_feed_posts image uploads — this
+ * function does not re-compress; it trusts the frontend contract.
+ */
+export async function uploadSchoolUserAvatar(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number,
+  bytes: ArrayBuffer,
+  contentType: string
+): Promise<{ avatarUrl: string }> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const user = await db
+    .select({
+      id: schoolUsersSchema.id,
+      schoolId: schoolUsersSchema.schoolId,
+      avatarKey: schoolUsersSchema.avatarKey,
+    })
+    .from(schoolUsersSchema)
+    .where(eq(schoolUsersSchema.id, userId))
+    .get();
+
+  if (!user) throw new Error("User not found");
+
+  // Basic server-side size guard — defense in depth even though the
+  // frontend is expected to compress before sending. 100KB ceiling gives
+  // headroom above the ~50KB target without allowing abuse.
+  const MAX_AVATAR_BYTES = 100 * 1024;
+  if (bytes.byteLength > MAX_AVATAR_BYTES) {
+    throw new Error(
+      `Image is too large (${Math.round(bytes.byteLength / 1024)}KB). Please use a smaller image.`
+    );
+  }
+
+  const { url, key } = await uploadUserAvatar(env, {
+    schoolId: user.schoolId,
+    userId: user.id,
+    bytes,
+    contentType,
+  });
+
+  const previousKey = user.avatarKey;
+
+  await db
+    .update(schoolUsersSchema)
+    .set({
+      avatarUrl: url,
+      avatarKey: key,
+      updatedAt: sql`CURRENT_TIMESTAMP`,
+    })
+    .where(eq(schoolUsersSchema.id, userId));
+
+  // Clean up the OLD object only after the new one is confirmed saved.
+  if (previousKey && previousKey !== key) {
+    await deleteUserAvatar(env, previousKey);
+  }
+
+  return { avatarUrl: url };
+}
+
+/**
+ * Removes a user's profile photo entirely (back to no-avatar state).
+ */
+export async function removeSchoolUserAvatar(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number
+): Promise<void> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const user = await db
+    .select({ avatarKey: schoolUsersSchema.avatarKey })
+    .from(schoolUsersSchema)
+    .where(eq(schoolUsersSchema.id, userId))
+    .get();
+
+  if (!user) throw new Error("User not found");
+
+  await db
+    .update(schoolUsersSchema)
+    .set({
+      avatarUrl: "",
+      avatarKey: "",
+      updatedAt: sql`CURRENT_TIMESTAMP`,
+    })
+    .where(eq(schoolUsersSchema.id, userId));
+
+  if (user.avatarKey) {
+    await deleteUserAvatar(env, user.avatarKey);
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -39,9 +39,25 @@ import schoolsRouter from "./modules/super/schools/routes";
 import tursoDbsRouter from "./modules/super/turso-dbs/routes";
 import usersRouter from "./modules/super/users/routes";
 import { Env } from "./types/common-types";
+import udiseRouter from "./modules/school/students/udise/routes";
+import studentHistoryRouter from "./modules/school/students/student-history/routes";
+import razorpayWebhookRouter from "./modules/webhooks/razorpay/routes";
+import accessPlansRouter from "./modules/super/access-plans/routes";
+import platformPaymentsRouter from "./modules/super/platform-payments/routes";
+import accessPaymentRouter from "./modules/school/payments/access/routes";
+import billingRouter from "./modules/school/billing/routes";
+import whatsappWebhookRouter from "./modules/webhooks/whatsapp/routes";
+import whatsappRouter from "./modules/school/whatsapp/routes";
+import messageBundlesRouter from "./modules/super/message-bundles/routes";
+import bundlesRouter from "./modules/school/payments/bundles/routes";
+import setupFeeRouter from "./modules/school/payments/setup-fee/routes";
+import feedRouter from "./modules/school/feed/routes";
+import idCardVerifyRouter from "./modules/public/id-card-verify/routes";
+import idCardsRouter from "./modules/school/id-cards/routes";
 
 const app = new Hono<Env>();
 
+// ── CORS ──────────────────────────────────────────────────────────
 // Add CORS middleware globally (production-grade)
 app.use(
   "*",
@@ -50,7 +66,7 @@ app.use(
       const allowedOrigins = [
         ctx.env.FRONTEND_ORIGIN, // production frontend URL from env
         "http://localhost:4200",
-      ].filter(Boolean); // Remove null/undefined 
+      ].filter(Boolean); // Remove null/undefined
 
       // Allow requests with no origin (some tools) or matching allowed origins
       if (!origin || allowedOrigins.includes(origin)) {
@@ -75,10 +91,27 @@ app.use(
   })
 );
 
-// Public (no auth)
+// ── WEBHOOKS — registered FIRST, before any body-parsing ─────────────────────
+// Razorpay webhook (HMAC signature auth)
+app.route("/webhooks/razorpay", razorpayWebhookRouter);
+// WhatsApp webhook (hub.verify_token for GET, WABA ID check for POST)
+app.route("/webhooks/whatsapp", whatsappWebhookRouter);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC routes (no auth)
+// ─────────────────────────────────────────────────────────────────────────────
 app.route("/public/school-requests", publicSchoolRequestsRouter);
 
-// Super routes
+app.route("/verify", idCardVerifyRouter);
+
+// ── Setup fee payment routes (public — used during onboarding before login)
+// These are called from the payment page which has no JWT yet.
+// The school identifies itself by schoolCode in the request body.
+app.route("/payments/setup-fee", setupFeeRouter);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SUPER ADMIN routes
+// ─────────────────────────────────────────────────────────────────────────────
 app.route("/auth", authRouter);
 app.route("/auth/setup", setupRouter); // Public: one-time setup (goes 404 after first user is created)
 app.route("/users", usersRouter);
@@ -91,11 +124,18 @@ app.route("/payment-config", paymentConfigRouter);
 app.route("/invitations", invitationsRouter);
 app.route("/approvals", approvalsRouter);
 // Super admin
-app.route("/school-requests", superSchoolRequestsRouter);
-app.route("/contact-messages", superContactMessagesRouter);
+app.route("/super/school-requests", superSchoolRequestsRouter);
+app.route("/super/contact-messages", superContactMessagesRouter);
 app.route("/school-permissions-sync", schoolPermissionsSyncRouter);
 
-// School routes
+// ── Razorpay super-admin management routes ───────────────────────────────
+app.route("/super/access-plans", accessPlansRouter); // GET/PUT monthly+yearly pricing
+app.route("/super/message-bundles", messageBundlesRouter); // CRUD for WhatsApp/Email/SMS bundles
+app.route("/super/platform-payments", platformPaymentsRouter); // Unified payment ledger + access overrides
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHOOL routes (authenticated via schoolJwtMiddleware on each router)
+// ─────────────────────────────────────────────────────────────────────────────
 app.route("/school/info", schoolInfoRouter);
 app.route("/school/about-us", aboutUsRouter);
 app.route("/school/auth", schoolAuthRouter);
@@ -103,7 +143,11 @@ app.route("/school/users", schoolUsersRouter);
 app.route("/school/notifications", notificationsRouter);
 app.route("/school/settings", schoolSettingsRouter);
 app.route("/school/profile", profileRouter);
+app.route("/school/students/history", studentHistoryRouter);
+app.route("/school/students/udise", udiseRouter);
 app.route("/school/students", studentsRouter);
+app.route("/school/id-cards", idCardsRouter);
+
 app.route("/school/academics", academicsRouter);
 app.route("/school/academics", classesRouter);
 app.route("/school/academics", sectionsRouter);
@@ -122,6 +166,23 @@ app.route("/school/parent", parentRouter);
 // School (authenticated)
 app.route("/contact", schoolContactRouter);
 
-app.get("/", (c) => c.text("Hello Hono!"));
+// ── School-side payment + billing routes (authenticated) ─────────────────
+//
+// IMPORTANT — these routes must NOT have requireActiveAccess applied:
+//   /school/payments/*   → school must be able to pay even when access is expired
+//   /school/billing/*    → school must be able to see their status and history
+//
+// All OTHER school routes (students, fees, attendance, etc.) should have
+// requireActiveAccess added. See APPLY_ACCESS_GATE_TO comment below.
+app.route("/school/payments/access", accessPaymentRouter); // Manual order + Autopay
+app.route("/school/payments/bundles", bundlesRouter); // WhatsApp bundle purchase
+app.route("/school/billing", billingRouter); // History, balance, access status
+
+// ── WhatsApp messaging (requireActiveAccess applied inside the router) ───
+app.route("/school/whatsapp", whatsappRouter);
+
+app.route("/school/feed", feedRouter);
+
+app.get("/", (c) => c.text("Hello!"));
 
 export default app;

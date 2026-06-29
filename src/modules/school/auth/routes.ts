@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   getCommonDB,
   paymentConfigSchema,
+  platformPaymentsSchema,
   schoolInvitationsSchema,
   schoolPaymentRecordsSchema,
   schoolsSchema as superSchoolsSchema,
@@ -97,10 +98,10 @@ async function fetchSchoolBranding(db: any): Promise<SchoolBranding | null> {
       tagline: row.tagline || null,
       theme: row.themeName
         ? {
-            themeName: row.themeName,
-            config: JSON.parse(row.themeConfig || "{}"),
-            isCustomTheme: row.isCustomTheme,
-          }
+          themeName: row.themeName,
+          config: JSON.parse(row.themeConfig || "{}"),
+          isCustomTheme: row.isCustomTheme,
+        }
         : null,
     };
   } catch {
@@ -275,6 +276,49 @@ schoolAuthRouter.get("/validate-invite/:token", async (c) => {
       );
     }
 
+    // ── Shared helper: fetch + shape payment config exactly the same way ────
+    // regardless of which branch below needs it. This is the piece that was
+    // previously duplicated only in the "fresh invitation" branch and MISSING
+    // entirely from the "already registered" branch — meaning any school
+    // that had already completed signup (status REGISTERED/PAYMENT_SUBMITTED)
+    // got `paymentConfig: undefined` back from this endpoint, every time,
+    // forever — which is exactly why the frontend kept showing ₹0 even after
+    // a fresh re-fetch: it was re-fetching the same incomplete response.
+    async function fetchPaymentConfigForResponse() {
+      const feeConfig = await commonDb
+        .select({
+          setupFeeAmount: paymentConfigSchema.setupFeeAmount,
+          setupFeeDiscountPaise: paymentConfigSchema.setupFeeDiscountPaise,
+          setupFeeFinalAmountPaise: paymentConfigSchema.setupFeeFinalAmountPaise,
+          isFeeEnabled: paymentConfigSchema.isFeeEnabled,
+          upiId: paymentConfigSchema.upiId,
+          qrCodeUrl: paymentConfigSchema.qrCodeUrl,
+          feeDescription: paymentConfigSchema.feeDescription,
+        })
+        .from(paymentConfigSchema)
+        .where(eq(paymentConfigSchema.id, 1))
+        .get();
+
+      // 🔍 DEBUG LOG — exact row read from payment_config on every call
+      console.log("💰 validate-invite → fetched payment_config row:", feeConfig);
+
+      return feeConfig
+        ? {
+          ...feeConfig,
+          razorpayKeyId: c.env.RAZORPAY_KEY_ID,
+        }
+        : {
+          setupFeeAmount: 0,
+          setupFeeDiscountPaise: 0,
+          setupFeeFinalAmountPaise: 0,
+          isFeeEnabled: false,
+          upiId: "",
+          qrCodeUrl: "",
+          feeDescription: "",
+          razorpayKeyId: c.env.RAZORPAY_KEY_ID,
+        };
+    }
+
     // ── Already registered: redirect to payment page ───────────────────────
     // If the school already completed the signup form (status = REGISTERED or
     // PAYMENT_SUBMITTED), return a special response so the frontend skips the
@@ -294,7 +338,7 @@ schoolAuthRouter.get("/validate-invite/:token", async (c) => {
         schoolCode = school?.uniqueCode ?? null;
       }
 
-      // ── NEW: parse stored owner registration data from invitation.notes ──────
+      // ── parse stored owner registration data from invitation.notes ───────
       // notes contains JSON with ownerName, ownerEmail, ownerPhone, schoolName,
       // addressLineOne, etc. — but NOT the passwordHash (we strip it for safety).
       let registeredDetails: Record<string, string> | null = null;
@@ -309,11 +353,16 @@ schoolAuthRouter.get("/validate-invite/:token", async (c) => {
         }
       }
 
+      // 🔧 FIX: this branch previously returned NO paymentConfig field at
+      // all, so the frontend's res.paymentConfig was always undefined here —
+      // the step-3 payment screen had nothing to show but ₹0/defaults.
+      const paymentConfig = await fetchPaymentConfigForResponse();
+
       return c.json({
         valid: true,
-        alreadyRegistered: true, // ← NEW flag the frontend checks
-        schoolCode, // ← NEW: school code for payment page redirect
-        registeredDetails, // safe owner+school details for pre-filling edit form
+        alreadyRegistered: true,
+        schoolCode,
+        registeredDetails,
         invitation: {
           token: invitation.inviteToken,
           schoolName: invitation.schoolName,
@@ -324,6 +373,7 @@ schoolAuthRouter.get("/validate-invite/:token", async (c) => {
           schoolId: invitation.schoolId,
           expiresAt: invitation.expiresAt,
         },
+        paymentConfig, // ← NEW: now present in this branch too
       });
     }
 
@@ -336,17 +386,7 @@ schoolAuthRouter.get("/validate-invite/:token", async (c) => {
     }
 
     // ── Fresh invitation — return full payload including payment config ─────
-    const feeConfig = await commonDb
-      .select({
-        setupFeeAmount: paymentConfigSchema.setupFeeAmount,
-        isFeeEnabled: paymentConfigSchema.isFeeEnabled,
-        upiId: paymentConfigSchema.upiId,
-        qrCodeUrl: paymentConfigSchema.qrCodeUrl,
-        feeDescription: paymentConfigSchema.feeDescription,
-      })
-      .from(paymentConfigSchema)
-      .where(eq(paymentConfigSchema.id, 1))
-      .get();
+    const paymentConfig = await fetchPaymentConfigForResponse();
 
     return c.json({
       valid: true,
@@ -361,13 +401,7 @@ schoolAuthRouter.get("/validate-invite/:token", async (c) => {
         schoolId: invitation.schoolId,
         expiresAt: invitation.expiresAt,
       },
-      paymentConfig: feeConfig ?? {
-        setupFeeAmount: 0,
-        isFeeEnabled: false,
-        upiId: "",
-        qrCodeUrl: "",
-        feeDescription: "",
-      },
+      paymentConfig,
     });
   } catch (error: any) {
     console.error("validate-invite error:", error);
@@ -396,7 +430,7 @@ schoolAuthRouter.get("/payment-status/:schoolCode", async (c) => {
     if (!school) return c.json({ error: "School not found" }, 404);
 
     // paymentRecord and feeConfig are independent — fetch both at once
-    const [paymentRecord, feeConfig] = await Promise.all([
+    const [paymentRecord, feeConfig, razorpayPayments] = await Promise.all([
       commonDb
         .select()
         .from(schoolPaymentRecordsSchema)
@@ -409,6 +443,21 @@ schoolAuthRouter.get("/payment-status/:schoolCode", async (c) => {
         .from(paymentConfigSchema)
         .where(eq(paymentConfigSchema.id, 1))
         .get(),
+
+      commonDb
+        .select({
+          id: platformPaymentsSchema.id,
+          paymentType: platformPaymentsSchema.paymentType,
+          amountPaise: platformPaymentsSchema.amountPaise,
+          status: platformPaymentsSchema.status,
+          capturedAt: platformPaymentsSchema.capturedAt,
+          createdAt: platformPaymentsSchema.createdAt,
+        })
+        .from(platformPaymentsSchema)
+        .where(eq(platformPaymentsSchema.schoolId, school.id))
+        .orderBy(sql`${platformPaymentsSchema.createdAt} DESC`)
+        .limit(5)
+        .all(),
     ]);
 
     return c.json({
@@ -418,8 +467,9 @@ schoolAuthRouter.get("/payment-status/:schoolCode", async (c) => {
         onboardingStatus: school.onboardingStatus,
         isActive: school.isActive,
       },
-      paymentRecord: paymentRecord ?? null,
+      paymentRecord: paymentRecord ?? null,  // legacy UTR record
       paymentConfig: feeConfig ?? null,
+      razorpayPayments: razorpayPayments ?? [],   // Razorpay payments (may be empty for legacy schools)
     });
   } catch (error: any) {
     return c.json({ error: error.message }, 500);
@@ -544,8 +594,8 @@ schoolAuthRouter.post(
           <p><strong>${school.name}</strong> has submitted payment proof.</p>
           <p>UTR: <strong>${data.utrNumber}</strong></p>
           <p>Amount: <strong>₹${(data.amountPaid / 100).toLocaleString(
-            "en-IN"
-          )}</strong></p>
+          "en-IN"
+        )}</strong></p>
           <p>Payer: ${data.payerName}</p>
           <p>Login to your admin portal to verify and approve.</p>
         `,
@@ -595,8 +645,8 @@ const signupSchema = z.object({
   addressLineTwo: z.string().optional(),
   phone: z.string().optional(),
   alternatePhone: z.string().optional(),
-  schoolEmail: z.string().email().optional(),
-  schoolWebsite: z.string().url().optional(),
+  schoolEmail: z.string().email().optional().or(z.literal("")),
+  schoolWebsite: z.string().url().optional().or(z.literal("")),
   /**
    * Owner must agree to T&C and Privacy Policy at signup.
    * Required: true — cannot register without accepting.
@@ -609,10 +659,34 @@ const signupSchema = z.object({
 
 schoolAuthRouter.post(
   "/signup",
-  zValidator("json", signupSchema),
+  zValidator("json", signupSchema, (result, c) => {
+    if (!result.success) {
+      // 🔍 DEBUG LOG — shows the exact field(s) that failed and why
+      console.error(
+        "❌ /school/auth/signup validation failed:",
+        JSON.stringify(result.error.issues, null, 2)
+      );
+      return c.json(
+        {
+          success: false,
+          error: "Validation failed",
+          // Send a flat, frontend-friendly message + the raw issues for debugging
+          message: result.error.issues
+            .map((i) => `${i.path.join(".")}: ${i.message}`)
+            .join("; "),
+          issues: result.error.issues,
+        },
+        400
+      );
+    }
+  }),
   async (c) => {
     try {
       const data = c.req.valid("json");
+      console.log("✅ /signup payload validated:", {
+        ...data,
+        ownerPassword: "[REDACTED]",
+      });
       const commonDb = getCommonDB(c.env);
 
       // 1. Validate invitation token

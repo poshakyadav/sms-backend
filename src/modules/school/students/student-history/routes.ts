@@ -1,4 +1,4 @@
-// src/modules/school/students/history/routes.ts
+// src/modules/school/students/student-history/routes.ts
 //
 // STUDENT HISTORY MODULE — ROUTES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -67,8 +67,8 @@ const historyQuerySchema = z.object({
   eventType: z.string().optional(),
   dateFrom: z.string().date().optional(),
   dateTo: z.string().date().optional(),
-  page: z.string().regex(/^\d+$/).transform(Number).optional().default(1),
-  limit: z.string().regex(/^\d+$/).transform(Number).optional().default(50),
+  page: z.string().regex(/^\d+$/).optional().default("1").transform(Number),
+  limit: z.string().regex(/^\d+$/).optional().default("50").transform(Number),
 });
 
 /**
@@ -105,8 +105,8 @@ const bulkHistoryQuerySchema = z.object({
     .default("name"),
   sortOrder: z.enum(["asc", "desc"]).optional().default("asc"),
   // Pagination
-  page: z.string().regex(/^\d+$/).transform(Number).optional().default(1),
-  limit: z.string().regex(/^\d+$/).transform(Number).optional().default(30),
+  page: z.string().regex(/^\d+$/).optional().default("1").transform(Number),
+  limit: z.string().regex(/^\d+$/).optional().default("30").transform(Number),
 });
 
 /**
@@ -119,8 +119,64 @@ const bulkHistoryQuerySchema = z.object({
 const searchQuerySchema = z.object({
   q: z.string().min(2).max(150),
   status: z.enum(["active", "departed", "all"]).optional().default("all"),
-  limit: z.string().regex(/^\d+$/).transform(Number).optional().default(10),
+  limit: z.string().regex(/^\d+$/).optional().default("10").transform(Number),
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GET /school/students/history   (bulk listing with search + filters)
+// ─────────────────────────────────────────────────────────────────────────────
+studentHistoryRouter.get(
+  "/",
+  requirePermission("students.list"),
+  // zValidator("query", bulkHistoryQuerySchema),
+  zValidator("query", bulkHistoryQuerySchema, (result, c) => {
+    if (!result.success) {
+      // ── LOG: print exact Zod validation errors to wrangler console ─────────
+      console.error(
+        "❌ [students/history] Query validation failed:",
+        JSON.stringify(result.error.issues, null, 2)
+      );
+      return c.json(
+        {
+          success: false,
+          error: "Validation failed",
+          issues: result.error.issues,
+        },
+        400
+      );
+    }
+  }),
+  async (c, next) => {
+    try {
+      const schoolCode = c.get("schoolCode")!;
+      const query = c.req.valid("query");
+
+      console.log("✅ [students/history] Validated query:", query);
+
+      const result = await getAllStudentsHistory(c.env, schoolCode, {
+        q: query.q,
+        name: query.name,
+        email: query.email,
+        phone: query.phone,
+        admissionNumber: query.admissionNumber,
+        fatherName: query.fatherName,
+        motherName: query.motherName,
+        rollNumber: query.rollNumber,
+        status: query.status,
+        academicYearId: query.academicYearId,
+        sortBy: query.sortBy,
+        sortOrder: query.sortOrder,
+        page: query.page,
+        limit: Math.min(query.limit, 100),
+      });
+
+      return c.json({ success: true, ...result });
+    } catch (error: any) {
+      console.error("Get all students history error:", error);
+      return c.json({ success: false, error: error.message }, 500);
+    }
+  }
+);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // GET /school/students/history/search   (fast autocomplete — before /:id routes)
@@ -143,43 +199,6 @@ studentHistoryRouter.get(
       return c.json({ success: true, results });
     } catch (error: any) {
       console.error("Student search error:", error);
-      return c.json({ success: false, error: error.message }, 500);
-    }
-  }
-);
-
-// ─────────────────────────────────────────────────────────────────────────────
-// GET /school/students/history   (bulk listing with search + filters)
-// ─────────────────────────────────────────────────────────────────────────────
-studentHistoryRouter.get(
-  "/",
-  requirePermission("students.list"),
-  zValidator("query", bulkHistoryQuerySchema),
-  async (c) => {
-    try {
-      const schoolCode = c.get("schoolCode")!;
-      const query = c.req.valid("query");
-
-      const result = await getAllStudentsHistory(c.env, schoolCode, {
-        q: query.q,
-        name: query.name,
-        email: query.email,
-        phone: query.phone,
-        admissionNumber: query.admissionNumber,
-        fatherName: query.fatherName,
-        motherName: query.motherName,
-        rollNumber: query.rollNumber,
-        status: query.status,
-        academicYearId: query.academicYearId,
-        sortBy: query.sortBy,
-        sortOrder: query.sortOrder,
-        page: query.page,
-        limit: Math.min(query.limit, 100),
-      });
-
-      return c.json({ success: true, ...result });
-    } catch (error: any) {
-      console.error("Get all students history error:", error);
       return c.json({ success: false, error: error.message }, 500);
     }
   }

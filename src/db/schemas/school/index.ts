@@ -23,6 +23,20 @@ export * from "./school-class-sections"; // Depends on schools, classes, section
 export * from "./school-subjects"; // No deps
 export * from "./school-class-section-subjects"; // Depends on classes, subjects
 
+// ── WhatsApp  ──────────────────────
+export * from "./whatsapp-balance";
+export * from "./whatsapp-bundle-credits";
+
+export * from "./whatsapp-templates";
+export * from "./whatsapp-messages";
+export * from "./whatsapp-bulk-sends";
+export * from "./whatsapp-inbound-messages";
+
+// ID Cards (depends on schools, school-users, school-student-enrollments)
+export * from "./id-card-templates";
+export * from "./id-cards";
+
+
 // User profiles (depend on school-users)
 export * from "./students";
 export * from "./teachers";
@@ -37,6 +51,11 @@ export * from "./school-fee-structures"; // Depends on academic_years, classes
 export * from "./school-fee-concessions";        // per-student discounts
 export * from "./school-student-fee-assignments"; // transport/hostel/custom fees
 export * from "./school-teacher-assignments"; // Depends on teachers, class_subjects
+
+export * from "./school-feed-posts";
+export * from "./school-feed-post-interactions";
+
+
 export * from "./school-notifications"; // Depends on school-users
 export * from "./school-notification-interactions"; // Depends on notifications, school-users
 export * from "./school-attendances"; // Depends on student_enrollments, school-users

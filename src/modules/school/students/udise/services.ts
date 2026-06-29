@@ -674,8 +674,14 @@ export async function updateStudentUDISEProfile(
       studentUpdate.previousClassResult = data.previousClassResult ?? null;
     if (data.admissionNumber !== undefined)
       studentUpdate.admissionNumber = data.admissionNumber ?? null;
-    if (data.admissionDate !== undefined)
-      studentUpdate.admissionDate = data.admissionDate ?? "";
+    // Sanitize admissionDate — reject Excel serials, only accept YYYY-MM-DD
+    if (data.admissionDate !== undefined) {
+      const iso = /^\d{4}-\d{2}-\d{2}$/.test(data.admissionDate ?? "")
+        ? data.admissionDate
+        : undefined;
+      if (iso) studentUpdate.admissionDate = iso;
+      // If it's garbage (serial, empty, etc.) we simply don't update the field
+    }
     if (data.previousSchool !== undefined)
       studentUpdate.previousSchool = data.previousSchool ?? "";
     if (data.rollNumber !== undefined)
@@ -1409,12 +1415,16 @@ async function buildExcelBuffer(
   };
   XLSX.utils.book_append_sheet(wb, wsSummary, "Completeness Summary");
 
-  // ── Write workbook to buffer ─────────────────────────────────────────────────
-  const xlsxBuffer = XLSX.write(wb, {
-    type: "array",
+  const b64: string = XLSX.write(wb, {
+    type: "base64",
     bookType: "xlsx",
     compression: true,
   });
-
-  return xlsxBuffer.buffer as ArrayBuffer;
+  // atob is globally available in Cloudflare Workers, browsers, and modern Node
+  const binary = atob(b64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes.buffer;
 }

@@ -81,6 +81,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "notifications.view",
     "roles.manage",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── MANAGER ───────────────────────────────────────────────────────────────
@@ -98,6 +100,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "notifications.send",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── ADMISSION_OFFICER ─────────────────────────────────────────────────────
@@ -112,6 +116,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "academics.unenroll",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── TEACHER ───────────────────────────────────────────────────────────────
@@ -127,6 +133,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "exams.marks.enter",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── ACCOUNTANT ────────────────────────────────────────────────────────────
@@ -139,6 +147,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "fees.report",
     "fees.ledger.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── LIBRARIAN ─────────────────────────────────────────────────────────────
@@ -149,6 +159,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "library.return",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── TRANSPORT_STAFF ───────────────────────────────────────────────────────
@@ -157,6 +169,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "transport.manage",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── SECURITY_STAFF ────────────────────────────────────────────────────────
@@ -164,6 +178,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "dashboard.view",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── CANTEEN_STAFF ─────────────────────────────────────────────────────────
@@ -171,6 +187,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "dashboard.view",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── SCHOOL_NURSE ──────────────────────────────────────────────────────────
@@ -179,6 +197,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "students.list",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── HOUSEKEEPING_STAFF ────────────────────────────────────────────────────
@@ -186,6 +206,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "dashboard.view",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── MAINTENANCE_STAFF ─────────────────────────────────────────────────────
@@ -193,6 +215,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "dashboard.view",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── GROUNDS_STAFF ─────────────────────────────────────────────────────────
@@ -200,6 +224,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "dashboard.view",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── UTILITY_STAFF ─────────────────────────────────────────────────────────
@@ -207,6 +233,8 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "dashboard.view",
     "notifications.view",
     "contact.submit",
+    "feed.view",
+    "feed.react",
   ],
 
   // ── STUDENT ───────────────────────────────────────────────────────────────

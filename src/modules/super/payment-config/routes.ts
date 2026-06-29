@@ -3,58 +3,61 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
-import { Env } from "../../../types/common-types";
-import { getCommonDB } from "../../../db";
 import {
   jwtMiddleware,
   superTokenValidationMiddleware,
   requireSuperPermission,
 } from "../../../middleware/super-auth";
-import { getPaymentConfig, upsertPaymentConfig } from "./services";
+import { Env } from "../../../types/common-types";
+import { getPaymentConfig, updatePaymentConfig } from "./services";
 
 const paymentConfigRouter = new Hono<Env>();
 
-
-// ── PUBLIC: GET /payment-config ───────────────────────────────────────────────
-// Must be PUBLIC (no auth) so the school payment page can fetch fee/UPI details
-// without a token. The data is non-sensitive (UPI ID, QR URL, fee amount).
-// This route is declared BEFORE the auth middleware so it bypasses it.
-paymentConfigRouter.get("/", async (c) => {
-  try {
-    const db = getCommonDB(c.env);
-    const config = await getPaymentConfig(db);
-    return c.json({ success: true, config });
-  } catch (e: any) {
-    return c.json({ error: e.message }, 500);
-  }
-});
-
-
 paymentConfigRouter.use("*", jwtMiddleware, superTokenValidationMiddleware);
 
-// PUT /payment-config — upsert (super admin only)
-paymentConfigRouter.put(
+// ==================== GET PAYMENT CONFIG ====================
+paymentConfigRouter.get(
   "/",
-  requireSuperPermission("schools.manage"),
-  zValidator(
-    "json",
-    z.object({
-      upiId: z.string().min(3).max(100),
-      qrCodeUrl: z.string().url().optional().or(z.literal("")),
-      setupFeeAmount: z.number().int().min(0), // paise
-      currency: z.string().default("INR"),
-      feeDescription: z.string().min(5).max(500),
-      isFeeEnabled: z.boolean(),
-    })
-  ),
+  requireSuperPermission("payments.config"),
   async (c) => {
     try {
-      const db = getCommonDB(c.env);
-      const data = c.req.valid("json");
-      const config = await upsertPaymentConfig(db, data);
+      const config = await getPaymentConfig(c.env);
       return c.json({ success: true, config });
-    } catch (e: any) {
-      return c.json({ error: e.message }, 400);
+    } catch (error: any) {
+      return c.json({ success: false, error: error.message }, 500);
+    }
+  }
+);
+
+// ==================== UPDATE PAYMENT CONFIG ====================
+const updateSchema = z.object({
+  upiId: z.string().optional(),
+  qrCodeUrl: z.string().url().optional().or(z.literal("")),
+  setupFeeAmount: z.number().int().min(0).optional(),
+  setupFeeDiscountPaise: z.number().int().min(0).optional(),
+  currency: z.string().optional(),
+  feeDescription: z.string().optional(),
+  isFeeEnabled: z.boolean().optional(),
+});
+
+paymentConfigRouter.put(
+  "/",
+  requireSuperPermission("payments.config"),
+  zValidator("json", updateSchema),
+  async (c) => {
+    try {
+      const data = c.req.valid("json");
+      const config = await updatePaymentConfig(c.env, data);
+      return c.json({
+        success: true,
+        message: "Payment configuration updated successfully",
+        config,
+      });
+    } catch (error: any) {
+      return c.json(
+        { success: false, error: error.message || "Update failed" },
+        400
+      );
     }
   }
 );

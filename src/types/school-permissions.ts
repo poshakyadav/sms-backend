@@ -107,11 +107,36 @@ export const SCHOOL_PERMISSIONS = {
     THEME_MANAGE: "settings.theme.manage",
   },
 
+  // ── BILLING / RAZORPAY — STAFF ───────────────────────────────────────────
+  // Controls visibility of the school's own billing screen: current access
+  // expiry, payment history, autopay (UPI Autopay) management, and WhatsApp/
+  // Email/SMS bundle purchases. category: staff — School Owner wildcard '*'
+  // includes this automatically; Accountant role can be granted it directly.
+  BILLING: {
+    VIEW: "billing.view", // View own school's payment history & access status
+    MANAGE: "billing.manage", // Initiate payments, manage autopay, buy bundles
+  },
+
   // ── STUDENTS — STAFF ──────────────────────────────────────────────────────
   STUDENTS: {
     LIST: "students.list",
     PROFILE_MANAGE: "students.profile.manage",
     BULK_UPLOAD: "students.bulk-upload",
+  },
+
+  ID_CARDS: {
+    GENERATE: "id-cards.generate", // Generate new ID cards (single or bulk)
+    VIEW: "id-cards.view", // View issued ID cards / management list
+    REVOKE: "id-cards.revoke", // Revoke / reissue an ID card
+    PRINT: "id-cards.print", // Export/print ID cards (PDF download access)
+    TEMPLATE_MANAGE: "id-cards.templates.manage", // Create/edit ID card templates (layout config)
+  },
+
+  FEED: {
+    FEED_POST_CREATE: "feed.post.create",
+    FEED_POST_MANAGE :"feed.post.manage",
+    FEED_VIEW: "feed.view",
+    FEED_REACT: "feed.react",
   },
 
   // ── TEACHERS ──────────────────────────────────────────────────────────────
@@ -165,6 +190,10 @@ export const SCHOOL_PERMISSIONS = {
 
     // Notifications
     VIEW_NOTIFICATIONS: "notifications.student.view", // Student views notifications sent to them
+
+    // Feed
+    VIEW_FEED: "feed.student.view", // Student views feed posts
+    REACT_FEED: "feed.student.react", // Student reacts to feed posts
   },
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -195,6 +224,10 @@ export const SCHOOL_PERMISSIONS = {
 
     // Notifications
     VIEW_NOTIFICATIONS: "notifications.parent.view", // Parent views notifications sent to them
+
+    // Feed
+    VIEW_FEED: "feed.parent.view", // Parent views feed posts
+    REACT_FEED: "feed.parent.react", // Parent reacts to feed posts
   },
 } as const;
 
@@ -274,6 +307,16 @@ export const STAFF_PERMISSION_SLUGS: readonly SchoolPermissionSlug[] = [
   "notifications.send",
   "notifications.view",
 
+  // Feed (staff)
+  "feed.post.create",
+  "feed.post.manage",
+  "feed.view",
+  "feed.react",
+
+  // Billing (staff)
+  "billing.view",
+  "billing.manage",
+
   // Settings
   "settings.manage",
   "settings.theme.manage",
@@ -282,6 +325,13 @@ export const STAFF_PERMISSION_SLUGS: readonly SchoolPermissionSlug[] = [
   "students.list",
   "students.profile.manage",
   "students.bulk-upload",
+
+  // ID Cards (staff)
+  "id-cards.generate",
+  "id-cards.view",
+  "id-cards.revoke",
+  "id-cards.print",
+  "id-cards.templates.manage",
 
   // Teachers, Parents, Contact
   "teachers.profile.manage",
@@ -306,6 +356,8 @@ export const STUDENT_PERMISSION_SLUGS: readonly SchoolPermissionSlug[] = [
   "exams.student.admit-card",
   "exams.student.report-card",
   "notifications.student.view",
+  "feed.student.view",
+  "feed.student.react",
 ] as const;
 
 /** All parent-facing permission slugs. Never given to staff or Owner wildcard. */
@@ -318,6 +370,8 @@ export const PARENT_PERMISSION_SLUGS: readonly SchoolPermissionSlug[] = [
   "exams.parent.admit-card",
   "exams.parent.report-card",
   "notifications.parent.view",
+  "feed.parent.view",
+  "feed.parent.react",
 ] as const;
 
 /** All permission slugs across all categories. Used for sync completeness checks. */

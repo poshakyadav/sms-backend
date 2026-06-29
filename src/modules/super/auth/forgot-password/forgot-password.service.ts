@@ -102,7 +102,7 @@ export async function requestPasswordResetOtp(
   await sendTransactionalEmail(env, {
     sender: {
       name: "School Management System",
-      email: "poshakkumar6171@gmail.com", // Changte this mail use production email
+      email: "poshakkumar6171@gmail.com", // Change this mail use production email
     },
     to: [{ email: user.email, name: user.name }],
     subject: "Your password reset code",

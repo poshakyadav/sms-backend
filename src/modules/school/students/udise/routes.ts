@@ -112,7 +112,11 @@ const updateUDISEProfileSchema = z.object({
     .nullable()
     .optional(),
   admissionNumber: z.string().max(50).nullable().optional(),
-  admissionDate: z.string().date().optional(),
+  admissionDate: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() ? v : undefined))
+    .pipe(z.string().date().optional()),
   previousSchool: z.string().max(255).optional(),
   rollNumber: z.string().max(50).optional(),
 
@@ -156,7 +160,22 @@ const updateUDISEProfileSchema = z.object({
 udiseRouter.put(
   "/profile/:studentId",
   requirePermission("students.profile.manage"),
-  zValidator("json", updateUDISEProfileSchema),
+  zValidator("json", updateUDISEProfileSchema, (result, c) => {
+    if (!result.success) {
+      console.error(
+        "[udise] PUT validation failed:",
+        JSON.stringify(result.error.issues, null, 2)
+      );
+      return c.json(
+        {
+          success: false,
+          error: "Validation failed",
+          issues: result.error.issues,
+        },
+        400
+      );
+    }
+  }),
   async (c) => {
     try {
       const studentId = parseInt(c.req.param("studentId"), 10);
@@ -167,6 +186,8 @@ udiseRouter.put(
       const data = c.req.valid("json");
       const updater = c.get("user")!;
       const schoolCode = c.get("schoolCode")!;
+
+      // console.log("[udise] PUT validated data:", JSON.stringify(data, null, 2));
 
       await updateStudentUDISEProfile(
         c.env,

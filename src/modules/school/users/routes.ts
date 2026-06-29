@@ -21,7 +21,9 @@ import {
   getUserDeniedPermissions,
   getUserDirectPermissions,
   getUserRoles,
+  removeSchoolUserAvatar,
   updateSchoolUser,
+  uploadSchoolUserAvatar,
 } from "./services";
 import { getSchoolDB } from "../../../db/school-client";
 import { schoolUsersSchema } from "../../../db/schemas/school";
@@ -537,6 +539,98 @@ usersRouter.put(
       console.error("Update user error:", error);
       return c.json(
         { success: false, error: error.message || "Failed to update user" },
+        400
+      );
+    }
+  }
+);
+
+// NOTE on accepted permission: both users.create (so the creation-hub's
+// post-create avatar upload works for someone who only has create rights,
+// not edit) and users.edit (so the edit screen's "Change Photo" works) are
+// accepted — mirrors how check-email is gated by users.create only because
+// it's only ever called from the creation flow, but THIS endpoint is called
+// from both flows.
+
+// ==================== UPLOAD / REPLACE USER AVATAR ====================
+// POST /school/users/:id/avatar
+// Body: multipart/form-data with a single field "avatar" containing the
+// already-compressed image (WebP, ≤ ~50KB) produced client-side.
+usersRouter.post(
+  "/:id/avatar",
+  requirePermission(["users.create", "users.edit"]),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) {
+        return c.json({ success: false, error: "Invalid user ID" }, 400);
+      }
+
+      const body = await c.req.parseBody();
+      const file = body["avatar"];
+
+      if (!file || typeof file === "string") {
+        return c.json({ success: false, error: "No image file provided" }, 400);
+      }
+
+      // file is a File (Web API) when parseBody() encounters multipart data
+      const arrayBuffer = await (file as File).arrayBuffer();
+      const contentType = (file as File).type || "image/webp";
+
+      if (!contentType.startsWith("image/")) {
+        return c.json({ success: false, error: "File must be an image" }, 400);
+      }
+
+      const schoolCode = c.get("schoolCode")!;
+      const result = await uploadSchoolUserAvatar(
+        c.env,
+        schoolCode,
+        id,
+        arrayBuffer,
+        contentType
+      );
+
+      return c.json({
+        success: true,
+        message: "Profile photo updated successfully",
+        avatarUrl: result.avatarUrl,
+      });
+    } catch (error: any) {
+      console.error("Avatar upload error:", error);
+      return c.json(
+        {
+          success: false,
+          error: error.message || "Failed to upload profile photo",
+        },
+        400
+      );
+    }
+  }
+);
+
+// ==================== REMOVE USER AVATAR ====================
+// POST /school/users/:id/avatar/remove
+usersRouter.post(
+  "/:id/avatar/remove",
+  requirePermission(["users.create", "users.edit"]),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) {
+        return c.json({ success: false, error: "Invalid user ID" }, 400);
+      }
+
+      const schoolCode = c.get("schoolCode")!;
+      await removeSchoolUserAvatar(c.env, schoolCode, id);
+
+      return c.json({ success: true, message: "Profile photo removed" });
+    } catch (error: any) {
+      console.error("Avatar remove error:", error);
+      return c.json(
+        {
+          success: false,
+          error: error.message || "Failed to remove profile photo",
+        },
         400
       );
     }

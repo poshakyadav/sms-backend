@@ -31,10 +31,35 @@ export const SUPER_PERMISSIONS = {
     VIEW: "dashboard.view",
   },
   PAYMENTS: {
-    CONFIG: "payments.config", // Manage UPI / fee config
-    APPROVE: "payments.approve", // Approve / reject payment proofs
-    VIEW: "payments.view", // View payment records
+    CONFIG: "payments.config", // Manage UPI / setup-fee config (legacy + Razorpay setup fee)
+    APPROVE: "payments.approve", // Approve / reject legacy manual UTR payment proofs
+    VIEW: "payments.view", // View payment records (legacy school_payment_records)
   },
+
+  // ── NEW: Razorpay platform payments ledger (platform_payments table) ─────
+  PLATFORM_PAYMENTS: {
+    VIEW: "platform-payments.view", // View the unified Razorpay payments ledger
+    REFUND: "platform-payments.refund", // Issue refunds against a captured payment
+  },
+
+  // ── NEW: Access plans (Monthly ₹599 / Yearly ₹8985) ───────────────────────
+  ACCESS_PLANS: {
+    VIEW: "access-plans.view",
+    MANAGE: "access-plans.manage", // Edit discountPaise, toggle autopayEnabled/isActive
+  },
+
+  // ── NEW: Message bundles catalog (WhatsApp now, Email/SMS later) ─────────
+  MESSAGE_BUNDLES: {
+    VIEW: "message-bundles.view",
+    MANAGE: "message-bundles.manage", // Create/edit bundles, pricing, discounts
+  },
+
+  // ── NEW: Per-school access & autopay visibility/override ─────────────────
+  SCHOOL_ACCESS: {
+    VIEW: "school-access.view", // View any school's access period / autopay status
+    OVERRIDE: "school-access.override", // Manually grant/extend access (goodwill, support cases)
+  },
+
   SCHOOL_REQUESTS: {
     VIEW: "school-requests.view",
     MANAGE: "school-requests.manage",
@@ -75,6 +100,14 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<string, SuperPermissionSlug[]> = {
     "payments.config",
     "payments.approve",
     "payments.view",
+    "platform-payments.view",
+    "platform-payments.refund",
+    "access-plans.view",
+    "access-plans.manage",
+    "message-bundles.view",
+    "message-bundles.manage",
+    "school-access.view",
+    "school-access.override",
     "school-requests.view",
     "school-requests.manage",
     "contact-messages.view",
@@ -86,6 +119,10 @@ export const DEFAULT_ROLE_PERMISSIONS: Record<string, SuperPermissionSlug[]> = {
     "schools.invite",
     "turso.manage",
     "payments.view",
+    "platform-payments.view",
+    "access-plans.view",
+    "message-bundles.view",
+    "school-access.view",
     "school-requests.view",
     "contact-messages.view",
   ],

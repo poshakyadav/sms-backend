@@ -197,7 +197,7 @@ export async function createInvitation(
 
   // 7. Send invite email — FIXED: use /school/register?token= (new URL)
   const frontendUrl = getFrontendUrl(env);
-  const registrationLink = `${frontendUrl}/school/register?token=${inviteToken}`;
+  const registrationLink = `${frontendUrl}/school/onboard?token=${inviteToken}`;
   const emailResult = await sendInviteEmail(env, {
     to: data.schoolEmail,
     schoolName: data.schoolName,
@@ -255,9 +255,8 @@ export async function resendInvitation(db: any, env: any, id: number) {
     .where(eq(paymentConfigSchema.id, 1))
     .get();
  
-  // FIXED: use /school/register?token= (new URL)
   const frontendUrl = getFrontendUrl(env);
-  const registrationLink = `${frontendUrl}/school/register?token=${inv.inviteToken}`;
+  const registrationLink = `${frontendUrl}/school/onboard?token=${inv.inviteToken}`;
  
   const daysLeft = Math.ceil(
     (new Date(inv.expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
@@ -346,11 +345,11 @@ async function sendInviteEmail(
             <div class="note">
               ⏳ This invitation expires in <strong>${opts.expiryDays} days</strong>. If you have any questions, please contact our support team.
             </div>
-            <p>If the button doesn't work, copy and paste this link:<br>
+            <p>If the button doesn't work, copy and paste this link on browser:<br>
             <a href="${opts.registrationLink}" style="color: #4f46e5; font-size: 13px;">${opts.registrationLink}</a></p>
           </div>
           <div class="footer">
-            <p>Best regards, SMS Team</p>
+            <p>Best regards, Eduxo Team</p>
             <p>If you didn't request this, you can safely ignore this email.</p>
           </div>
         </div>
