@@ -152,7 +152,7 @@ export async function createInvitation(
 
   // 3. Get fee config snapshot
   const feeConfig = await db
-    .select({ setupFeeAmount: paymentConfigSchema.setupFeeAmount })
+    .select({ setupFeeAmount: paymentConfigSchema.setupFeeFinalAmountPaise })
     .from(paymentConfigSchema)
     .where(eq(paymentConfigSchema.id, 1))
     .get();
@@ -238,7 +238,7 @@ export async function createInvitation(
     to: data.schoolEmail,
     schoolName: data.schoolName,
     registrationLink,
-    setupFeeAmount: feeConfig?.setupFeeAmount ?? 0,
+    setupFeeFinalAmountPaise: feeConfig?.setupFeeFinalAmountPaise ?? 0,
     expiryDays,
   });
 
@@ -286,7 +286,7 @@ export async function resendInvitation(db: any, env: any, id: number) {
     throw new Error("Invitation is cancelled");
 
   const feeConfig = await db
-    .select({ setupFeeAmount: paymentConfigSchema.setupFeeAmount })
+    .select({ setupFeeAmount: paymentConfigSchema.setupFeeFinalAmountPaise })
     .from(paymentConfigSchema)
     .where(eq(paymentConfigSchema.id, 1))
     .get();
@@ -302,7 +302,7 @@ export async function resendInvitation(db: any, env: any, id: number) {
     to: inv.schoolEmail,
     schoolName: inv.schoolName,
     registrationLink,
-    setupFeeAmount: feeConfig?.setupFeeAmount ?? 0,
+    setupFeeFinalAmountPaise: feeConfig?.setupFeeFinalAmountPaise ?? 0,
     expiryDays: Math.max(daysLeft, 1), // at least 1 day shown
   });
 
@@ -320,13 +320,13 @@ async function sendInviteEmail(
     to: string;
     schoolName: string;
     registrationLink: string;
-    setupFeeAmount: number;
+    setupFeeFinalAmountPaise: number;
     expiryDays: number;
   }
 ) {
   const feeFormatted =
-    opts.setupFeeAmount > 0
-      ? `₹${(opts.setupFeeAmount / 100).toLocaleString("en-IN")}`
+    opts.setupFeeFinalAmountPaise > 0
+      ? `₹${(opts.setupFeeFinalAmountPaise / 100).toLocaleString("en-IN")}`
       : "as informed by our team";
 
   const emailData: BrevoSendEmailRequest = {
