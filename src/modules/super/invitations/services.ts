@@ -384,7 +384,7 @@ async function sendInviteEmail(
       <body>
         <div class="container">
           <div class="header">
-            <h1>🎓 Welcome to SMS!</h1>
+            <h1>🎓 Welcome to Eduxo!</h1>
             <p>Your school management journey starts here</p>
           </div>
           <div class="body">
