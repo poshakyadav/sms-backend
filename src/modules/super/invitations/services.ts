@@ -152,10 +152,14 @@ export async function createInvitation(
 
   // 3. Get fee config snapshot
   const feeConfig = await db
-    .select({ setupFeeAmount: paymentConfigSchema.setupFeeFinalAmountPaise })
-    .from(paymentConfigSchema)
-    .where(eq(paymentConfigSchema.id, 1))
-    .get();
+  .select({
+    setupFeeAmount: paymentConfigSchema.setupFeeAmount,
+    setupFeeDiscountPaise: paymentConfigSchema.setupFeeDiscountPaise,
+    setupFeeFinalAmountPaise: paymentConfigSchema.setupFeeFinalAmountPaise,
+  })
+  .from(paymentConfigSchema)
+  .where(eq(paymentConfigSchema.id, 1))
+  .get();
 
   // 4. Generate invite token & expiry
   const inviteToken = crypto.randomUUID();
@@ -238,6 +242,8 @@ export async function createInvitation(
     to: data.schoolEmail,
     schoolName: data.schoolName,
     registrationLink,
+    setupFeeAmount: feeConfig?.setupFeeAmount ?? 0,
+    setupFeeDiscountPaise: feeConfig?.setupFeeDiscountPaise ?? 0,
     setupFeeFinalAmountPaise: feeConfig?.setupFeeFinalAmountPaise ?? 0,
     expiryDays,
   });
@@ -286,10 +292,14 @@ export async function resendInvitation(db: any, env: any, id: number) {
     throw new Error("Invitation is cancelled");
 
   const feeConfig = await db
-    .select({ setupFeeAmount: paymentConfigSchema.setupFeeFinalAmountPaise })
-    .from(paymentConfigSchema)
-    .where(eq(paymentConfigSchema.id, 1))
-    .get();
+  .select({
+    setupFeeAmount: paymentConfigSchema.setupFeeAmount,
+    setupFeeDiscountPaise: paymentConfigSchema.setupFeeDiscountPaise,
+    setupFeeFinalAmountPaise: paymentConfigSchema.setupFeeFinalAmountPaise,
+  })
+  .from(paymentConfigSchema)
+  .where(eq(paymentConfigSchema.id, 1))
+  .get();
 
   const frontendUrl = getFrontendUrl(env);
   const registrationLink = `${frontendUrl}/school/onboard?token=${inv.inviteToken}`;
@@ -302,6 +312,8 @@ export async function resendInvitation(db: any, env: any, id: number) {
     to: inv.schoolEmail,
     schoolName: inv.schoolName,
     registrationLink,
+    setupFeeAmount: feeConfig?.setupFeeAmount ?? 0,
+    setupFeeDiscountPaise: feeConfig?.setupFeeDiscountPaise ?? 0,
     setupFeeFinalAmountPaise: feeConfig?.setupFeeFinalAmountPaise ?? 0,
     expiryDays: Math.max(daysLeft, 1), // at least 1 day shown
   });
@@ -320,14 +332,22 @@ async function sendInviteEmail(
     to: string;
     schoolName: string;
     registrationLink: string;
+    setupFeeAmount: number;
+    setupFeeDiscountPaise: number;
     setupFeeFinalAmountPaise: number;
     expiryDays: number;
   }
 ) {
-  const feeFormatted =
+  const formatPaise = (paise: number) =>
+    `₹${(paise / 100).toLocaleString("en-IN")}`;
+
+  const hasDiscount = opts.setupFeeDiscountPaise > 0;
+  const finalFeeFormatted =
     opts.setupFeeFinalAmountPaise > 0
-      ? `₹${(opts.setupFeeFinalAmountPaise / 100).toLocaleString("en-IN")}`
+      ? formatPaise(opts.setupFeeFinalAmountPaise)
       : "as informed by our team";
+  const stickerFeeFormatted = formatPaise(opts.setupFeeAmount);
+  const discountFormatted = formatPaise(opts.setupFeeDiscountPaise);
 
   const emailData: BrevoSendEmailRequest = {
     sender: {
@@ -352,7 +372,9 @@ async function sendInviteEmail(
           .body p { color: #374151; font-size: 15px; line-height: 1.6; margin: 0 0 16px; }
           .fee-box { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 8px; padding: 16px 20px; margin: 24px 0; }
           .fee-box .label { font-size: 12px; color: #6b7280; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
-          .fee-box .amount { font-size: 32px; font-weight: 800; color: #065f46; }
+          .fee-box .sticker-price { font-size: 16px; color: #9ca3af; text-decoration: line-through; margin-top: 4px; }
+          .fee-box .discount-badge { display: inline-block; margin-top: 4px; font-size: 12px; color: #047857; background: #d1fae5; padding: 2px 8px; border-radius: 4px; font-weight: 600; }
+          .fee-box .amount { font-size: 32px; font-weight: 800; color: #065f46; margin-top: 6px; }
           .cta { text-align: center; margin: 32px 0; }
           .cta a { display: inline-block; padding: 14px 36px; background: #4f46e5; color: white; text-decoration: none; border-radius: 8px; font-weight: 700; font-size: 16px; }
           .note { background: #fffbeb; border: 1px solid #fde68a; border-radius: 8px; padding: 12px 16px; margin: 24px 0; font-size: 13px; color: #92400e; }
@@ -371,7 +393,13 @@ async function sendInviteEmail(
             <p>To complete your registration, there is a one-time setup fee:</p>
             <div class="fee-box">
               <div class="label">One-time Setup Fee</div>
-              <div class="amount">${feeFormatted}</div>
+              ${
+                hasDiscount
+                  ? `<div class="sticker-price">${stickerFeeFormatted}</div>
+                     <div class="discount-badge">You save ${discountFormatted}</div>`
+                  : ""
+              }
+              <div class="amount">${finalFeeFormatted}</div>
               <div style="margin-top: 8px; font-size: 13px; color: #065f46;">Includes onboarding support from our team</div>
             </div>
             <p>Click the button below to complete your registration and view payment instructions:</p>
