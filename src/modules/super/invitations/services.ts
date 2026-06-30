@@ -1,7 +1,7 @@
 // src/modules/super/invitations/services.ts
 
 import { eq, desc, sql } from "drizzle-orm";
-import { nanoid } from "nanoid";
+import { customAlphabet } from "nanoid";
 import { schoolInvitationsSchema } from "../../../db/schemas/super/school-invitations";
 import { schoolsSchema } from "../../../db/schemas/super/schools";
 import { paymentConfigSchema } from "../../../db/schemas/super/payment-config";
@@ -15,6 +15,42 @@ import { BrevoSendEmailRequest } from "../../../types/brevo";
 const getFrontendUrl = (env: { FRONTEND_ORIGIN?: string }): string => {
   return env.FRONTEND_ORIGIN || "http://localhost:4200";
 };
+
+// ── School code generation ────────────────────────────────────────────────
+
+const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+const SCHOOL_CODE_LENGTH = 7;
+const MAX_GENERATION_ATTEMPTS = 10;
+
+const generateRandomCode = customAlphabet(ALPHABET, SCHOOL_CODE_LENGTH);
+
+/**
+ * Generates a school code using only A-Z characters. Checks the schools
+ * table for a pre-existing match and retries on collision. The DB-level
+ * unique constraint on schoolsSchema.uniqueCode (see schools.ts) is the
+ * real guarantee against duplicates — this pre-check just avoids letting
+ * an avoidable constraint-violation bubble up to the caller in the
+ * vanishingly rare case of a collision.
+ */
+async function generateUniqueSchoolCode(db: any): Promise<string> {
+  for (let attempt = 0; attempt < MAX_GENERATION_ATTEMPTS; attempt++) {
+    const candidate = generateRandomCode();
+
+    const existing = await db
+      .select({ id: schoolsSchema.id })
+      .from(schoolsSchema)
+      .where(eq(schoolsSchema.uniqueCode, candidate))
+      .get();
+
+    if (!existing) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    "Failed to generate a unique school code after multiple attempts"
+  );
+}
 
 // ── List all invitations with school info ────────────────────────────────────
 
@@ -129,7 +165,7 @@ export async function createInvitation(
   ).toISOString();
 
   // 5. Generate unique school code
-  const uniqueCode = `GH${nanoid(5).toUpperCase()}`;
+  const uniqueCode = await generateUniqueSchoolCode(db);
 
   // 6. Transaction: create school record (INVITED state) + invitation
   //    If a previous non-active school record exists for this email, reuse it
@@ -244,24 +280,24 @@ export async function resendInvitation(db: any, env: any, id: number) {
     .from(schoolInvitationsSchema)
     .where(eq(schoolInvitationsSchema.id, id))
     .get();
- 
+
   if (!inv) throw new Error("Invitation not found");
   if (["CANCELLED"].includes(inv.status))
     throw new Error("Invitation is cancelled");
- 
+
   const feeConfig = await db
     .select({ setupFeeAmount: paymentConfigSchema.setupFeeAmount })
     .from(paymentConfigSchema)
     .where(eq(paymentConfigSchema.id, 1))
     .get();
- 
+
   const frontendUrl = getFrontendUrl(env);
   const registrationLink = `${frontendUrl}/school/onboard?token=${inv.inviteToken}`;
- 
+
   const daysLeft = Math.ceil(
     (new Date(inv.expiresAt).getTime() - Date.now()) / (1000 * 60 * 60 * 24)
   );
- 
+
   const emailResult = await sendInviteEmail(env, {
     to: inv.schoolEmail,
     schoolName: inv.schoolName,
@@ -269,7 +305,7 @@ export async function resendInvitation(db: any, env: any, id: number) {
     setupFeeAmount: feeConfig?.setupFeeAmount ?? 0,
     expiryDays: Math.max(daysLeft, 1), // at least 1 day shown
   });
- 
+
   return {
     registrationLink,
     emailSent: emailResult.success,
