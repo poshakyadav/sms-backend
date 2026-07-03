@@ -2015,3 +2015,169 @@ async function updateUserProfile(
       break;
   }
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BULK PHOTO UPLOAD (class-section based)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface StudentForAvatarUpload {
+  userId: number;
+  name: string;
+  avatarUrl: string | null;
+  rollNumber: string | null;
+  admissionNumber: string | null;
+  gender: string | null;
+  enrollmentId: number;
+
+  fatherName: string | null;
+  motherName: string | null;
+  phone: string | null;
+}
+
+/**
+ * Lists active students in a class-section for the bulk photo upload tool.
+ * Deliberately lean — the caller already knows which class-section this is
+ * (it just picked it from the dropdown), so we don't join class/section names.
+ *
+ * NOTE on ordering: rollNumber is free-text (not always zero-padded), so
+ * "10" can sort before "2" lexically. If your school always zero-pads roll
+ * numbers this is a non-issue; otherwise consider ORDER BY CAST(roll_number
+ * AS INTEGER) via raw sql if this bites you in practice.
+ */
+export async function getStudentsByClassSectionForAvatarUpload(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  classSectionId: number
+): Promise<StudentForAvatarUpload[]> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const rows = await db
+    .select({
+      userId: schoolUsersSchema.id,
+      name: schoolUsersSchema.name,
+      avatarUrl: schoolUsersSchema.avatarUrl,
+      fatherName: schoolUsersSchema.fatherName,
+      motherName: schoolUsersSchema.motherName,
+      phone: schoolUsersSchema.phone,
+      gender: schoolUsersSchema.gender,
+      rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
+      admissionNumber: studentsSchema.admissionNumber,
+      enrollmentId: schoolStudentEnrollmentsSchema.id,
+    })
+    .from(schoolStudentEnrollmentsSchema)
+    .innerJoin(
+      schoolUsersSchema,
+      eq(schoolUsersSchema.id, schoolStudentEnrollmentsSchema.studentId)
+    )
+    .innerJoin(
+      studentsSchema,
+      eq(studentsSchema.userId, schoolStudentEnrollmentsSchema.studentId)
+    )
+    .where(
+      and(
+        eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId),
+        eq(schoolStudentEnrollmentsSchema.isActive, true),
+        eq(schoolUsersSchema.isActive, true)
+      )
+    )
+    .orderBy(schoolStudentEnrollmentsSchema.rollNumber, schoolUsersSchema.name)
+    .all();
+
+  return rows.map((r: any) => ({
+    userId: r.userId,
+    name: r.name,
+    avatarUrl: r.avatarUrl || null,
+    gender: r.gender || null,
+    fatherName: r.fatherName || null,
+    motherName: r.motherName || null,
+    phone: r.phone || null,
+    rollNumber: r.rollNumber ?? null,
+    admissionNumber: r.admissionNumber ?? null,
+    enrollmentId: r.enrollmentId,
+  }));
+}
+
+export interface BulkAvatarUploadItem {
+  userId: number;
+  bytes: ArrayBuffer;
+  contentType: string;
+}
+
+export interface BulkAvatarUploadOutcome {
+  uploaded: { userId: number; avatarUrl: string }[];
+  failed: { userId: number; error: string }[];
+}
+
+/**
+ * Uploads photos for multiple students in one call, reusing the exact same
+ * single-avatar pipeline (uploadSchoolUserAvatar) per student — same R2 key
+ * shape, same old-key cleanup, same size guard.
+ *
+ * Runs with bounded concurrency (not sequential, not unbounded Promise.all)
+ * — a class-section can have 40-60 students, and R2 round-trips add up.
+ * 5 concurrent uploads keeps this fast without hammering the DB connection
+ * or R2 with 60 simultaneous PUTs.
+ *
+ * Partial failure is expected and handled gracefully — one bad file
+ * shouldn't fail the other 39. Per-item errors are collected and returned
+ * so the frontend can show exactly which students need a retry.
+ */
+export async function bulkUploadStudentAvatars(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  items: BulkAvatarUploadItem[]
+): Promise<BulkAvatarUploadOutcome> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  // Defense in depth: route-level Zod validates shape, this confirms every
+  // userId is actually a student row in THIS school before we touch R2.
+  const ids = items.map((i) => i.userId);
+  const validStudents = await db
+    .select({ userId: studentsSchema.userId })
+    .from(studentsSchema)
+    .where(inArray(studentsSchema.userId, ids))
+    .all();
+  const validIdSet = new Set(validStudents.map((s: any) => s.userId));
+
+  const uploaded: { userId: number; avatarUrl: string }[] = [];
+  const failed: { userId: number; error: string }[] = [];
+
+  const CONCURRENCY = 5;
+  let cursor = 0;
+
+  async function worker() {
+    while (cursor < items.length) {
+      const item = items[cursor++];
+
+      if (!validIdSet.has(item.userId)) {
+        failed.push({
+          userId: item.userId,
+          error: "Not a valid student in this school",
+        });
+        continue;
+      }
+
+      try {
+        const result = await uploadSchoolUserAvatar(
+          env,
+          schoolCode,
+          item.userId,
+          item.bytes,
+          item.contentType
+        );
+        uploaded.push({ userId: item.userId, avatarUrl: result.avatarUrl });
+      } catch (err: any) {
+        failed.push({
+          userId: item.userId,
+          error: err?.message || "Upload failed",
+        });
+      }
+    }
+  }
+
+  await Promise.all(
+    Array.from({ length: Math.min(CONCURRENCY, items.length) }, () => worker())
+  );
+
+  return { uploaded, failed };
+}

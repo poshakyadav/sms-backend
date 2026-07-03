@@ -33,6 +33,20 @@ export const ALL_ID_CARD_HOLDER_TYPES = [
   IdCardHolderType.STAFF,
 ] as const;
 
+// NEW — card physical orientation. Optional on the type so existing rows
+// already saved in the DB (with no "orientation" key at all in their stored
+// JSON) still parse correctly — every read site treats a missing value as
+// "horizontal", so this is a fully backward-compatible addition requiring
+// ZERO migration, since layoutConfig is stored as a raw JSON text column,
+// not individual typed columns.
+export const IdCardOrientation = {
+  HORIZONTAL: "horizontal",
+  VERTICAL: "vertical",
+} as const;
+
+export type IdCardOrientationValue =
+  (typeof IdCardOrientation)[keyof typeof IdCardOrientation];
+
 // ─────────────────────────────────────────────────────────────────────────────
 // LAYOUT CONFIG SHAPE (stored as JSON in `layoutConfig`)
 //
@@ -69,6 +83,11 @@ export interface IdCardLayoutConfig {
 
   /** QR code size as a fraction of the card width (0–1), default ~0.22 */
   qrSizeRatio: number;
+
+  /** NEW — physical card orientation. Undefined/missing is treated as
+   *  "horizontal" everywhere it's read (frontend preview component, PDF
+   *  export), so this field is safe to omit on old templates. */
+  orientation?: IdCardOrientationValue;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -1,27 +1,35 @@
 // src/modules/school/id-cards/routes.ts
 
 import { zValidator } from "@hono/zod-validator";
-import { and, desc, eq } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
 import {
-  idCardsSchema,
-  idCardTemplatesSchema,
-  schoolsSchema,
   ALL_ID_CARD_HOLDER_TYPES,
+  IdCardOrientation,
+  IdCardStatus,
+  IdCardStatusValue,
+  idCardTemplatesSchema,
+  schoolsSchema
 } from "../../../db/schemas/school";
 import { getSchoolDB } from "../../../db/school-client";
+import { requirePermission, schoolJwtMiddleware, schoolTokenValidationMiddleware } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
-import { requirePermission } from "../../../middleware/school-auth";
 import {
+  deleteIdCard,
+  deleteIdCardsBulk,
   generateIdCard,
   generateIdCardsBulk,
+  getEligibleHolders,
   getIdCardData,
-  revokeIdCard,
+  listIdCards,
   reissueIdCard,
+  revokeIdCard,
 } from "./services";
 
 const idCardsRouter = new Hono<SchoolEnv>();
+
+idCardsRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
 
 // ── Auth/DB pattern note ────────────────────────────────────────────────────
 // This router does NOT receive a `db` from context — your codebase never
@@ -53,6 +61,9 @@ const layoutConfigSchema = z.object({
   visibleFields: z.array(z.string()),
   footerNote: z.string(),
   qrSizeRatio: z.number().min(0.1).max(0.4),
+  orientation: z
+    .enum([IdCardOrientation.HORIZONTAL, IdCardOrientation.VERTICAL])
+    .optional(),
 });
 
 const createTemplateSchema = z.object({
@@ -237,6 +248,17 @@ idCardsRouter.post(
 
       return c.json({ success: true, cardId: result.id });
     } catch (error: any) {
+      if (error.code === "ACTIVE_CARD_EXISTS") {
+        return c.json(
+          {
+            success: false,
+            error: error.message,
+            code: error.code,
+            existingCardId: error.existingCardId,
+          },
+          409
+        );
+      }
       return c.json({ success: false, error: error.message }, 400);
     }
   }
@@ -274,19 +296,14 @@ idCardsRouter.post(
         .from(schoolsSchema)
         .get();
 
-      const inputs = data.holders.map((h) => ({
-        holderUserId: h.holderUserId,
-        enrollmentId: h.enrollmentId,
+      // NOTE: templateId and validUntil now passed once (shared across the
+      // whole batch) instead of duplicated into every holder input.
+      const result = await generateIdCardsBulk(db, school?.shortName || "EDX", {
         templateId: data.templateId,
         validUntil: data.validUntil,
         issuedBy,
-      }));
-
-      const result = await generateIdCardsBulk(
-        db,
-        school?.shortName || "EDX",
-        inputs
-      );
+        holders: data.holders,
+      });
 
       return c.json({
         success: true,
@@ -309,33 +326,74 @@ idCardsRouter.get("/", requirePermission("id-cards.view"), async (c) => {
   try {
     const schoolCode = c.get("schoolCode")!;
     const db = await getSchoolDB(c.env, schoolCode);
-    const holderType = c.req.query("holderType");
-    const status = c.req.query("status");
 
-    const conditions = [];
-    if (holderType)
-      conditions.push(eq(idCardsSchema.holderType, holderType as any));
-    if (status) conditions.push(eq(idCardsSchema.status, status as any));
+    const holderTypeParam = c.req.query("holderType");
+    const holderType =
+      holderTypeParam === "STUDENT" || holderTypeParam === "STAFF"
+        ? holderTypeParam
+        : undefined;
 
-    const rows = await db
-      .select({
-        id: idCardsSchema.id,
-        cardNumber: idCardsSchema.cardNumber,
-        holderType: idCardsSchema.holderType,
-        holderName: idCardsSchema.holderNameSnapshot,
-        photoUrl: idCardsSchema.photoUrlSnapshot,
-        status: idCardsSchema.status,
-        issuedAt: idCardsSchema.issuedAt,
-        validUntil: idCardsSchema.validUntil,
-      })
-      .from(idCardsSchema)
-      .where(conditions.length ? and(...conditions) : undefined)
-      .orderBy(desc(idCardsSchema.issuedAt))
-      .all();
+    const statusParam = c.req.query("status");
+    const status =
+      statusParam && Object.values(IdCardStatus).includes(statusParam as any)
+        ? (statusParam as IdCardStatusValue)
+        : undefined;
 
-    return c.json({ success: true, cards: rows });
-  } catch (error: any) {
-    return c.json({ success: false, error: error.message }, 500);
+    const classSectionIdParam = c.req.query("classSectionId");
+    let classSectionId: number | undefined;
+    if (classSectionIdParam && holderType === "STUDENT") {
+      classSectionId = Number(classSectionIdParam);
+      if (Number.isNaN(classSectionId)) {
+        return c.json({ success: false, error: "Invalid classSectionId" }, 400);
+      }
+    }
+
+    const cards = await listIdCards(db, { holderType, status, classSectionId });
+    // console.log(`Listed ${cards.length} ID cards for school ${schoolCode}`);
+    // console.log("Cards:", cards);
+    return c.json({ success: true, cards });
+  } catch (err: any) {
+    console.error("Failed to list ID cards:", err);
+    return c.json(
+      { success: false, error: err.message || "Failed to fetch ID cards" },
+      500
+    );
+  }
+});
+
+idCardsRouter.get("/eligible-holders", requirePermission("id-cards.view"), async (c) => {
+  try {
+    const schoolCode = c.get("schoolCode")!;
+    const db = await getSchoolDB(c.env, schoolCode);
+
+    const holderTypeParam = c.req.query("holderType");
+    if (holderTypeParam !== "STUDENT" && holderTypeParam !== "STAFF") {
+      return c.json({ success: false, error: "holderType must be STUDENT or STAFF" }, 400);
+    }
+
+    let classSectionId: number | undefined;
+    if (holderTypeParam === "STUDENT") {
+      const raw = c.req.query("classSectionId");
+      classSectionId = raw ? Number(raw) : undefined;
+      if (!classSectionId || Number.isNaN(classSectionId)) {
+        return c.json(
+          { success: false, error: "classSectionId is required for STUDENT" },
+          400
+        );
+      }
+    }
+
+    const holders = await getEligibleHolders(db, {
+      holderType: holderTypeParam,
+      classSectionId,
+    });
+    return c.json({ success: true, holders });
+  } catch (err: any) {
+    console.error("Failed to fetch eligible holders:", err);
+    return c.json(
+      { success: false, error: err.message || "Failed to fetch eligible holders" },
+      500
+    );
   }
 });
 
@@ -381,6 +439,9 @@ idCardsRouter.get(
         frontendBaseUrl,
         schoolCode
       );
+
+      console.log(`Fetched ID card data for card ID ${id} in school ${schoolCode}`);
+      console.log("Card data:", card);
 
       if (!card)
         return c.json({ success: false, error: "Card not found" }, 404);
@@ -501,6 +562,77 @@ idCardsRouter.post(
       return c.json({ success: true, newCardId: result.id });
     } catch (error: any) {
       return c.json({ success: false, error: error.message }, 400);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE — permanent removal (distinct from /:id/revoke, which soft-revokes).
+// Required before a holder who already has an active card can be issued a
+// fresh one — see the ACTIVE_CARD_EXISTS guard inside generateIdCard().
+//
+// NOTE: uses the "id-cards.delete" permission slug. Add it to
+// SchoolPermissionSlug (src/types/school-permissions.ts) and seed it into
+// the permissions table with module "ID_CARDS", same as the other
+// id-cards.* slugs — school-owner roles already get it automatically via
+// the '*' wildcard.
+// ─────────────────────────────────────────────────────────────────────────────
+
+idCardsRouter.delete(
+  "/:id",
+  requirePermission("id-cards.delete"),
+  async (c) => {
+    try {
+      const id = Number(c.req.param("id"));
+      if (Number.isNaN(id)) {
+        return c.json({ success: false, error: "Invalid card id" }, 400);
+      }
+      const schoolCode = c.get("schoolCode")!;
+      const db = await getSchoolDB(c.env, schoolCode);
+
+      await deleteIdCard(db, id);
+      return c.json({ success: true, message: "Card deleted" });
+    } catch (error: any) {
+      const status = error.message === "Card not found" ? 404 : 400;
+      return c.json({ success: false, error: error.message }, status);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// DELETE — BULK (POST, not DELETE — mirrors /data/bulk's convention of using
+// POST for any bulk operation that needs a JSON array body). Powers the
+// "Delete Selected" action in id-card-management's table toolbar.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const bulkDeleteSchema = z.object({
+  cardIds: z.array(z.number().int().positive()).min(1).max(500),
+});
+
+idCardsRouter.post(
+  "/delete/bulk",
+  requirePermission("id-cards.delete"),
+  zValidator("json", bulkDeleteSchema),
+  async (c) => {
+    try {
+      const { cardIds } = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const db = await getSchoolDB(c.env, schoolCode);
+
+      const result = await deleteIdCardsBulk(db, cardIds);
+
+      return c.json({
+        success: true,
+        deletedCount: result.deletedCount,
+        deletedIds: result.deletedIds,
+        notFound: result.notFound,
+        message:
+          result.notFound.length > 0
+            ? `Deleted ${result.deletedCount} card(s). ${result.notFound.length} were already removed.`
+            : `Deleted ${result.deletedCount} card(s).`,
+      });
+    } catch (error: any) {
+      return c.json({ success: false, error: error.message }, 500);
     }
   }
 );

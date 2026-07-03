@@ -49,6 +49,7 @@ async function resolveSchoolId(c: any): Promise<number> {
 accessPaymentRouter.get("/plans", async (c) => {
   try {
     const plans = await getAllAccessPlans(c.env as any);
+    console.log("plans", plans);
     return c.json({ success: true, plans });
   } catch (error: any) {
     return c.json({ success: false, error: error.message }, 500);

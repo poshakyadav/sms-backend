@@ -205,7 +205,7 @@ async function parseExcelBuffer(
   fileBuffer: Uint8Array
 ): Promise<BulkStudentRow[]> {
   const XLSX = await import("xlsx");
-  const workbook = XLSX.read(fileBuffer, { type: "array" });
+  const workbook = XLSX.read(fileBuffer, { type: "array", cellDates: true });
   const sheetName =
     workbook.SheetNames.find((n: string) => n.toLowerCase() === "students") ??
     workbook.SheetNames[0];
@@ -241,8 +241,8 @@ async function parseExcelBuffer(
   if (headerRowIndex === -1)
     throw new Error(
       "Could not find the header row in the Excel file. " +
-        "Make sure you are using the official student upload template and have NOT " +
-        'renamed or removed the "Name *", "Email *", or "Password *" column headers.'
+      "Make sure you are using the official student upload template and have NOT " +
+      'renamed or removed the "Name *", "Email *", or "Password *" column headers.'
     );
 
   const hintRowIndex = headerRowIndex + 1;
@@ -252,10 +252,9 @@ async function parseExcelBuffer(
   if (dataStartIndex >= rawData.length)
     throw new Error(
       "Excel file has a header row but no data rows. " +
-        `Please fill in your student data starting from row ${
-          dataStartIndex + 1
-        } ` +
-        "(below the two sample rows shown in blue and green) and re-upload."
+      `Please fill in your student data starting from row ${dataStartIndex + 1
+      } ` +
+      "(below the two sample rows shown in blue and green) and re-upload."
     );
 
   const headerRow: string[] = rawData[headerRowIndex].map((h: any) =>
@@ -395,7 +394,7 @@ async function parseExcelBuffer(
       `Missing required column${missing.length > 1 ? "s" : ""}: ${missing.join(
         ", "
       )}. ` +
-        "Please use the official student upload template and do not rename the column headers."
+      "Please use the official student upload template and do not rename the column headers."
     );
 
   const rows: BulkStudentRow[] = [];
@@ -412,6 +411,14 @@ async function parseExcelBuffer(
       return String(row[colIdx] ?? "").trim();
     };
 
+    // — same guard logic as str(), but routes through normaliseDateCell()
+    // instead of a blind String() cast, so numeric/Date cell values are
+    // converted to ISO date strings rather than stringified as-is.
+    const dateColStr = (colIdx: number): string => {
+      if (colIdx === -1 || colIdx === snoColIndex) return "";
+      return normaliseDateCell(row[colIdx]);
+    };
+
     const nameVal = str(colMap.name);
     const emailVal = str(colMap.email).toLowerCase();
     const passwordVal = str(colMap.password);
@@ -424,7 +431,7 @@ async function parseExcelBuffer(
       password: passwordVal,
       phone: str(colMap.phone) || undefined,
       alternatePhone: str(colMap.alternatePhone) || undefined,
-      dateOfBirth: str(colMap.dateOfBirth) || undefined,
+      dateOfBirth: dateColStr(colMap.dateOfBirth) || undefined,
       gender: str(colMap.gender) || undefined,
       bloodGroup: str(colMap.bloodGroup) || undefined,
       fatherName: str(colMap.fatherName) || undefined,
@@ -437,7 +444,7 @@ async function parseExcelBuffer(
       state: str(colMap.state) || undefined,
       postalCode: str(colMap.postalCode) || undefined,
       admissionNumber: str(colMap.admissionNumber) || undefined,
-      admissionDate: str(colMap.admissionDate) || undefined,
+      admissionDate: dateColStr(colMap.admissionDate) || undefined,
       rollNumber: str(colMap.rollNumber) || undefined,
       previousSchool: str(colMap.previousSchool) || undefined,
       medicalInfo: str(colMap.medicalInfo) || undefined,
@@ -537,6 +544,51 @@ function normaliseGender(raw: string | undefined): string {
 function normaliseBloodGroup(raw: string | undefined): string {
   if (!raw) return "";
   return raw.toUpperCase().replace(/\s/g, "");
+}
+
+/**
+ * Normalizes a raw Excel cell value for a date column (DOB, Admission Date)
+ * into a clean "YYYY-MM-DD" string, regardless of how Excel stored it:
+ *   • Date object    — when { cellDates: true } auto-detected a date-formatted cell
+ *   • number         — a raw Excel serial slipped through (old template, no
+ *                       explicit Text format, or a paste that re-triggered
+ *                       Excel's auto-date-detection)
+ *   • string         — the expected case (Text-formatted cell, e.g. "2009-07-18"),
+ *                       but also guards against a serial that arrived as text
+ *                       (e.g. "40012") from a raw CSV or other odd source
+ */
+function normaliseDateCell(raw: any): string {
+  if (raw === undefined || raw === null || raw === "") return "";
+
+  // Case 1: xlsx already parsed it into a real Date (cellDates: true)
+  if (raw instanceof Date && !isNaN(raw.getTime())) {
+    return raw.toISOString().slice(0, 10);
+  }
+
+  // Case 2: raw Excel serial number (days since 1899-12-30)
+  if (typeof raw === "number" && isFinite(raw)) {
+    const date = new Date(Date.UTC(1899, 11, 30) + raw * 86400000);
+    if (!isNaN(date.getTime())) return date.toISOString().slice(0, 10);
+  }
+
+  const trimmed = String(raw).trim();
+  if (!trimmed) return "";
+
+  // Case 3: a serial number that arrived as a plain string, e.g. "40012"
+  if (/^\d{4,6}(\.\d+)?$/.test(trimmed)) {
+    const serial = Number(trimmed);
+    // Sanity range: Excel dates from ~1950 to ~2100 fall roughly between
+    // 18000–73000 — guards against misreading a genuinely numeric non-date
+    // value (unlikely here, but cheap to check) as a date.
+    if (serial > 15000 && serial < 75000) {
+      const date = new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
+      if (!isNaN(date.getTime())) return date.toISOString().slice(0, 10);
+    }
+  }
+
+  // Case 4: already a normal date string (expected case, e.g. "2009-07-18")
+  // — return as-is; validateRow()/downstream DB layer handles format checks.
+  return trimmed;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -814,13 +866,10 @@ export async function bulkUploadStudents(
   if (rows.length > availableSlots) {
     return {
       success: false,
-      message: `Cannot add ${
-        rows.length
-      } students. Only ${availableSlots} slot${
-        availableSlots !== 1 ? "s" : ""
-      } available in ${classSection.className} – ${
-        classSection.sectionName
-      } (${existingStudents}/${maxAllowed} enrolled). Please reduce your file to ${availableSlots} or fewer students.`,
+      message: `Cannot add ${rows.length
+        } students. Only ${availableSlots} slot${availableSlots !== 1 ? "s" : ""
+        } available in ${classSection.className} – ${classSection.sectionName
+        } (${existingStudents}/${maxAllowed} enrolled). Please reduce your file to ${availableSlots} or fewer students.`,
       summary: {
         totalRows: rows.length,
         successful: 0,
@@ -884,14 +933,12 @@ export async function bulkUploadStudents(
     const parts: string[] = [];
     if (inSchoolCount > 0)
       parts.push(
-        `${inSchoolCount} email${
-          inSchoolCount !== 1 ? "s are" : " is"
+        `${inSchoolCount} email${inSchoolCount !== 1 ? "s are" : " is"
         } already registered in this school`
       );
     if (inFileCount > 0)
       parts.push(
-        `${inFileCount} duplicate email${
-          inFileCount !== 1 ? "s" : ""
+        `${inFileCount} duplicate email${inFileCount !== 1 ? "s" : ""
         } within the file`
       );
     return {
@@ -1003,7 +1050,7 @@ export async function bulkUploadStudents(
           previousSchool: r.row.previousSchool || "",
           medicalInfo: r.row.medicalInfo || "",
           enrollmentType: (r.row.enrollmentType &&
-          VALID_ENROLLMENT_TYPES.has(r.row.enrollmentType)
+            VALID_ENROLLMENT_TYPES.has(r.row.enrollmentType)
             ? r.row.enrollmentType
             : "REGULAR") as any,
           previousClassResult: (r.row.previousClassResult || null) as any,
@@ -1088,7 +1135,7 @@ export async function bulkUploadStudents(
             previousSchool: r.row.previousSchool || "",
             medicalInfo: r.row.medicalInfo || "",
             enrollmentType: (r.row.enrollmentType &&
-            VALID_ENROLLMENT_TYPES.has(r.row.enrollmentType)
+              VALID_ENROLLMENT_TYPES.has(r.row.enrollmentType)
               ? r.row.enrollmentType
               : "REGULAR") as any,
             previousClassResult: (r.row.previousClassResult || null) as any,
@@ -1179,21 +1226,17 @@ export async function bulkUploadStudents(
 
   let message: string;
   if (allSuccess) {
-    message = `Successfully added ${successCount} student${
-      successCount !== 1 ? "s" : ""
-    } to ${classSection.className} – ${classSection.sectionName}.`;
+    message = `Successfully added ${successCount} student${successCount !== 1 ? "s" : ""
+      } to ${classSection.className} – ${classSection.sectionName}.`;
     if (udiseWarningCount > 0)
-      message += ` Note: ${udiseWarningCount} student${
-        udiseWarningCount !== 1 ? "s have" : " has"
-      } UDISE field format issues — please review and correct from the student profile.`;
+      message += ` Note: ${udiseWarningCount} student${udiseWarningCount !== 1 ? "s have" : " has"
+        } UDISE field format issues — please review and correct from the student profile.`;
   } else if (partialSuccess) {
-    message = `Partially completed: ${successCount} student${
-      successCount !== 1 ? "s" : ""
-    } added, ${failCount} failed.`;
+    message = `Partially completed: ${successCount} student${successCount !== 1 ? "s" : ""
+      } added, ${failCount} failed.`;
     if (udiseWarningCount > 0)
-      message += ` ${udiseWarningCount} student${
-        udiseWarningCount !== 1 ? "s" : ""
-      } added with UDISE format warnings.`;
+      message += ` ${udiseWarningCount} student${udiseWarningCount !== 1 ? "s" : ""
+        } added with UDISE format warnings.`;
   } else {
     message = `Upload failed: all ${failCount} rows had errors.`;
   }

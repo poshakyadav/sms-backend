@@ -129,6 +129,7 @@ export const SCHOOL_PERMISSIONS = {
     VIEW: "id-cards.view", // View issued ID cards / management list
     REVOKE: "id-cards.revoke", // Revoke / reissue an ID card
     PRINT: "id-cards.print", // Export/print ID cards (PDF download access)
+    DELETE: "id-cards.delete",
     TEMPLATE_MANAGE: "id-cards.templates.manage", // Create/edit ID card templates (layout config)
   },
 

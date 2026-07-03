@@ -12,12 +12,14 @@ import { SchoolEnv } from "../../../types/common-types";
 import {
   assignDirectPermissionsToUser,
   assignRolesToUser,
+  bulkUploadStudentAvatars,
   checkUserDeletionImpact,
   createSchoolUser,
   deleteSchoolUser,
   getSchoolUserById,
   getSchoolUsers,
   getSchoolUsersByCategory,
+  getStudentsByClassSectionForAvatarUpload,
   getUserDeniedPermissions,
   getUserDirectPermissions,
   getUserRoles,
@@ -128,6 +130,166 @@ usersRouter.get(
       console.error("Check email error:", error);
       return c.json(
         { success: false, error: error.message || "Server error" },
+        500
+      );
+    }
+  }
+);
+
+// ── Bulk photo upload limits ────────────────────────────────────────────────
+const MAX_BULK_AVATAR_ITEMS = 100; // sane ceiling — largest realistic class-section is ~60
+const MAX_AVATAR_BYTES_BULK = 100 * 1024; // same 100KB ceiling as single avatar upload
+
+const bulkAvatarStudentIdsSchema = z
+  .array(z.number().int().positive())
+  .min(1, "At least one student is required")
+  .max(
+    MAX_BULK_AVATAR_ITEMS,
+    `Cannot upload more than ${MAX_BULK_AVATAR_ITEMS} photos in a single request`
+  );
+
+  // ─────────────────────────────────────────────────────────────────────────────
+// BULK PHOTO UPLOAD — class-section based
+// IMPORTANT: Defined before GET /:id and use static path segments, so no
+// collision risk, but kept here with the other pre-`/:id` routes for
+// consistency with the rest of this file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+usersRouter.get(
+  "/class-section/:classSectionId/students",
+  requirePermission("users.list"),
+  async (c) => {
+    try {
+      const classSectionId = parseInt(c.req.param("classSectionId"));
+      if (isNaN(classSectionId)) {
+        return c.json(
+          { success: false, error: "Invalid class section ID" },
+          400
+        );
+      }
+
+      const schoolCode = c.get("schoolCode")!;
+      const students = await getStudentsByClassSectionForAvatarUpload(
+        c.env,
+        schoolCode,
+        classSectionId
+      );
+
+      return c.json({ success: true, students });
+    } catch (error: any) {
+      console.error("Get students by class-section error:", error);
+      return c.json({ success: false, error: error.message }, 500);
+    }
+  }
+);
+
+// POST /school/users/bulk-avatar-upload
+// Body: multipart/form-data
+//   studentIds  -> JSON string, e.g. "[12,13,14]"
+//   avatar_<id> -> one file field PER student id in studentIds, e.g.
+//                  "avatar_12", "avatar_13", "avatar_14"
+//
+// Files are matched to students BY FIELD NAME, not by array position — this
+// sidesteps any ambiguity about FormData iteration/multipart ordering.
+// Accepts the same permission set as the single-avatar endpoint since both
+// serve the same "manage a student's profile photo" capability.
+usersRouter.post(
+  "/bulk-avatar-upload",
+  requirePermission(["users.create", "users.edit"]),
+  async (c) => {
+    try {
+      const body = await c.req.parseBody();
+
+      const studentIdsRaw = body["studentIds"];
+      if (typeof studentIdsRaw !== "string") {
+        return c.json(
+          { success: false, error: "studentIds field is required" },
+          400
+        );
+      }
+
+      let studentIds: number[];
+      try {
+        studentIds = bulkAvatarStudentIdsSchema.parse(
+          JSON.parse(studentIdsRaw)
+        );
+      } catch (e: any) {
+        return c.json(
+          {
+            success: false,
+            error: e?.errors?.[0]?.message ?? "Invalid studentIds payload",
+          },
+          400
+        );
+      }
+
+      const items: { userId: number; bytes: ArrayBuffer; contentType: string }[] =
+        [];
+      const missing: number[] = [];
+
+      for (const userId of studentIds) {
+        const file = body[`avatar_${userId}`];
+
+        if (!file || typeof file === "string") {
+          missing.push(userId);
+          continue;
+        }
+
+        const contentType = (file as File).type || "image/webp";
+        if (!contentType.startsWith("image/")) {
+          return c.json(
+            {
+              success: false,
+              error: `File for student #${userId} is not an image`,
+            },
+            400
+          );
+        }
+
+        const arrayBuffer = await (file as File).arrayBuffer();
+        if (arrayBuffer.byteLength > MAX_AVATAR_BYTES_BULK) {
+          return c.json(
+            {
+              success: false,
+              error: `Image for student #${userId} is too large (${Math.round(
+                arrayBuffer.byteLength / 1024
+              )}KB). Max ${MAX_AVATAR_BYTES_BULK / 1024}KB.`,
+            },
+            400
+          );
+        }
+
+        items.push({ userId, bytes: arrayBuffer, contentType });
+      }
+
+      if (missing.length > 0) {
+        return c.json(
+          {
+            success: false,
+            error: `Missing image file(s) for student ID(s): ${missing.join(
+              ", "
+            )}`,
+          },
+          400
+        );
+      }
+
+      const schoolCode = c.get("schoolCode")!;
+      const result = await bulkUploadStudentAvatars(c.env, schoolCode, items);
+
+      return c.json({
+        success: true,
+        message:
+          result.failed.length > 0
+            ? `${result.uploaded.length} photo(s) uploaded, ${result.failed.length} failed`
+            : `${result.uploaded.length} photo(s) uploaded successfully`,
+        uploaded: result.uploaded,
+        failed: result.failed,
+      });
+    } catch (error: any) {
+      console.error("Bulk avatar upload error:", error);
+      return c.json(
+        { success: false, error: error.message || "Failed to bulk upload photos" },
         500
       );
     }

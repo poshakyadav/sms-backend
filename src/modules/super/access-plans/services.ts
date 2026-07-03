@@ -1,29 +1,52 @@
 // src/modules/super/access-plans/services.ts
 
-import { eq } from "drizzle-orm";
-import { sql } from "drizzle-orm";
-import { accessPlansSchema } from "../../../db/schemas/super";
+import { eq, inArray, sql } from "drizzle-orm";
+import {
+  accessPlansSchema,
+  schoolAutopaySubscriptionsSchema,
+} from "../../../db/schemas/super";
 import { Env } from "../../../types/common-types";
-import { AccessPlanTypeValue } from "../../../types/razorpay";
+import { AccessPlanTypeValue, AutopaySubscriptionStatus, AutopaySubscriptionStatusValue } from "../../../types/razorpay";
 import { getCommonDB } from "../../../db";
 
-/**
- * ACCESS PLANS SERVICE — super-admin management of the two access plan
- * rows (MONTHLY, YEARLY). amountPaise and planType are fixed at seed time
- * and are NOT editable here by design (changing the base price of an
- * existing plan type is a business decision that should go through a new
- * plan type, not a silent edit — keeps historical billing records
- * meaningful). Only discountPaise, autopayEnabled, and isActive are
- * editable.
- */
+// Typed as AutopaySubscriptionStatusValue[] (not string[]) so it matches
+// schoolAutopaySubscriptionsSchema.status's column type for inArray().
+const ACTIVE_SUBSCRIPTION_STATUSES: AutopaySubscriptionStatusValue[] = [
+  AutopaySubscriptionStatus.ACTIVE,
+  AutopaySubscriptionStatus.AUTHENTICATED,
+  AutopaySubscriptionStatus.CREATED,
+];
+
+/** Attaches a live count of active/authenticated/created Autopay subs per planType. */
+async function withActiveAutopayCounts(db: any, plans: any[]) {
+  if (plans.length === 0) return plans;
+
+  const counts = await db
+    .select({
+      planType: schoolAutopaySubscriptionsSchema.planType,
+      count: sql<number>`count(*)`,
+    })
+    .from(schoolAutopaySubscriptionsSchema)
+    .where(inArray(schoolAutopaySubscriptionsSchema.status, ACTIVE_SUBSCRIPTION_STATUSES))
+    .groupBy(schoolAutopaySubscriptionsSchema.planType)
+    .all();
+
+  const countMap = new Map(counts.map((c: any) => [c.planType, Number(c.count)]));
+
+  return plans.map((p) => ({
+    ...p,
+    activeAutopaySubscriptions: countMap.get(p.planType) ?? 0,
+  }));
+}
 
 export async function getAllAccessPlans(env: Env["Bindings"]) {
   const db = getCommonDB(env);
-  return db
+  const plans = await db
     .select()
     .from(accessPlansSchema)
     .orderBy(accessPlansSchema.planType)
     .all();
+  return withActiveAutopayCounts(db, plans);
 }
 
 export async function getAccessPlanByType(
@@ -31,37 +54,43 @@ export async function getAccessPlanByType(
   planType: AccessPlanTypeValue
 ) {
   const db = getCommonDB(env);
-  return db
+  const plan = await db
     .select()
     .from(accessPlansSchema)
     .where(eq(accessPlansSchema.planType, planType))
     .get();
+  if (!plan) return null;
+  const [withCount] = await withActiveAutopayCounts(db, [plan]);
+  return withCount;
 }
 
 /**
- * Updates the discount on an access plan and recomputes finalAmountPaise.
+ * Updates an access plan's pricing/config. `planType` and `durationDays`
+ * stay fixed by design — they're baked into PaymentType.ACCESS_MONTHLY/
+ * YEARLY routing in the webhook handler and into the Razorpay Plan
+ * "period" (monthly/yearly). Editing them isn't a pricing tweak, it's a
+ * data-model change — do that as a migration, not through this endpoint.
  *
- * IMPORTANT: If the discount actually changes, razorpayPlanId is reset to
- * NULL in the same transaction. This is what makes the next Autopay sign-up
- * for this plan type create a fresh Razorpay Plan at the new price (Plans
- * are immutable on Razorpay — see schema comment in access-plans.ts for the
- * full rationale). Existing live Autopay subscriptions are UNAFFECTED and
- * keep being charged at whatever price their already-created Plan has —
- * this is intentional and matches how every real-world recurring-payment
- * system handles price changes on a live mandate.
+ * If amountPaise or discountPaise actually changes, razorpayPlanId is
+ * reset to NULL so the next Autopay sign-up lazily creates a fresh
+ * (immutable) Razorpay Plan at the new price. Existing live Autopay
+ * subscriptions are unaffected — the caller gets `priceChanged` plus
+ * `activeAutopaySubscriptions` so the UI can warn the admin.
  */
-export async function updateAccessPlanDiscount(
+export async function updateAccessPlan(
   env: Env["Bindings"],
   planType: AccessPlanTypeValue,
   input: {
+    name?: string;
+    amountPaise?: number;
     discountPaise?: number;
     autopayEnabled?: boolean;
     isActive?: boolean;
   }
-) {
+): Promise<{ plan: any; priceChanged: boolean }> {
   const db = getCommonDB(env);
 
-  return db.transaction(async (tx: any) => {
+  const priceChanged = await db.transaction(async (tx: any) => {
     const existing = await tx
       .select()
       .from(accessPlansSchema)
@@ -69,63 +98,55 @@ export async function updateAccessPlanDiscount(
       .get();
 
     if (!existing) {
-      throw new Error(
-        `Access plan "${planType}" not found. Run the seeder first.`
-      );
+      throw new Error(`Access plan "${planType}" not found. Run the seeder first.`);
     }
 
+    const newAmountPaise = input.amountPaise ?? existing.amountPaise;
     const newDiscountPaise = input.discountPaise ?? existing.discountPaise;
 
-    if (newDiscountPaise < 0 || newDiscountPaise > existing.amountPaise) {
-      throw new Error(
-        "Discount must be between 0 and the plan's sticker amount."
-      );
+    if (newAmountPaise <= 0) {
+      throw new Error("Sticker amount must be greater than zero.");
+    }
+    if (newDiscountPaise < 0 || newDiscountPaise > newAmountPaise) {
+      throw new Error("Discount must be between 0 and the plan's sticker amount.");
     }
 
-    const discountChanged = newDiscountPaise !== existing.discountPaise;
-    const newFinalAmountPaise = existing.amountPaise - newDiscountPaise;
+    const changed =
+      newAmountPaise !== existing.amountPaise || newDiscountPaise !== existing.discountPaise;
+    const newFinalAmountPaise = newAmountPaise - newDiscountPaise;
 
     await tx
       .update(accessPlansSchema)
       .set({
+        ...(input.name !== undefined && { name: input.name }),
+        amountPaise: newAmountPaise,
         discountPaise: newDiscountPaise,
         finalAmountPaise: newFinalAmountPaise,
-        ...(input.autopayEnabled !== undefined && {
-          autopayEnabled: input.autopayEnabled,
-        }),
+        ...(input.autopayEnabled !== undefined && { autopayEnabled: input.autopayEnabled }),
         ...(input.isActive !== undefined && { isActive: input.isActive }),
-        // Discount changed → force a fresh Plan on next Autopay sign-up.
-        // Existing live subscriptions keep their already-created Plan and
-        // are unaffected.
-        ...(discountChanged && { razorpayPlanId: null }),
+        ...(changed && { razorpayPlanId: null }),
         updatedAt: sql`CURRENT_TIMESTAMP`,
       })
       .where(eq(accessPlansSchema.planType, planType));
 
-    return tx
-      .select()
-      .from(accessPlansSchema)
-      .where(eq(accessPlansSchema.planType, planType))
-      .get();
+    return changed;
   });
+
+  const updated = await getAccessPlanByType(env, planType);
+  return { plan: updated, priceChanged };
 }
 
-/**
- * Seeds the two access plan rows if they don't already exist. Safe to call
- * on every boot — no-ops if rows are already present. Call this from your
- * existing setup/seeder flow (alongside seedSuperPermissionsAndRoles).
- */
+/** Idempotent — no-ops if rows already exist. Unchanged from your version. */
 export async function seedAccessPlans(env: Env["Bindings"]) {
   const db = getCommonDB(env);
-
   const existing = await db.select().from(accessPlansSchema).all();
   if (existing.length > 0) return existing;
 
-  const rows = [
+  await db.insert(accessPlansSchema).values([
     {
       planType: "MONTHLY" as const,
       name: "Monthly Access",
-      amountPaise: 59900, // ₹599.00
+      amountPaise: 59900,
       discountPaise: 0,
       finalAmountPaise: 59900,
       durationDays: 30,
@@ -135,15 +156,14 @@ export async function seedAccessPlans(env: Env["Bindings"]) {
     {
       planType: "YEARLY" as const,
       name: "Yearly Access",
-      amountPaise: 898500, // ₹8985.00
+      amountPaise: 898500,
       discountPaise: 0,
       finalAmountPaise: 898500,
       durationDays: 365,
       autopayEnabled: true,
       isActive: true,
     },
-  ];
+  ]);
 
-  await db.insert(accessPlansSchema).values(rows);
   return db.select().from(accessPlansSchema).all();
 }

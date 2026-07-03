@@ -25,8 +25,11 @@ import {
   upsertFeedPostReaction,
   type R2PresignEnv,
 } from "./services";
+import { schoolJwtMiddleware, schoolTokenValidationMiddleware } from "../../../middleware/school-auth";
 
 const feedRouter = new Hono<SchoolEnv>();
+
+feedRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // AUTH GUARD HELPERS
