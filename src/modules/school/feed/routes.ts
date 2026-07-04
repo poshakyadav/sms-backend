@@ -407,6 +407,8 @@ feedRouter.post(
         contentType
       );
 
+      console.log("Generated presigned URL for feed image:", result);
+
       return c.json({ success: true, ...result });
     } catch (error: any) {
       console.error("POST /school/feed/presign-image error:", error);

@@ -1,3 +1,5 @@
+// src/modules/school/fees/services.ts
+
 import { getSchoolDB } from "../../../db/school-client";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { nanoid } from "nanoid";

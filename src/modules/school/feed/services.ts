@@ -125,7 +125,6 @@ export async function generateFeedImagePresignedUrl(
   publicUrl: string;
   expiresInSeconds: number;
 }> {
-  // Map MIME type to file extension
   const extMap: Record<string, string> = {
     "image/webp": "webp",
     "image/jpeg": "jpg",
@@ -133,16 +132,25 @@ export async function generateFeedImagePresignedUrl(
   };
   const ext = extMap[contentType] ?? "webp";
 
-  // Key format: feed/posts/{schoolId}/{uuid}.{ext}
-  // Namespaced per school so bulk cleanup (e.g. school offboarding) is trivial.
   const uuid = crypto.randomUUID();
   const key = `feed/posts/${schoolId}/${uuid}.${ext}`;
 
   const r2Endpoint = `https://${env.R2_ACCOUNT_ID}.r2.cloudflarestorage.com`;
-  const objectUrl = `${r2Endpoint}/${env.R2_FEED_BUCKET_NAME}/${key}`;
 
   // 15-minute window — plenty of time for upload, short enough to limit abuse
   const EXPIRES_IN_SECONDS = 900;
+
+  // ── FIX: build the URL WITH X-Amz-Expires set BEFORE signing ─────────────
+  // Previously X-Amz-Expires was appended AFTER aws.sign() had already signed
+  // the request with its own default expiry (86400s). That produced a URL
+  // with X-Amz-Expires appearing TWICE with different values — the second
+  // one was never part of what got signed, so R2 rejected the signature
+  // with a 403 (which the browser then reports as a CORS failure, since R2
+  // omits CORS headers on error responses).
+  const objectUrl = new URL(
+    `${r2Endpoint}/${env.R2_FEED_BUCKET_NAME}/${key}`
+  );
+  objectUrl.searchParams.set("X-Amz-Expires", EXPIRES_IN_SECONDS.toString());
 
   const aws = new AwsClient({
     accessKeyId: env.R2_ACCESS_KEY_ID,
@@ -153,19 +161,20 @@ export async function generateFeedImagePresignedUrl(
 
   // signQuery: true embeds the AWS signature in the URL query string so the
   // browser can PUT with a plain fetch() call — no auth headers needed.
+  // Because X-Amz-Expires is already on objectUrl, aws4fetch signs using
+  // THIS value instead of its own default — no more duplicate param.
   const presignedRequest = await aws.sign(
-    new Request(objectUrl, { method: "PUT" }),
+    new Request(objectUrl.toString(), { method: "PUT" }),
     { aws: { signQuery: true } }
   );
 
-  // Append the expiry parameter
-  const presignedUrl = `${presignedRequest.url}&X-Amz-Expires=${EXPIRES_IN_SECONDS}`;
+  const presignedUrl = presignedRequest.url; // ← no more manual appending
 
-  // Permanent CDN URL for display (R2 bucket must have public access enabled)
   const publicUrl = `${env.R2_FEED_PUBLIC_URL}/${key}`;
 
   return { presignedUrl, key, publicUrl, expiresInSeconds: EXPIRES_IN_SECONDS };
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DELETE R2 OBJECT (fire-and-forget)

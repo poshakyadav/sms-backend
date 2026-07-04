@@ -98,7 +98,7 @@ bundlesRouter.post(
         school.id,
         bundleId
       );
-      return c.json(result);
+      return c.json({ success: true, ...result });   // ← fixed
     } catch (error: any) {
       return c.json(
         {

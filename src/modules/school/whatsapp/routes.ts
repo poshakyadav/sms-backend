@@ -1,5 +1,4 @@
 // src/modules/school/whatsapp/routes.ts
-// Canonical final version — deduped imports, all endpoints correct.
 
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";

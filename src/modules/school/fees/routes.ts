@@ -1,24 +1,4 @@
-// …/school/fees/routes.ts  (PRODUCTION-GRADE — FULL REWRITE)
-//
-// New endpoints added in this version:
-//
-//  CONCESSIONS
-//    POST  /fees/concessions                        — grant concession to a student
-//    GET   /fees/concessions/:enrollmentId          — list all concessions for an enrollment
-//    PATCH /fees/concessions/:id/revoke             — revoke a concession
-//    GET   /fees/concessions/dashboard              — admin concession overview
-//
-//  STUDENT FEE ASSIGNMENTS (transport / hostel / custom)
-//    POST  /fees/assignments                        — assign custom fee to a student
-//    POST  /fees/assignments/bulk-monthly           — bulk assign monthly fees (transport/hostel)
-//    GET   /fees/assignments/:enrollmentId          — list assignments for an enrollment
-//    PATCH /fees/assignments/:id/cancel             — cancel an assignment
-//
-//  BULK MONTHLY FEE STRUCTURES (class-section level)
-//    POST  /fees/structures/bulk-monthly            — create 12 monthly fee structures at once
-//
-//  EXISTING (updated to be concession + assignment aware)
-//    All existing endpoints remain at the same URLs — backward compatible.
+// …/school/fees/routes.ts  
 
 import { zValidator } from "@hono/zod-validator";
 import { Hono } from "hono";
