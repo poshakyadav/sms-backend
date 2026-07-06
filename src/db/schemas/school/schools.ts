@@ -16,6 +16,7 @@ export const schoolsSchema = sqliteTable("schools", {
   email: text("email").notNull().default(""), // School contact email
   website: text("website").default(""), // School website URL
   logoUrl: text("logo_url").default(""), // URL to school logo image
+  logoKey: text("logo_key").default(""), // R2 object key for school logo image
   tagline: text("tagline").default(""), // Optional school tagline or motto
   isActive: integer("is_active", { mode: "boolean" }).default(true).notNull(),
   // === Active Theme Reference (for fast lookup) ===

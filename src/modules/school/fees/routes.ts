@@ -20,6 +20,7 @@ import {
   getConcessionDashboard,
   getConcessionsForStudent,
   getDueFeesForEnrollment,
+  getFeeReceipt,
   getFeeReport,
   getFeesClassSectionBreakdown,
   getFeesCollectionTrend,
@@ -27,6 +28,7 @@ import {
   getFeeStructures,
   getParentChildFees,
   getPaymentsForEnrollment,
+  getPaymentsForFeeItem,
   getStudentFeeAssignments,
   getStudentLedger,
   getStudentOwnFees,
@@ -912,5 +914,85 @@ feesRouter.get(
     }
   }
 );
+
+// ========
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FEE RECEIPT
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * GET /fees/receipt/:paymentId
+ * Batch-expanded receipt for a single payment row. Staff can view any
+ * student's receipt within the school; students/parents can only view their
+ * own/child's — enforced inside getFeeReceipt(), not here.
+ */
+feesRouter.get(
+  "/receipt/:paymentId",
+  requirePermission([
+    "fees.report",
+    "fees.payments.record",
+    "fees.structures.manage",
+    "fees.ledger.view",
+    "fees.student.view",
+    "fees.parent.view",
+  ]),
+  async (c) => {
+    try {
+      const paymentId = parseInt(c.req.param("paymentId"));
+      const schoolCode = c.get("schoolCode")!;
+      const user = c.get("user")!;
+      const receipt = await getFeeReceipt(c.env, schoolCode, paymentId, {
+        id: user.id,
+        role: user.role,
+        permissions: user.permissions,
+      });
+      return c.json({ receipt });
+    } catch (error: any) {
+      const status = error.message?.startsWith("Unauthorized") ? 403 : 400;
+      return c.json({ error: error.message }, status);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYMENTS FOR A SINGLE FEE ITEM
+// ─────────────────────────────────────────────────────────────────────────────
+
+const itemPaymentsQuerySchema = z
+  .object({
+    enrollmentId: z.coerce.number().int().positive(),
+    feeStructureId: z.coerce.number().int().positive().optional(),
+    studentFeeAssignmentId: z.coerce.number().int().positive().optional(),
+  })
+  .refine(
+    (d) => (d.feeStructureId !== undefined) !== (d.studentFeeAssignmentId !== undefined),
+    { message: "Provide exactly one of feeStructureId or studentFeeAssignmentId" }
+  );
+
+feesRouter.get(
+  "/item-payments",
+  requirePermission([
+    "fees.report",
+    "fees.payments.record",
+    "fees.ledger.view",
+    "fees.student.view",
+    "fees.parent.view",
+  ]),
+  zValidator("query", itemPaymentsQuerySchema),
+  async (c) => {
+    try {
+      const { enrollmentId, feeStructureId, studentFeeAssignmentId } = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+      const source = feeStructureId !== undefined ? "STRUCTURE" : "ASSIGNMENT";
+      const feeId = feeStructureId ?? studentFeeAssignmentId!;
+      const payments = await getPaymentsForFeeItem(c.env, schoolCode, enrollmentId, source, feeId);
+      return c.json({ payments });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
 
 export default feesRouter;

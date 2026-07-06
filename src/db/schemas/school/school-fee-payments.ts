@@ -38,8 +38,19 @@ export const schoolFeePaymentsSchema = sqliteTable("fee_payments", {
   paymentDate: text("payment_date")
     .default(sql`CURRENT_DATE`)
     .notNull(),
-  paymentMethod: text("payment_method").default("CASH").notNull(), // "CASH" | "CHECK" | "BANK_TRANSFER"
+    paymentMethod: text("payment_method")
+    .$type<"CASH" | "CHECK" | "BANK_TRANSFER">()
+    .default("CASH")
+    .notNull(), // "CASH" | "CHECK" | "BANK_TRANSFER"
   receiptNumber: text("receipt_number").unique().notNull(),
+  // ── NEW ─────────────────────────────────────────────────────────────────
+  // Generated once per recordFeePayment() call (crypto.randomUUID()) and
+  // stamped on every row inserted during that call. Lets the receipt
+  // endpoint reconstruct "everything paid in one checkout" even when a
+  // single submission covers several fee structures/assignments.
+  // NULL on any row inserted before this migration — treated as a
+  // "batch of one" by the receipt service, so no backfill is required.
+  batchId: text("batch_id"),
   notes: text("notes"),
   recordedBy: integer("recorded_by")
     .references(() => schoolUsersSchema.id)

@@ -10,6 +10,7 @@ import {
   schoolFeePaymentsSchema,
   schoolFeeStructuresSchema,
   schoolSectionsSchema,
+  schoolsSchema,
   schoolStudentEnrollmentsSchema,
   schoolUsersSchema,
   studentParentsSchema,
@@ -798,6 +799,11 @@ export async function recordFeePayment(
     }
   }
 
+  // ── NEW: one batchId for every row this call inserts ─────────────────────
+  // Stamped unconditionally (single-mode or multi-mode payments alike) so the
+  // receipt-fetch logic never has to special-case "was this a batch or not."
+  const batchId = crypto.randomUUID();
+
   return await db.transaction(async (tx: any) => {
     // 1. Verify enrollment
     const enrollment = await tx
@@ -834,6 +840,8 @@ export async function recordFeePayment(
       if (p.amountPaid <= 0) continue;
 
       let feeType = "";
+      // ── NEW: capture feeMonth alongside feeType for receipt display ───────
+      let feeMonth: string | null = null;
 
       if (p.feeStructureId) {
         const feeStructure = await tx
@@ -842,6 +850,7 @@ export async function recordFeePayment(
             amount: schoolFeeStructuresSchema.amount,
             classSectionId: schoolFeeStructuresSchema.classSectionId,
             feeType: schoolFeeStructuresSchema.feeType,
+            feeMonth: schoolFeeStructuresSchema.feeMonth, // ← NEW field in select
           })
           .from(schoolFeeStructuresSchema)
           .where(eq(schoolFeeStructuresSchema.id, p.feeStructureId))
@@ -856,6 +865,7 @@ export async function recordFeePayment(
         }
 
         feeType = feeStructure.feeType;
+        feeMonth = feeStructure.feeMonth ?? null; // ← NEW
 
         const concession = concessionMap.get(p.feeStructureId) ?? null;
         const effectiveAmount = applyDiscount(feeStructure.amount, concession);
@@ -900,6 +910,7 @@ export async function recordFeePayment(
             amount: schoolStudentFeeAssignmentsSchema.amount,
             enrollmentId: schoolStudentFeeAssignmentsSchema.enrollmentId,
             feeType: schoolStudentFeeAssignmentsSchema.feeType,
+            feeMonth: schoolStudentFeeAssignmentsSchema.feeMonth, // ← NEW field
             isCancelled: schoolStudentFeeAssignmentsSchema.isCancelled,
           })
           .from(schoolStudentFeeAssignmentsSchema)
@@ -919,6 +930,7 @@ export async function recordFeePayment(
           throw new Error("Cannot pay a cancelled fee assignment");
 
         feeType = assignment.feeType;
+        feeMonth = assignment.feeMonth ?? null; // ← NEW
 
         const assignmentConcession =
           assignmentConcessionMap.get(p.studentFeeAssignmentId) ?? null;
@@ -986,10 +998,11 @@ export async function recordFeePayment(
           notes: data.notes ?? null,
           receiptNumber,
           recordedBy,
+          batchId, // ← NEW
         })
         .returning();
 
-      insertedPayments.push({ ...newPayment, feeType });
+      insertedPayments.push({ ...newPayment, feeType, feeMonth }); // ← feeMonth added
     }
 
     if (insertedPayments.length === 0)
@@ -3623,3 +3636,463 @@ function generateMonthRange(startMonth: string, endMonth: string): string[] {
 
   return months;
 }
+
+
+// ===========
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FEE RECEIPT (batch-aware, ownership-checked)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface RequestingUserContext {
+  id: number;
+  role?: string;
+  permissions: string[];
+}
+
+export interface FeeReceiptLineItem {
+  id: number;
+  receiptNumber: string;
+  source: "STRUCTURE" | "ASSIGNMENT";
+  feeType: string;
+  feeMonth: string | null;
+  originalAmount: number;
+  concessionAmount: number;
+  effectiveAmount: number;
+  amountPaid: number;
+  isVoid: boolean;
+}
+
+export interface FeeReceiptData {
+  batchId: string | null;
+  primaryReceiptNumber: string;
+  paymentDate: string;
+  paymentMethod: "CASH" | "CHECK" | "BANK_TRANSFER";
+  notes: string | null;
+  totalPaid: number;
+  items: FeeReceiptLineItem[];
+  recordedByName: string | null;
+  student: {
+    name: string;
+    rollNumber: string | null;
+    className: string;
+    sectionName: string;
+    academicYearName: string;
+  };
+  school: {
+    name: string;
+    shortName: string | null;
+    logoUrl: string | null;
+    addressLineOne: string;
+    addressLineTwo: string;
+    phone: string;
+    email: string;
+  };
+}
+
+const STAFF_FEE_PERMISSIONS = [
+  "fees.report",
+  "fees.payments.record",
+  "fees.structures.manage",
+  "fees.ledger.view",
+];
+
+export async function getFeeReceipt(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  paymentId: number,
+  requestingUser: RequestingUserContext
+): Promise<FeeReceiptData> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  // ── 1. Load the anchor payment row ────────────────────────────────────────
+  const anchor = await db
+    .select({
+      id: schoolFeePaymentsSchema.id,
+      enrollmentId: schoolFeePaymentsSchema.enrollmentId,
+      batchId: schoolFeePaymentsSchema.batchId,
+    })
+    .from(schoolFeePaymentsSchema)
+    .where(eq(schoolFeePaymentsSchema.id, paymentId))
+    .get();
+
+  if (!anchor) throw new Error("Payment not found");
+
+  // ── 2. Resolve enrollment → student, for ownership check + header info ────
+  const enrollment = await db
+    .select({
+      enrollmentId: schoolStudentEnrollmentsSchema.id,
+      studentId: schoolStudentEnrollmentsSchema.studentId,
+      rollNumber: schoolStudentEnrollmentsSchema.rollNumber,
+      studentName: schoolUsersSchema.name,
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
+      academicYearName: schoolAcademicYearsSchema.name,
+    })
+    .from(schoolStudentEnrollmentsSchema)
+    .innerJoin(
+      schoolUsersSchema,
+      eq(schoolStudentEnrollmentsSchema.studentId, schoolUsersSchema.id)
+    )
+    .innerJoin(
+      schoolClassSectionsSchema,
+      eq(schoolStudentEnrollmentsSchema.classSectionId, schoolClassSectionsSchema.id)
+    )
+    .innerJoin(schoolClassesSchema, eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id))
+    .innerJoin(
+      schoolSectionsSchema,
+      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+    )
+    .innerJoin(
+      schoolAcademicYearsSchema,
+      eq(schoolStudentEnrollmentsSchema.academicYearId, schoolAcademicYearsSchema.id)
+    )
+    .where(eq(schoolStudentEnrollmentsSchema.id, anchor.enrollmentId))
+    .get();
+
+  if (!enrollment) throw new Error("Enrollment not found for this payment");
+
+  // ── 3. Ownership / permission check ────────────────────────────────────────
+  const isStaff = requestingUser.permissions.some(
+    (p) => p === "*" || STAFF_FEE_PERMISSIONS.includes(p)
+  );
+
+  if (!isStaff) {
+    const canViewOwn = requestingUser.permissions.includes("fees.student.view");
+    const canViewChild = requestingUser.permissions.includes("fees.parent.view");
+    let authorised = false;
+
+    if (canViewOwn && requestingUser.id === enrollment.studentId) {
+      authorised = true;
+    } else if (canViewChild) {
+      const relationship = await db
+        .select({ studentId: studentParentsSchema.studentId })
+        .from(studentParentsSchema)
+        .where(
+          and(
+            eq(studentParentsSchema.parentId, requestingUser.id),
+            eq(studentParentsSchema.studentId, enrollment.studentId)
+          )
+        )
+        .get();
+      authorised = !!relationship;
+    }
+
+    if (!authorised) {
+      throw new Error("Unauthorized: you do not have access to this receipt");
+    }
+  }
+
+  // ── 4. Expand to the full batch (or just this row if batchId is null) ─────
+  const batchCondition = anchor.batchId
+    ? eq(schoolFeePaymentsSchema.batchId, anchor.batchId)
+    : eq(schoolFeePaymentsSchema.id, anchor.id);
+
+  const paymentRows = await db
+    .select({
+      id: schoolFeePaymentsSchema.id,
+      feeStructureId: schoolFeePaymentsSchema.feeStructureId,
+      studentFeeAssignmentId: schoolFeePaymentsSchema.studentFeeAssignmentId,
+      amountPaid: schoolFeePaymentsSchema.amountPaid,
+      paymentMethod: schoolFeePaymentsSchema.paymentMethod,
+      paymentDate: schoolFeePaymentsSchema.paymentDate,
+      receiptNumber: schoolFeePaymentsSchema.receiptNumber,
+      notes: schoolFeePaymentsSchema.notes,
+      isVoid: schoolFeePaymentsSchema.isVoid,
+      recordedBy: schoolFeePaymentsSchema.recordedBy,
+      batchId: schoolFeePaymentsSchema.batchId,
+    })
+    .from(schoolFeePaymentsSchema)
+    .where(and(eq(schoolFeePaymentsSchema.enrollmentId, anchor.enrollmentId), batchCondition))
+    .orderBy(schoolFeePaymentsSchema.id)
+    .all();
+
+  if (paymentRows.length === 0) throw new Error("Payment not found");
+
+  // ── 5. Resolve fee-type / month / original-amount context per row ─────────
+  const structureIds = paymentRows
+    .map((p: any) => p.feeStructureId)
+    .filter((id: any): id is number => id !== null);
+  const assignmentIds = paymentRows
+    .map((p: any) => p.studentFeeAssignmentId)
+    .filter((id: any): id is number => id !== null);
+
+  const structures = structureIds.length
+    ? await db
+        .select({
+          id: schoolFeeStructuresSchema.id,
+          feeType: schoolFeeStructuresSchema.feeType,
+          feeMonth: schoolFeeStructuresSchema.feeMonth,
+          amount: schoolFeeStructuresSchema.amount,
+        })
+        .from(schoolFeeStructuresSchema)
+        .where(inArray(schoolFeeStructuresSchema.id, structureIds))
+        .all()
+    : [];
+
+  const assignments = assignmentIds.length
+    ? await db
+        .select({
+          id: schoolStudentFeeAssignmentsSchema.id,
+          feeType: schoolStudentFeeAssignmentsSchema.feeType,
+          feeMonth: schoolStudentFeeAssignmentsSchema.feeMonth,
+          amount: schoolStudentFeeAssignmentsSchema.amount,
+        })
+        .from(schoolStudentFeeAssignmentsSchema)
+        .where(inArray(schoolStudentFeeAssignmentsSchema.id, assignmentIds))
+        .all()
+    : [];
+
+  const structureMap = new Map(structures.map((s: any) => [s.id, s]));
+  const assignmentMap = new Map(assignments.map((a: any) => [a.id, a]));
+
+  // Concessions aren't versioned historically — surfacing the CURRENTLY
+  // active concession per fee is a reasonable, clearly-labeled approximation
+  // for receipt display, matching how the rest of the fees module treats them.
+  const structureConcessions = structureIds.length
+    ? await db
+        .select({
+          feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
+          concessionType: schoolFeeConcessionsSchema.concessionType,
+          concessionValue: schoolFeeConcessionsSchema.concessionValue,
+        })
+        .from(schoolFeeConcessionsSchema)
+        .where(
+          and(
+            eq(schoolFeeConcessionsSchema.enrollmentId, anchor.enrollmentId),
+            inArray(schoolFeeConcessionsSchema.feeStructureId, structureIds)
+          )
+        )
+        .all()
+    : [];
+
+  const assignmentConcessions = assignmentIds.length
+    ? await db
+        .select({
+          studentFeeAssignmentId: schoolFeeConcessionsSchema.studentFeeAssignmentId,
+          concessionType: schoolFeeConcessionsSchema.concessionType,
+          concessionValue: schoolFeeConcessionsSchema.concessionValue,
+        })
+        .from(schoolFeeConcessionsSchema)
+        .where(
+          and(
+            eq(schoolFeeConcessionsSchema.enrollmentId, anchor.enrollmentId),
+            inArray(schoolFeeConcessionsSchema.studentFeeAssignmentId, assignmentIds)
+          )
+        )
+        .all()
+    : [];
+
+  const structureConcessionMap = new Map(
+    structureConcessions.map((c: any) => [c.feeStructureId, c])
+  );
+  const assignmentConcessionMap = new Map(
+    assignmentConcessions.map((c: any) => [c.studentFeeAssignmentId, c])
+  );
+
+  // ── 6. Assemble line items ─────────────────────────────────────────────────
+  const items: FeeReceiptLineItem[] = paymentRows.map((p: any) => {
+    if (p.feeStructureId) {
+      const s = structureMap.get(p.feeStructureId);
+      const conc = structureConcessionMap.get(p.feeStructureId) ?? null;
+      const originalAmount = s?.amount ?? p.amountPaid;
+      const concessionAmount = conc
+        ? conc.concessionType === "FIXED"
+          ? conc.concessionValue
+          : Math.floor((originalAmount * conc.concessionValue) / 100)
+        : 0;
+      return {
+        id: p.id,
+        receiptNumber: p.receiptNumber,
+        source: "STRUCTURE" as const,
+        feeType: s?.feeType ?? "Fee",
+        feeMonth: s?.feeMonth ?? null,
+        originalAmount,
+        concessionAmount,
+        effectiveAmount: Math.max(0, originalAmount - concessionAmount),
+        amountPaid: p.amountPaid,
+        isVoid: p.isVoid,
+      };
+    }
+    const a = p.studentFeeAssignmentId ? assignmentMap.get(p.studentFeeAssignmentId) : null;
+    const conc = p.studentFeeAssignmentId
+      ? assignmentConcessionMap.get(p.studentFeeAssignmentId) ?? null
+      : null;
+    const originalAmount = a?.amount ?? p.amountPaid;
+    const concessionAmount = conc
+      ? conc.concessionType === "FIXED"
+        ? conc.concessionValue
+        : Math.floor((originalAmount * conc.concessionValue) / 100)
+      : 0;
+    return {
+      id: p.id,
+      receiptNumber: p.receiptNumber,
+      source: "ASSIGNMENT" as const,
+      feeType: a?.feeType ?? "Custom Fee",
+      feeMonth: a?.feeMonth ?? null,
+      originalAmount,
+      concessionAmount,
+      effectiveAmount: Math.max(0, originalAmount - concessionAmount),
+      amountPaid: p.amountPaid,
+      isVoid: p.isVoid,
+    };
+  });
+
+  // ── 7. Recorded-by staff name ────────────────────────────────────────────
+  const recordedByIds = [...new Set(paymentRows.map((p: any) => p.recordedBy))];
+  const recordedByRows = recordedByIds.length
+    ? await db
+        .select({ id: schoolUsersSchema.id, name: schoolUsersSchema.name })
+        .from(schoolUsersSchema)
+        .where(inArray(schoolUsersSchema.id, recordedByIds))
+        .all()
+    : [];
+  const recordedByName = recordedByRows[0]?.name ?? null;
+
+  // ── 8. School branding ────────────────────────────────────────────────────
+  const school = await getSchoolBrandingForReceipt(db);
+
+  const primary = paymentRows[0];
+  const totalPaid = items.filter((i) => !i.isVoid).reduce((s, i) => s + i.amountPaid, 0);
+
+  return {
+    batchId: anchor.batchId,
+    primaryReceiptNumber: primary.receiptNumber,
+    paymentDate: primary.paymentDate,
+    paymentMethod: primary.paymentMethod,
+    notes: primary.notes,
+    totalPaid,
+    items,
+    recordedByName,
+    student: {
+      name: enrollment.studentName,
+      rollNumber: enrollment.rollNumber ?? null,
+      className: enrollment.className,
+      sectionName: enrollment.sectionName,
+      academicYearName: enrollment.academicYearName,
+    },
+    school,
+  };
+}
+
+// ── School branding for receipts ─────────────────────────────────────────
+// Takes the already-open db handle from the caller instead of (env, schoolCode)
+// — getFeeReceipt() already has a live connection via getSchoolDB(), so
+// re-resolving the tenant DB here would open a second redundant connection
+// to the same database for no reason. Queries the schools table directly
+// (single-row table, id always 1 per tenant DB — see schoolsSchema comment).
+// Falls back to empty strings only if the row is somehow missing, so a
+// broken receipt never throws.
+async function getSchoolBrandingForReceipt(
+  db: any
+): Promise<FeeReceiptData["school"]> {
+  const school = await db
+    .select({
+      name: schoolsSchema.name,
+      shortName: schoolsSchema.shortName,
+      logoUrl: schoolsSchema.logoUrl,
+      addressLineOne: schoolsSchema.addressLineOne,
+      addressLineTwo: schoolsSchema.addressLineTwo,
+      phone: schoolsSchema.phone,
+      email: schoolsSchema.email,
+    })
+    .from(schoolsSchema)
+    .get();
+
+  return {
+    name: school?.name ?? "",
+    shortName: school?.shortName || null,
+    logoUrl: school?.logoUrl || null,
+    addressLineOne: school?.addressLineOne ?? "",
+    addressLineTwo: school?.addressLineTwo ?? "",
+    phone: school?.phone ?? "",
+    email: school?.email ?? "",
+  };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PAYMENTS FOR A SINGLE FEE ITEM (powers FeeItemPaymentHistoryDialogComponent)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface FeeItemPaymentRow {
+  id: number;
+  receiptNumber: string;
+  amountPaid: number;
+  paymentMethod: "CASH" | "CHECK" | "BANK_TRANSFER";
+  paymentDate: string;
+  isVoid: boolean;
+  batchId: string | null;
+  /** True when this payment's batch also covers other fee items — i.e. it
+   *  was collected together with something else in one checkout. */
+  hasSiblingsOutsideThisItem: boolean;
+}
+
+export async function getPaymentsForFeeItem(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  enrollmentId: number,
+  source: "STRUCTURE" | "ASSIGNMENT",
+  feeId: number
+): Promise<FeeItemPaymentRow[]> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const condition =
+    source === "STRUCTURE"
+      ? eq(schoolFeePaymentsSchema.feeStructureId, feeId)
+      : eq(schoolFeePaymentsSchema.studentFeeAssignmentId, feeId);
+
+  const rows = await db
+    .select({
+      id: schoolFeePaymentsSchema.id,
+      receiptNumber: schoolFeePaymentsSchema.receiptNumber,
+      amountPaid: schoolFeePaymentsSchema.amountPaid,
+      paymentMethod: schoolFeePaymentsSchema.paymentMethod,
+      paymentDate: schoolFeePaymentsSchema.paymentDate,
+      isVoid: schoolFeePaymentsSchema.isVoid,
+      batchId: schoolFeePaymentsSchema.batchId,
+    })
+    .from(schoolFeePaymentsSchema)
+    .where(and(eq(schoolFeePaymentsSchema.enrollmentId, enrollmentId), condition))
+    .orderBy(desc(schoolFeePaymentsSchema.paymentDate), desc(schoolFeePaymentsSchema.id))
+    .all();
+
+  if (rows.length === 0) return [];
+
+  // ── Figure out which batches have rows OUTSIDE this fee item ──────────────
+  const batchIds = [...new Set(rows.map((r: any) => r.batchId).filter(Boolean))] as string[];
+
+  const totalRowsPerBatchRaw = batchIds.length
+    ? await db
+        .select({
+          batchId: schoolFeePaymentsSchema.batchId,
+          count: sql<number>`COUNT(*)`,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(inArray(schoolFeePaymentsSchema.batchId, batchIds))
+        .groupBy(schoolFeePaymentsSchema.batchId)
+        .all()
+    : [];
+
+  const rowsPerBatchForThisItem = new Map<string, number>();
+  rows.forEach((r: any) => {
+    if (!r.batchId) return;
+    rowsPerBatchForThisItem.set(r.batchId, (rowsPerBatchForThisItem.get(r.batchId) ?? 0) + 1);
+  });
+  const totalRowsPerBatch = new Map<string, number>(
+    totalRowsPerBatchRaw.map((s: any) => [s.batchId, s.count])
+  );
+
+  return rows.map((r: any) => ({
+    id: r.id,
+    receiptNumber: r.receiptNumber,
+    amountPaid: r.amountPaid,
+    paymentMethod: r.paymentMethod,
+    paymentDate: r.paymentDate,
+    isVoid: r.isVoid,
+    batchId: r.batchId,
+    hasSiblingsOutsideThisItem: r.batchId
+      ? (totalRowsPerBatch.get(r.batchId) ?? 0) > (rowsPerBatchForThisItem.get(r.batchId) ?? 0)
+      : false,
+  }));
+}
+

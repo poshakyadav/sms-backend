@@ -158,6 +158,25 @@ export type Env = {
     //   wrangler secret put R2_AVATARS_PUBLIC_URL
     R2_AVATARS_BUCKET_NAME: string;
     R2_AVATARS_PUBLIC_URL: string;
+
+    // Separate bucket from feed/avatars — school logos are one-per-school,
+    // replace-in-place branding assets used in headers, sidebars, ID cards,
+    // and receipts. Same R2 account/credentials; only bucket + public URL differ.
+    //
+    // R2_LOGOS_BUCKET_NAME: e.g. "school-logos"
+    // R2_LOGOS_PUBLIC_URL: the public base URL for the bucket — either the
+    //   default r2.dev subdomain or a custom domain mapped to the bucket.
+    //   No trailing slash.
+    //
+    // Local dev (.dev.vars — never commit):
+    //   R2_LOGOS_BUCKET_NAME = "school-logos"
+    //   R2_LOGOS_PUBLIC_URL = "https://pub-zzzz.r2.dev"
+    //
+    // Production (wrangler secret put):
+    //   wrangler secret put R2_LOGOS_BUCKET_NAME
+    //   wrangler secret put R2_LOGOS_PUBLIC_URL
+    R2_LOGOS_BUCKET_NAME: string;
+    R2_LOGOS_PUBLIC_URL: string;
   };
   Variables: {
     jwtPayload?: any;

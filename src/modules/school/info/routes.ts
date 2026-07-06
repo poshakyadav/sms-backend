@@ -14,7 +14,7 @@ import {
   schoolTokenValidationMiddleware,
 } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
-import { getSchoolInfo, updateSchoolInfo } from "./services";
+import { getSchoolInfo, removeSchoolLogoImage, updateSchoolInfo, uploadSchoolLogoImage } from "./services";
 
 const schoolInfoRouter = new Hono<SchoolEnv>();
 
@@ -63,7 +63,6 @@ const updateSchoolInfoSchema = z.object({
   alternatePhone: z.string().max(20).optional(),
   email: z.string().email().optional().or(z.literal("")),
   website: z.string().url().optional().or(z.literal("")),
-  logoUrl: z.string().url().optional().or(z.literal("")),
   tagline: z.string().max(300).optional().or(z.literal("")),
 });
 
@@ -92,6 +91,79 @@ schoolInfoRouter.put(
         {
           success: false,
           error: error.message || "Failed to update school info",
+        },
+        400
+      );
+    }
+  }
+);
+
+// ==================== UPLOAD / REPLACE SCHOOL LOGO ====================
+// POST /school/info/logo
+// Body: multipart/form-data with a single field "logo" containing the
+// already-compressed image (WebP, square, ≤ ~100KB) produced client-side.
+schoolInfoRouter.post(
+  "/logo",
+  requirePermission("settings.manage"),
+  async (c) => {
+    try {
+      const body = await c.req.parseBody();
+      const file = body["logo"];
+
+      if (!file || typeof file === "string") {
+        return c.json({ success: false, error: "No image file provided" }, 400);
+      }
+
+      const arrayBuffer = await (file as File).arrayBuffer();
+      const contentType = (file as File).type || "image/webp";
+
+      if (!contentType.startsWith("image/")) {
+        return c.json({ success: false, error: "File must be an image" }, 400);
+      }
+
+      const schoolCode = c.get("schoolCode")!;
+      const result = await uploadSchoolLogoImage(
+        c.env,
+        schoolCode,
+        arrayBuffer,
+        contentType
+      );
+
+      return c.json({
+        success: true,
+        message: "School logo updated successfully",
+        logoUrl: result.logoUrl,
+      });
+    } catch (error: any) {
+      console.error("School logo upload error:", error);
+      return c.json(
+        {
+          success: false,
+          error: error.message || "Failed to upload school logo",
+        },
+        400
+      );
+    }
+  }
+);
+
+// ==================== REMOVE SCHOOL LOGO ====================
+// POST /school/info/logo/remove
+schoolInfoRouter.post(
+  "/logo/remove",
+  requirePermission("settings.manage"),
+  async (c) => {
+    try {
+      const schoolCode = c.get("schoolCode")!;
+      await removeSchoolLogoImage(c.env, schoolCode);
+
+      return c.json({ success: true, message: "School logo removed" });
+    } catch (error: any) {
+      console.error("School logo remove error:", error);
+      return c.json(
+        {
+          success: false,
+          error: error.message || "Failed to remove school logo",
         },
         400
       );

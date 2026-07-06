@@ -8,6 +8,7 @@ import { eq, sql } from "drizzle-orm";
 import { schoolsSchema } from "../../../db/schemas/school";
 import { getSchoolDB } from "../../../db/school-client";
 import { SchoolEnv } from "../../../types/common-types";
+import { deleteSchoolLogo, uploadSchoolLogo } from "../../../utils/school/logo-storage";
 
 // ==================== GET SCHOOL INFO ====================
 export async function getSchoolInfo(
@@ -53,7 +54,6 @@ export async function updateSchoolInfo(
     alternatePhone?: string;
     email?: string;
     website?: string;
-    logoUrl?: string;
     tagline?: string;
   }
 ) {
@@ -77,7 +77,6 @@ export async function updateSchoolInfo(
     updateData.alternatePhone = data.alternatePhone;
   if (data.email !== undefined) updateData.email = data.email;
   if (data.website !== undefined) updateData.website = data.website;
-  if (data.logoUrl !== undefined) updateData.logoUrl = data.logoUrl;
   if (data.tagline !== undefined) updateData.tagline = data.tagline;
 
   if (Object.keys(updateData).length <= 1) {
@@ -87,4 +86,105 @@ export async function updateSchoolInfo(
   await db.update(schoolsSchema).set(updateData);
 
   return { message: "School information updated successfully" };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCHOOL LOGO UPLOAD / REMOVE
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Uploads (or replaces) the school's logo.
+ *
+ * Single-image invariant: a school has at most ONE logo at a time. If a
+ * logo already exists, the OLD R2 object is deleted only AFTER the new one
+ * uploads successfully — this ordering means a failed upload never leaves
+ * the school without its previous logo.
+ *
+ * `bytes` is expected to already be compressed/resized client-side
+ * (square, ≤ ~100KB, WebP) — this function does not re-compress; it trusts
+ * the frontend contract, same as uploadSchoolUserAvatar.
+ */
+export async function uploadSchoolLogoImage(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  bytes: ArrayBuffer,
+  contentType: string
+): Promise<{ logoUrl: string }> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const school = await db
+    .select({
+      id: schoolsSchema.id,
+      logoKey: schoolsSchema.logoKey,
+    })
+    .from(schoolsSchema)
+    .get();
+
+  if (!school) throw new Error("School not found");
+
+  // Server-side size guard — defense in depth even though the frontend
+  // compresses before sending. Logos get a slightly higher ceiling than
+  // avatars since some schools use detailed crests/emblems.
+  const MAX_LOGO_BYTES = 150 * 1024;
+  if (bytes.byteLength > MAX_LOGO_BYTES) {
+    throw new Error(
+      `Image is too large (${Math.round(
+        bytes.byteLength / 1024
+      )}KB). Please use a smaller image.`
+    );
+  }
+
+  const { url, key } = await uploadSchoolLogo(env, {
+    schoolId: school.id,
+    bytes,
+    contentType,
+  });
+
+  const previousKey = school.logoKey;
+
+  await db
+    .update(schoolsSchema)
+    .set({
+      logoUrl: url,
+      logoKey: key,
+      updatedAt: sql`CURRENT_TIMESTAMP`,
+    })
+    .where(eq(schoolsSchema.id, school.id));
+
+  // Clean up the OLD object only after the new one is confirmed saved.
+  if (previousKey && previousKey !== key) {
+    await deleteSchoolLogo(env, previousKey);
+  }
+
+  return { logoUrl: url };
+}
+
+/**
+ * Removes the school's logo entirely (back to no-logo/initials fallback).
+ */
+export async function removeSchoolLogoImage(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string
+): Promise<void> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const school = await db
+    .select({ id: schoolsSchema.id, logoKey: schoolsSchema.logoKey })
+    .from(schoolsSchema)
+    .get();
+
+  if (!school) throw new Error("School not found");
+
+  await db
+    .update(schoolsSchema)
+    .set({
+      logoUrl: "",
+      logoKey: "",
+      updatedAt: sql`CURRENT_TIMESTAMP`,
+    })
+    .where(eq(schoolsSchema.id, school.id));
+
+  if (school.logoKey) {
+    await deleteSchoolLogo(env, school.logoKey);
+  }
 }

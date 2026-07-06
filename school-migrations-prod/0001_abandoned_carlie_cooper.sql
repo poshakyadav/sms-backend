@@ -1,0 +1,1 @@
+ALTER TABLE `fee_payments` ADD `batch_id` text;
