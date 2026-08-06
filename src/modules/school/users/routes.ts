@@ -516,9 +516,9 @@ const studentProfileFields = {
 
   /**
    * Social category as per UDISE+ code book.
-   * 1=General, 2=SC, 3=ST, 4=OBC, 5=OBC-NCL.
+   * 1=General, 2=SC, 3=ST, 4=OBC, 5=OBC-NCL, 6=Minority.
    */
-  socialCategory: z.number().int().min(1).max(5).optional().nullable(),
+  socialCategory: z.number().int().min(1).max(6).optional().nullable(),
 
   /**
    * Religion as per UDISE+ code book.

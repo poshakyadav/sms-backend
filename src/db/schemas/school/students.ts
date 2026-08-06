@@ -20,6 +20,7 @@ export const SocialCategory = {
   ST: 3, // Scheduled Tribe
   OBC: 4, // Other Backward Class
   OBC_NCL: 5, // OBC – Non Creamy Layer (some state variants)
+  MINORITY: 6, // Minority community (state-variant UDISE+ category, distinct from religious minority flag)
 } as const;
 export type SocialCategoryValue =
   (typeof SocialCategory)[keyof typeof SocialCategory];

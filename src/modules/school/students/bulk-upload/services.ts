@@ -85,6 +85,9 @@ const SOCIAL_CATEGORY_MAP: Record<string, number> = {
   "5": 5,
   "obc-ncl": 5,
   "obc ncl": 5,
+  "6": 6,
+  minority: 6,
+  "minority community": 6,
 };
 
 const RELIGION_MAP: Record<string, number> = {
@@ -523,7 +526,7 @@ function validateRow(row: BulkStudentRow): string | null {
     row.socialCategoryRaw &&
     resolveSocialCategory(row.socialCategoryRaw) === null
   )
-    return `Invalid social category "${row.socialCategoryRaw}". Use 1–5 or: General, SC, ST, OBC, OBC-NCL`;
+  return `Invalid social category "${row.socialCategoryRaw}". Use 1–6 or: General, SC, ST, OBC, OBC-NCL, Minority`;
   if (row.religionRaw && resolveReligion(row.religionRaw) === null)
     return `Invalid religion "${row.religionRaw}". Use 1–8 or: Hindu, Muslim, Christian, Sikh, Buddhist, Jain, Others, No Religion`;
   return null;
