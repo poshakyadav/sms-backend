@@ -1,3 +1,5 @@
+// .../src/modules/school/academics/class-sections/services.ts
+
 import { and, eq, inArray, sql } from "drizzle-orm";
 import {
   schoolClassesSchema,
@@ -10,7 +12,7 @@ import { getSchoolDB } from "../../../../db/school-client";
 import { SchoolEnv } from "../../../../types/common-types";
 
 /** Single source of truth — mirrors the value in routes.ts and the frontend. */
-const MAX_CAPACITY = 50;
+const MAX_CAPACITY = 100;
 
 // ==================== CREATE (single) ====================
 export async function createClassSection(
@@ -43,7 +45,7 @@ export async function createClassSection(
     throw new Error("This class-section combination already exists");
 
   // Guard: capacity cap (belt-and-suspenders — Zod already rejects >50)
-  const capacity = data.capacity ?? 40;
+  const capacity = data.capacity ?? 100;
   if (capacity > MAX_CAPACITY) {
     throw new Error(
       `Capacity cannot exceed ${MAX_CAPACITY} students per section`
@@ -163,7 +165,7 @@ export async function bulkCreateClassSections(
       toInsert.map((r) => ({
         classId: r.classId,
         sectionId: r.sectionId,
-        capacity: Math.min(r.capacity ?? 40, MAX_CAPACITY),
+        capacity: Math.min(r.capacity ?? 100, MAX_CAPACITY),
         classTeacherId: r.classTeacherId ?? null,
         roomNumber: r.roomNumber ?? null,
         isActive: r.isActive ?? true,

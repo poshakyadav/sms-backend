@@ -34,7 +34,7 @@ classSectionsRouter.use(
 const classSectionSchema = z.object({
   classId: z.number().int().positive(),
   sectionId: z.number().int().positive(),
-  capacity: z.number().int().min(1).max(MAX_CAPACITY).default(40),
+  capacity: z.number().int().min(1).max(MAX_CAPACITY).default(100),
   classTeacherId: z.number().int().positive().optional().nullable(),
   roomNumber: z.string().optional().nullable(),
   isActive: z.boolean().default(true),
@@ -47,7 +47,7 @@ const bulkCreateSchema = z.object({
       z.object({
         classId: z.number().int().positive(),
         sectionId: z.number().int().positive(),
-        capacity: z.number().int().min(1).max(MAX_CAPACITY).default(40),
+        capacity: z.number().int().min(1).max(MAX_CAPACITY).default(100),
         classTeacherId: z.number().int().positive().optional().nullable(),
         roomNumber: z.string().optional().nullable(),
         isActive: z.boolean().default(true),
