@@ -31,6 +31,7 @@ export async function generateSchoolTokens(
     id: number;
     name: string;
     email?: string;
+    username: string; // required, every user has one
     schoolCode: string;
     permissions: string[]; 
     tokenVersion: number; 
@@ -43,7 +44,7 @@ export async function generateSchoolTokens(
   let permissions = user.permissions;
   
   if (!permissions || permissions.length === 0) {
-    console.log(`🔍 Fetching permissions for user ${user.id} from DB...`);
+    // console.log(`🔍 Fetching permissions for user ${user.id} from DB...`);
     permissions = await getUserPermissionsFromDB(db, user.id);
   }
 
@@ -53,6 +54,7 @@ export async function generateSchoolTokens(
       id: user.id,
       name: user.name,
       email: user.email ?? "",
+      username: user.username,
       schoolCode: user.schoolCode,
       permissions: permissions as string[],
       tokenVersion: user.tokenVersion,

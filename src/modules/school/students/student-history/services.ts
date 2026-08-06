@@ -178,6 +178,7 @@ function buildSearchConditions(params: {
   q?: string;
   name?: string;
   email?: string;
+  username?: string;
   phone?: string;
   admissionNumber?: string;
   fatherName?: string;
@@ -195,9 +196,11 @@ function buildSearchConditions(params: {
       or(
         // Exact matches (higher relevance, but OR is fine here)
         sql`LOWER(${schoolUsersSchema.email}) = ${exactTerm}`,
+        sql`LOWER(${schoolUsersSchema.username}) = ${exactTerm}`,
         sql`LOWER(${studentsSchema.admissionNumber}) = ${exactTerm}`,
         // Partial matches
         sql`LOWER(${schoolUsersSchema.name}) LIKE ${term}`,
+        sql`LOWER(${schoolUsersSchema.username}) LIKE ${term}`,
         sql`LOWER(${schoolUsersSchema.phone}) LIKE ${term}`,
         sql`LOWER(${schoolUsersSchema.alternatePhone}) LIKE ${term}`,
         sql`LOWER(${schoolUsersSchema.fatherName}) LIKE ${term}`,
@@ -214,10 +217,18 @@ function buildSearchConditions(params: {
     const t = `%${params.name.trim().toLowerCase()}%`;
     conditions.push(sql`LOWER(${schoolUsersSchema.name}) LIKE ${t}`);
   }
+
   if (params.email?.trim()) {
     const t = `%${params.email.trim().toLowerCase()}%`;
     conditions.push(sql`LOWER(${schoolUsersSchema.email}) LIKE ${t}`);
   }
+
+  // students without an email can still be filtered by username
+  if (params.username?.trim()) {
+    const t = `%${params.username.trim().toLowerCase()}%`;
+    conditions.push(sql`LOWER(${schoolUsersSchema.username}) LIKE ${t}`);
+  }
+
   if (params.phone?.trim()) {
     const t = `%${params.phone.trim()}%`;
     conditions.push(
@@ -227,6 +238,7 @@ function buildSearchConditions(params: {
       )
     );
   }
+
   if (params.admissionNumber?.trim()) {
     const t = `%${params.admissionNumber.trim()}%`;
     conditions.push(sql`LOWER(${studentsSchema.admissionNumber}) LIKE ${t}`);
@@ -277,7 +289,8 @@ function buildStatusCondition(
 export interface StudentSearchResult {
   id: number;
   name: string;
-  email: string;
+  email: string | null;   // CHANGED  was `string`, schema made it nullable
+  username: string;       // always present, NOT NULL in schema
   phone: string | null;
   admissionNumber: string | null;
   avatarUrl: string | null;
@@ -325,6 +338,7 @@ export async function searchStudents(
       id: schoolUsersSchema.id,
       name: schoolUsersSchema.name,
       email: schoolUsersSchema.email,
+      username: schoolUsersSchema.username,
       phone: schoolUsersSchema.phone,
       avatarUrl: schoolUsersSchema.avatarUrl,
       isActive: schoolUsersSchema.isActive,
@@ -442,6 +456,7 @@ export async function searchStudents(
       id: r.id,
       name: r.name,
       email: r.email,
+      username: r.username,
       phone: r.phone || null,
       admissionNumber: r.admissionNumber || null,
       avatarUrl: r.avatarUrl || null,
@@ -481,6 +496,7 @@ export async function getAllStudentsHistory(
     q?: string;
     name?: string;
     email?: string;
+    username?: string; 
     phone?: string;
     admissionNumber?: string;
     fatherName?: string;
@@ -503,6 +519,7 @@ export async function getAllStudentsHistory(
     q: options.q,
     name: options.name,
     email: options.email,
+    username: options.username, 
     phone: options.phone,
     admissionNumber: options.admissionNumber,
     fatherName: options.fatherName,
@@ -553,6 +570,7 @@ export async function getAllStudentsHistory(
       id: schoolUsersSchema.id,
       name: schoolUsersSchema.name,
       email: schoolUsersSchema.email,
+      username: schoolUsersSchema.username,
       phone: schoolUsersSchema.phone,
       alternatePhone: schoolUsersSchema.alternatePhone,
       avatarUrl: schoolUsersSchema.avatarUrl,
@@ -763,6 +781,7 @@ export async function getAllStudentsHistory(
       id: s.id,
       name: s.name,
       email: s.email,
+      username: s.username, 
       phone: s.phone || null,
       alternatePhone: s.alternatePhone || null,
       avatarUrl: s.avatarUrl || null,
@@ -835,6 +854,7 @@ export async function getStudentHistorySummary(
       id: schoolUsersSchema.id,
       name: schoolUsersSchema.name,
       email: schoolUsersSchema.email,
+      username: schoolUsersSchema.username,
       primaryRole: schoolUsersSchema.primaryRole,
       avatarUrl: schoolUsersSchema.avatarUrl,
       isActive: schoolUsersSchema.isActive,
@@ -985,6 +1005,7 @@ export async function getStudentHistorySummary(
       parentId: studentParentsSchema.parentId,
       parentName: schoolUsersSchema.name,
       parentEmail: schoolUsersSchema.email,
+      parentUsername: schoolUsersSchema.username,
       parentPhone: schoolUsersSchema.phone,
       relationship: studentParentsSchema.relationship,
       isPrimary: studentParentsSchema.isPrimary,
@@ -1107,6 +1128,7 @@ export async function getStudentHistory(
       id: schoolUsersSchema.id,
       name: schoolUsersSchema.name,
       email: schoolUsersSchema.email,
+      username: schoolUsersSchema.username, 
       primaryRole: schoolUsersSchema.primaryRole,
       avatarUrl: schoolUsersSchema.avatarUrl,
       gender: schoolUsersSchema.gender,
@@ -1294,6 +1316,7 @@ export async function getStudentHistory(
         isPrimary: studentParentsSchema.isPrimary,
         parentName: schoolUsersSchema.name,
         parentEmail: schoolUsersSchema.email,
+        parentUsername: schoolUsersSchema.username, 
         parentPhone: schoolUsersSchema.phone,
       })
       .from(studentParentsSchema)
@@ -1321,6 +1344,7 @@ export async function getStudentHistory(
           parentId: link.parentId,
           parentName: link.parentName,
           parentEmail: link.parentEmail,
+          parentUsername: link.parentUsername,
           parentPhone: link.parentPhone,
           relationship: link.relationship,
           isPrimary: link.isPrimary,
@@ -1845,6 +1869,7 @@ export async function getStudentHistory(
       id: studentRow.id,
       name: studentRow.name,
       email: studentRow.email,
+      username: studentRow.username,
       primaryRole: studentRow.primaryRole,
       avatarUrl: studentRow.avatarUrl || null,
       admissionNumber: studentRow.admissionNumber || null,

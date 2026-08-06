@@ -220,7 +220,7 @@ export async function createConcession(
     if (data.concessionValue > baseAmount) {
       throw new Error(
         `Fixed concession (₹${data.concessionValue / 100}) cannot exceed ` +
-          `fee amount (₹${baseAmount / 100})`
+        `fee amount (₹${baseAmount / 100})`
       );
     }
   }
@@ -228,18 +228,18 @@ export async function createConcession(
   // ── Duplicate active concession guard ─────────────────────────────────────
   const duplicateConditions = data.feeStructureId
     ? and(
-        eq(schoolFeeConcessionsSchema.enrollmentId, data.enrollmentId),
-        eq(schoolFeeConcessionsSchema.feeStructureId, data.feeStructureId),
-        eq(schoolFeeConcessionsSchema.isActive, true)
-      )
+      eq(schoolFeeConcessionsSchema.enrollmentId, data.enrollmentId),
+      eq(schoolFeeConcessionsSchema.feeStructureId, data.feeStructureId),
+      eq(schoolFeeConcessionsSchema.isActive, true)
+    )
     : and(
-        eq(schoolFeeConcessionsSchema.enrollmentId, data.enrollmentId),
-        eq(
-          schoolFeeConcessionsSchema.studentFeeAssignmentId,
-          data.studentFeeAssignmentId!
-        ),
-        eq(schoolFeeConcessionsSchema.isActive, true)
-      );
+      eq(schoolFeeConcessionsSchema.enrollmentId, data.enrollmentId),
+      eq(
+        schoolFeeConcessionsSchema.studentFeeAssignmentId,
+        data.studentFeeAssignmentId!
+      ),
+      eq(schoolFeeConcessionsSchema.isActive, true)
+    );
 
   const existing = await db
     .select({ id: schoolFeeConcessionsSchema.id })
@@ -250,7 +250,7 @@ export async function createConcession(
   if (existing) {
     throw new Error(
       "An active concession already exists for this fee. Revoke it first, " +
-        "then create a new one."
+      "then create a new one."
     );
   }
 
@@ -509,8 +509,8 @@ export async function createBulkMonthlyAssignments(
   if (existingCheck) {
     throw new Error(
       `Active ${data.feeType} assignments already exist for one or more months ` +
-        `in the range ${data.startMonth}–${data.endMonth} for this enrollment. ` +
-        `Cancel existing assignments first.`
+      `in the range ${data.startMonth}–${data.endMonth} for this enrollment. ` +
+      `Cancel existing assignments first.`
     );
   }
 
@@ -708,8 +708,8 @@ export async function createBulkMonthlyFeeStructures(
   if (existingCheck) {
     throw new Error(
       `Fee structures for ${data.feeType} already exist for one or more months ` +
-        `in the range ${data.startMonth}–${data.endMonth} for this class-section. ` +
-        `Delete existing structures first if you need to recreate them.`
+      `in the range ${data.startMonth}–${data.endMonth} for this class-section. ` +
+      `Delete existing structures first if you need to recreate them.`
     );
   }
 
@@ -773,15 +773,15 @@ export async function recordFeePayment(
     data.payments && data.payments.length > 0
       ? data.payments
       : data.feeStructureId && data.amountPaid
-      ? [{ feeStructureId: data.feeStructureId, amountPaid: data.amountPaid }]
-      : data.studentFeeAssignmentId && data.amountPaid
-      ? [
-          {
-            studentFeeAssignmentId: data.studentFeeAssignmentId,
-            amountPaid: data.amountPaid,
-          },
-        ]
-      : [];
+        ? [{ feeStructureId: data.feeStructureId, amountPaid: data.amountPaid }]
+        : data.studentFeeAssignmentId && data.amountPaid
+          ? [
+            {
+              studentFeeAssignmentId: data.studentFeeAssignmentId,
+              amountPaid: data.amountPaid,
+            },
+          ]
+          : [];
 
   if (paymentsToProcess.length === 0)
     throw new Error("No payment data provided");
@@ -895,12 +895,12 @@ export async function recordFeePayment(
             : "no discount";
           throw new Error(
             `Payment ₹${(p.amountPaid / 100).toFixed(2)} exceeds remaining ` +
-              `balance ₹${(remainingBalance / 100).toFixed(
-                2
-              )} for ${feeType}. ` +
-              `Effective amount (after ${concessionDesc}): ` +
-              `₹${(effectiveAmount / 100).toFixed(2)}, ` +
-              `already paid: ₹${(alreadyPaid / 100).toFixed(2)}.`
+            `balance ₹${(remainingBalance / 100).toFixed(
+              2
+            )} for ${feeType}. ` +
+            `Effective amount (after ${concessionDesc}): ` +
+            `₹${(effectiveAmount / 100).toFixed(2)}, ` +
+            `already paid: ₹${(alreadyPaid / 100).toFixed(2)}.`
           );
         }
       } else if (p.studentFeeAssignmentId) {
@@ -969,17 +969,17 @@ export async function recordFeePayment(
             ? assignmentConcession.concessionType === "PERCENTAGE"
               ? `${assignmentConcession.concessionValue}% discount`
               : `₹${(assignmentConcession.concessionValue / 100).toFixed(
-                  2
-                )} discount`
+                2
+              )} discount`
             : "no discount";
           throw new Error(
             `Payment ₹${(p.amountPaid / 100).toFixed(2)} exceeds remaining ` +
-              `balance ₹${(remainingBalance / 100).toFixed(
-                2
-              )} for ${feeType}. ` +
-              `Effective amount (after ${concessionDesc}): ` +
-              `₹${(effectiveAmount / 100).toFixed(2)}, ` +
-              `already paid: ₹${(alreadyPaid / 100).toFixed(2)}.`
+            `balance ₹${(remainingBalance / 100).toFixed(
+              2
+            )} for ${feeType}. ` +
+            `Effective amount (after ${concessionDesc}): ` +
+            `₹${(effectiveAmount / 100).toFixed(2)}, ` +
+            `already paid: ₹${(alreadyPaid / 100).toFixed(2)}.`
           );
         }
       }
@@ -1020,7 +1020,7 @@ export async function recordFeePayment(
       .where(eq(schoolUsersSchema.id, enrollment.studentId))
       .get();
 
-    if (student) {
+    if (student && student.email) {
       const paymentLines = insertedPayments
         .map(
           (p: any) =>
@@ -1033,16 +1033,14 @@ export async function recordFeePayment(
       const emailData: BrevoSendEmailRequest = {
         sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
         to: [{ email: student.email, name: student.name }],
-        subject: `Fee Payment Receipt${
-          insertedPayments.length > 1 ? "s" : ""
-        } — ${receiptNumbers.join(", ")}`,
+        subject: `Fee Payment Receipt${insertedPayments.length > 1 ? "s" : ""
+          } — ${receiptNumbers.join(", ")}`,
         htmlContent: `
           <h2>Fee Payment Receipt</h2>
           <p><strong>Total Amount Paid:</strong> ₹${(
             totalPaidNow / 100
           ).toLocaleString("en-IN")}</p>
-          <p><strong>Payment Date:</strong> ${
-            insertedPayments[0].paymentDate
+          <p><strong>Payment Date:</strong> ${insertedPayments[0].paymentDate
           }</p>
           <p><strong>Method:</strong> ${data.paymentMethod}</p>
           <ul>${paymentLines}</ul>
@@ -1052,14 +1050,17 @@ export async function recordFeePayment(
       sendTransactionalEmail(env, emailData).catch((err: any) =>
         console.error("Receipt email failed:", err)
       );
+    } else if (student) {
+      console.log(
+        `Student ${enrollment.studentId} has no email on file — fee payment recorded but receipt email skipped. Receipt(s) still viewable via GET /fees/receipt/:paymentId.`
+      );
     }
 
     return {
       payment: insertedPayments[0],
       payments: insertedPayments,
-      message: `${
-        insertedPayments.length > 1 ? "Payments" : "Payment"
-      } recorded and receipt sent`,
+      message: `${insertedPayments.length > 1 ? "Payments" : "Payment"
+        } recorded and receipt sent`,
       meta: {
         receiptNumbers,
         totalPaid: totalPaidNow,
@@ -1326,29 +1327,29 @@ export async function getStudentOwnFees(
     const assignmentPayments =
       assignments.length > 0
         ? await db
-            .select({
-              studentFeeAssignmentId:
-                schoolFeePaymentsSchema.studentFeeAssignmentId,
-              amountPaid: schoolFeePaymentsSchema.amountPaid,
-              id: schoolFeePaymentsSchema.id,
-              paymentDate: schoolFeePaymentsSchema.paymentDate,
-              paymentMethod: schoolFeePaymentsSchema.paymentMethod,
-              receiptNumber: schoolFeePaymentsSchema.receiptNumber,
-              notes: schoolFeePaymentsSchema.notes,
-            })
-            .from(schoolFeePaymentsSchema)
-            .where(
-              and(
-                eq(
-                  schoolFeePaymentsSchema.enrollmentId,
-                  enrollment.enrollmentId
-                ),
-                eq(schoolFeePaymentsSchema.isVoid, false),
-                sql`${schoolFeePaymentsSchema.studentFeeAssignmentId} IS NOT NULL`
-              )
+          .select({
+            studentFeeAssignmentId:
+              schoolFeePaymentsSchema.studentFeeAssignmentId,
+            amountPaid: schoolFeePaymentsSchema.amountPaid,
+            id: schoolFeePaymentsSchema.id,
+            paymentDate: schoolFeePaymentsSchema.paymentDate,
+            paymentMethod: schoolFeePaymentsSchema.paymentMethod,
+            receiptNumber: schoolFeePaymentsSchema.receiptNumber,
+            notes: schoolFeePaymentsSchema.notes,
+          })
+          .from(schoolFeePaymentsSchema)
+          .where(
+            and(
+              eq(
+                schoolFeePaymentsSchema.enrollmentId,
+                enrollment.enrollmentId
+              ),
+              eq(schoolFeePaymentsSchema.isVoid, false),
+              sql`${schoolFeePaymentsSchema.studentFeeAssignmentId} IS NOT NULL`
             )
-            .orderBy(desc(schoolFeePaymentsSchema.paymentDate))
-            .all()
+          )
+          .orderBy(desc(schoolFeePaymentsSchema.paymentDate))
+          .all()
         : [];
 
     const structurePaidMap = new Map<number, number>();
@@ -1513,7 +1514,7 @@ export async function getStudentOwnFees(
 
 export interface ParentChildFeeOverview extends StudentFeeOverview {
   studentName: string;
-  studentEmail: string;
+  studentEmail: string | null; // email is now optional on school_users
   studentId: number;
 }
 
@@ -1601,7 +1602,7 @@ export async function createFeeStructure(
     if (duplicate) {
       throw new Error(
         `A fee structure for ${data.feeType} in ${data.feeMonth} already exists ` +
-          `for this class-section. Delete or update the existing structure instead.`
+        `for this class-section. Delete or update the existing structure instead.`
       );
     }
   }
@@ -2069,20 +2070,20 @@ export async function getFeeReport(
   const structurePaymentRows =
     feeStructureIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeePaymentsSchema.enrollmentId,
-            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-          })
-          .from(schoolFeePaymentsSchema)
-          .where(
-            and(
-              inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds),
-              inArray(schoolFeePaymentsSchema.feeStructureId, feeStructureIds),
-              eq(schoolFeePaymentsSchema.isVoid, false)
-            )
+        .select({
+          enrollmentId: schoolFeePaymentsSchema.enrollmentId,
+          totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(
+          and(
+            inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds),
+            inArray(schoolFeePaymentsSchema.feeStructureId, feeStructureIds),
+            eq(schoolFeePaymentsSchema.isVoid, false)
           )
-          .groupBy(schoolFeePaymentsSchema.enrollmentId)
-          .all()
+        )
+        .groupBy(schoolFeePaymentsSchema.enrollmentId)
+        .all()
       : [];
 
   const structurePaidMap = new Map<number, number>(
@@ -2092,21 +2093,21 @@ export async function getFeeReport(
   const allConcessions =
     feeStructureIds.length > 0 && enrollmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
-            feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
-            concessionType: schoolFeeConcessionsSchema.concessionType,
-            concessionValue: schoolFeeConcessionsSchema.concessionValue,
-          })
-          .from(schoolFeeConcessionsSchema)
-          .where(
-            and(
-              inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
-              eq(schoolFeeConcessionsSchema.isActive, true),
-              sql`${schoolFeeConcessionsSchema.feeStructureId} IS NOT NULL`
-            )
+        .select({
+          enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
+          feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
+          concessionType: schoolFeeConcessionsSchema.concessionType,
+          concessionValue: schoolFeeConcessionsSchema.concessionValue,
+        })
+        .from(schoolFeeConcessionsSchema)
+        .where(
+          and(
+            inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
+            eq(schoolFeeConcessionsSchema.isActive, true),
+            sql`${schoolFeeConcessionsSchema.feeStructureId} IS NOT NULL`
           )
-          .all()
+        )
+        .all()
       : [];
 
   const concessionsByEnrollment = new Map<number, Map<number, any>>();
@@ -2121,26 +2122,26 @@ export async function getFeeReport(
   const customAssignments =
     enrollmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolStudentFeeAssignmentsSchema.enrollmentId,
-            amount: schoolStudentFeeAssignmentsSchema.amount,
-            id: schoolStudentFeeAssignmentsSchema.id,
-          })
-          .from(schoolStudentFeeAssignmentsSchema)
-          .where(
-            and(
-              inArray(
-                schoolStudentFeeAssignmentsSchema.enrollmentId,
-                enrollmentIds
-              ),
-              eq(
-                schoolStudentFeeAssignmentsSchema.academicYearId,
-                academicYearId
-              ),
-              eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
-            )
+        .select({
+          enrollmentId: schoolStudentFeeAssignmentsSchema.enrollmentId,
+          amount: schoolStudentFeeAssignmentsSchema.amount,
+          id: schoolStudentFeeAssignmentsSchema.id,
+        })
+        .from(schoolStudentFeeAssignmentsSchema)
+        .where(
+          and(
+            inArray(
+              schoolStudentFeeAssignmentsSchema.enrollmentId,
+              enrollmentIds
+            ),
+            eq(
+              schoolStudentFeeAssignmentsSchema.academicYearId,
+              academicYearId
+            ),
+            eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
           )
-          .all()
+        )
+        .all()
       : [];
 
   const customTotalMap = new Map<number, number>();
@@ -2157,24 +2158,24 @@ export async function getFeeReport(
   const allAssignmentConcessions =
     customAssignmentIds.length > 0 && enrollmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
-            assignmentId: schoolFeeConcessionsSchema.studentFeeAssignmentId,
-            concessionType: schoolFeeConcessionsSchema.concessionType,
-            concessionValue: schoolFeeConcessionsSchema.concessionValue,
-          })
-          .from(schoolFeeConcessionsSchema)
-          .where(
-            and(
-              inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
-              inArray(
-                schoolFeeConcessionsSchema.studentFeeAssignmentId,
-                customAssignmentIds
-              ),
-              eq(schoolFeeConcessionsSchema.isActive, true)
-            )
+        .select({
+          enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
+          assignmentId: schoolFeeConcessionsSchema.studentFeeAssignmentId,
+          concessionType: schoolFeeConcessionsSchema.concessionType,
+          concessionValue: schoolFeeConcessionsSchema.concessionValue,
+        })
+        .from(schoolFeeConcessionsSchema)
+        .where(
+          and(
+            inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
+            inArray(
+              schoolFeeConcessionsSchema.studentFeeAssignmentId,
+              customAssignmentIds
+            ),
+            eq(schoolFeeConcessionsSchema.isActive, true)
           )
-          .all()
+        )
+        .all()
       : [];
 
   // Map: enrollmentId → Map<assignmentId, concession>
@@ -2190,22 +2191,22 @@ export async function getFeeReport(
   const customPaymentRows =
     customAssignmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeePaymentsSchema.enrollmentId,
-            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-          })
-          .from(schoolFeePaymentsSchema)
-          .where(
-            and(
-              inArray(
-                schoolFeePaymentsSchema.studentFeeAssignmentId,
-                customAssignmentIds
-              ),
-              eq(schoolFeePaymentsSchema.isVoid, false)
-            )
+        .select({
+          enrollmentId: schoolFeePaymentsSchema.enrollmentId,
+          totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(
+          and(
+            inArray(
+              schoolFeePaymentsSchema.studentFeeAssignmentId,
+              customAssignmentIds
+            ),
+            eq(schoolFeePaymentsSchema.isVoid, false)
           )
-          .groupBy(schoolFeePaymentsSchema.enrollmentId)
-          .all()
+        )
+        .groupBy(schoolFeePaymentsSchema.enrollmentId)
+        .all()
       : [];
 
   const customPaidMap = new Map<number, number>(
@@ -2292,11 +2293,30 @@ export async function getFeeReport(
 // STUDENTS BY CLASS-SECTION
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ─────────────────────────────────────────────────────────────────────────────
+// STUDENTS BY CLASS-SECTION (row shape — mirrors frontend StudentForPayment)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface StudentForPaymentRow {
+  id: number;
+  name: string;
+  email: string | null; // school_users.email is nullable now
+  rollNumber: string | null;
+  enrollmentId: number;
+  totalOriginal: number;
+  totalConcession: number;
+  totalAssigned: number;
+  totalPaid: number;
+  balance: number;
+}
+
+
 export async function getStudentsByClassSection(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   classSectionId: number
-) {
+): Promise<StudentForPaymentRow[]> {
+
   const db = await getSchoolDB(env, schoolCode);
 
   const currentYear = await db
@@ -2363,20 +2383,20 @@ export async function getStudentsByClassSection(
   const structurePaymentRows =
     feeStructureIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeePaymentsSchema.enrollmentId,
-            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-          })
-          .from(schoolFeePaymentsSchema)
-          .where(
-            and(
-              inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds),
-              inArray(schoolFeePaymentsSchema.feeStructureId, feeStructureIds),
-              eq(schoolFeePaymentsSchema.isVoid, false)
-            )
+        .select({
+          enrollmentId: schoolFeePaymentsSchema.enrollmentId,
+          totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(
+          and(
+            inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds),
+            inArray(schoolFeePaymentsSchema.feeStructureId, feeStructureIds),
+            eq(schoolFeePaymentsSchema.isVoid, false)
           )
-          .groupBy(schoolFeePaymentsSchema.enrollmentId)
-          .all()
+        )
+        .groupBy(schoolFeePaymentsSchema.enrollmentId)
+        .all()
       : [];
 
   const structurePaidMap = new Map<number, number>(
@@ -2387,21 +2407,21 @@ export async function getStudentsByClassSection(
   const allStructureConcessions =
     feeStructureIds.length > 0 && enrollmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
-            feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
-            concessionType: schoolFeeConcessionsSchema.concessionType,
-            concessionValue: schoolFeeConcessionsSchema.concessionValue,
-          })
-          .from(schoolFeeConcessionsSchema)
-          .where(
-            and(
-              inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
-              eq(schoolFeeConcessionsSchema.isActive, true),
-              sql`${schoolFeeConcessionsSchema.feeStructureId} IS NOT NULL`
-            )
+        .select({
+          enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
+          feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
+          concessionType: schoolFeeConcessionsSchema.concessionType,
+          concessionValue: schoolFeeConcessionsSchema.concessionValue,
+        })
+        .from(schoolFeeConcessionsSchema)
+        .where(
+          and(
+            inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
+            eq(schoolFeeConcessionsSchema.isActive, true),
+            sql`${schoolFeeConcessionsSchema.feeStructureId} IS NOT NULL`
           )
-          .all()
+        )
+        .all()
       : [];
 
   const structureConcessionsByEnrollment = new Map<number, Map<number, any>>();
@@ -2417,26 +2437,26 @@ export async function getStudentsByClassSection(
   const customAssignments =
     enrollmentIds.length > 0
       ? await db
-          .select({
-            id: schoolStudentFeeAssignmentsSchema.id,
-            enrollmentId: schoolStudentFeeAssignmentsSchema.enrollmentId,
-            amount: schoolStudentFeeAssignmentsSchema.amount,
-          })
-          .from(schoolStudentFeeAssignmentsSchema)
-          .where(
-            and(
-              inArray(
-                schoolStudentFeeAssignmentsSchema.enrollmentId,
-                enrollmentIds
-              ),
-              eq(
-                schoolStudentFeeAssignmentsSchema.academicYearId,
-                currentYear.id
-              ),
-              eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
-            )
+        .select({
+          id: schoolStudentFeeAssignmentsSchema.id,
+          enrollmentId: schoolStudentFeeAssignmentsSchema.enrollmentId,
+          amount: schoolStudentFeeAssignmentsSchema.amount,
+        })
+        .from(schoolStudentFeeAssignmentsSchema)
+        .where(
+          and(
+            inArray(
+              schoolStudentFeeAssignmentsSchema.enrollmentId,
+              enrollmentIds
+            ),
+            eq(
+              schoolStudentFeeAssignmentsSchema.academicYearId,
+              currentYear.id
+            ),
+            eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
           )
-          .all()
+        )
+        .all()
       : [];
 
   // Map: enrollmentId → total original custom amount
@@ -2454,25 +2474,25 @@ export async function getStudentsByClassSection(
   const allAssignmentConcessions =
     customAssignmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
-            studentFeeAssignmentId:
+        .select({
+          enrollmentId: schoolFeeConcessionsSchema.enrollmentId,
+          studentFeeAssignmentId:
+            schoolFeeConcessionsSchema.studentFeeAssignmentId,
+          concessionType: schoolFeeConcessionsSchema.concessionType,
+          concessionValue: schoolFeeConcessionsSchema.concessionValue,
+        })
+        .from(schoolFeeConcessionsSchema)
+        .where(
+          and(
+            inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
+            inArray(
               schoolFeeConcessionsSchema.studentFeeAssignmentId,
-            concessionType: schoolFeeConcessionsSchema.concessionType,
-            concessionValue: schoolFeeConcessionsSchema.concessionValue,
-          })
-          .from(schoolFeeConcessionsSchema)
-          .where(
-            and(
-              inArray(schoolFeeConcessionsSchema.enrollmentId, enrollmentIds),
-              inArray(
-                schoolFeeConcessionsSchema.studentFeeAssignmentId,
-                customAssignmentIds
-              ),
-              eq(schoolFeeConcessionsSchema.isActive, true)
-            )
+              customAssignmentIds
+            ),
+            eq(schoolFeeConcessionsSchema.isActive, true)
           )
-          .all()
+        )
+        .all()
       : [];
 
   // Map: enrollmentId → Map<assignmentId, concession>
@@ -2489,22 +2509,22 @@ export async function getStudentsByClassSection(
   const customPaymentRows =
     customAssignmentIds.length > 0
       ? await db
-          .select({
-            enrollmentId: schoolFeePaymentsSchema.enrollmentId,
-            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-          })
-          .from(schoolFeePaymentsSchema)
-          .where(
-            and(
-              inArray(
-                schoolFeePaymentsSchema.studentFeeAssignmentId,
-                customAssignmentIds
-              ),
-              eq(schoolFeePaymentsSchema.isVoid, false)
-            )
+        .select({
+          enrollmentId: schoolFeePaymentsSchema.enrollmentId,
+          totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(
+          and(
+            inArray(
+              schoolFeePaymentsSchema.studentFeeAssignmentId,
+              customAssignmentIds
+            ),
+            eq(schoolFeePaymentsSchema.isVoid, false)
           )
-          .groupBy(schoolFeePaymentsSchema.enrollmentId)
-          .all()
+        )
+        .groupBy(schoolFeePaymentsSchema.enrollmentId)
+        .all()
       : [];
 
   const customPaidMap = new Map<number, number>(
@@ -2563,7 +2583,7 @@ export async function getStudentsByClassSection(
     return {
       id: e.studentId,
       name: e.name,
-      email: e.email,
+      email: e.email, // now correctly typed as string | null via the return annotation
       rollNumber: e.rollNumber ?? null,
       enrollmentId: e.enrollmentId,
       totalOriginal, // standard + custom original amounts
@@ -2679,22 +2699,22 @@ export async function getDueFeesForEnrollment(
   const assignmentPayments =
     assignments.length > 0
       ? await db
-          .select({
-            studentFeeAssignmentId:
+        .select({
+          studentFeeAssignmentId:
+            schoolFeePaymentsSchema.studentFeeAssignmentId,
+          amountPaid: schoolFeePaymentsSchema.amountPaid,
+        })
+        .from(schoolFeePaymentsSchema)
+        .where(
+          and(
+            inArray(
               schoolFeePaymentsSchema.studentFeeAssignmentId,
-            amountPaid: schoolFeePaymentsSchema.amountPaid,
-          })
-          .from(schoolFeePaymentsSchema)
-          .where(
-            and(
-              inArray(
-                schoolFeePaymentsSchema.studentFeeAssignmentId,
-                assignments.map((a: any) => a.id)
-              ),
-              eq(schoolFeePaymentsSchema.isVoid, false)
-            )
+              assignments.map((a: any) => a.id)
+            ),
+            eq(schoolFeePaymentsSchema.isVoid, false)
           )
-          .all()
+        )
+        .all()
       : [];
 
   const assignmentPaidMap = new Map<number, number>();
@@ -2860,6 +2880,8 @@ export async function getFeesDashboard(
     if (current) academicYearId = current.id;
   }
 
+  // ── STANDARD FEES — unchanged, already correctly scoped ───────────────────
+
   const assignedResult = await db
     .select({
       totalAssigned: sql<number>`COALESCE(SUM(${schoolFeeStructuresSchema.amount}), 0)`,
@@ -2877,9 +2899,6 @@ export async function getFeesDashboard(
     )
     .get();
 
-  // ── Structure-level concession total (floored to avoid fractional paise) ──
-  // CAST(FLOOR(...)) mirrors the JS-side applyDiscount() Math.floor so that
-  // dashboard totals match per-student ledger calculations exactly.
   const concessionResult = await db
     .select({
       totalConcession: sql<number>`COALESCE(SUM(
@@ -2941,22 +2960,40 @@ export async function getFeesDashboard(
     )
     .get();
 
+  // ═══════════════════════════════════════════════════════════════════════
+  // FIX: CUSTOM FEE STATS — previously ignored classSectionId entirely.
+  // student_fee_assignments has no classSectionId column of its own (only
+  // enrollmentId), so each query below now joins through
+  // school_student_enrollments to scope by the student's actual
+  // class-section — mirroring how collectedResult already scopes
+  // structure payments above.
+  // ═══════════════════════════════════════════════════════════════════════
+
   const customAssignedResult = await db
     .select({
       totalCustom: sql<number>`COALESCE(SUM(${schoolStudentFeeAssignmentsSchema.amount}), 0)`,
     })
     .from(schoolStudentFeeAssignmentsSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolStudentFeeAssignmentsSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
     .where(
       and(
         academicYearId
           ? eq(schoolStudentFeeAssignmentsSchema.academicYearId, academicYearId)
+          : undefined,
+        classSectionId
+          ? eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId)
           : undefined,
         eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
       )
     )
     .get();
 
-  // ── Assignment-level concession total (floored to avoid fractional paise) ──
   const customConcessionResult = await db
     .select({
       totalCustomConcession: sql<number>`COALESCE(SUM(
@@ -2978,12 +3015,22 @@ export async function getFeesDashboard(
         schoolStudentFeeAssignmentsSchema.id
       )
     )
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolStudentFeeAssignmentsSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
     .where(
       and(
         eq(schoolFeeConcessionsSchema.isActive, true),
         sql`${schoolFeeConcessionsSchema.studentFeeAssignmentId} IS NOT NULL`,
         academicYearId
           ? eq(schoolStudentFeeAssignmentsSchema.academicYearId, academicYearId)
+          : undefined,
+        classSectionId
+          ? eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId)
           : undefined,
         eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
       )
@@ -3002,10 +3049,20 @@ export async function getFeesDashboard(
         schoolStudentFeeAssignmentsSchema.id
       )
     )
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolStudentFeeAssignmentsSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
     .where(
       and(
         academicYearId
           ? eq(schoolStudentFeeAssignmentsSchema.academicYearId, academicYearId)
+          : undefined,
+        classSectionId
+          ? eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId)
           : undefined,
         eq(schoolFeePaymentsSchema.isVoid, false)
       )
@@ -3017,30 +3074,32 @@ export async function getFeesDashboard(
       today: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
     })
     .from(schoolFeePaymentsSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(schoolFeePaymentsSchema.enrollmentId, schoolStudentEnrollmentsSchema.id)
+    )
     .where(
       and(
         sql`date(${schoolFeePaymentsSchema.paymentDate}) = date('now')`,
-        eq(schoolFeePaymentsSchema.isVoid, false)
+        eq(schoolFeePaymentsSchema.isVoid, false),
+        academicYearId
+          ? eq(schoolStudentEnrollmentsSchema.academicYearId, academicYearId)
+          : undefined,
+        classSectionId
+          ? eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId)
+          : undefined
       )
     )
     .get();
 
-  // ── FIX (Bug 1): Overdue calculation — per-enrollment, class-section scoped ─
-  //
-  // Previous bugs:
-  //   A. allEnrollmentsForOverdue fetched ALL active enrollments school-wide
-  //      when classSectionId was given — now scoped by classSectionId.
-  //   B. The inner loop over overdueStructures ran for every enrollment in
-  //      overduePaidMap regardless of whether that enrollment belongs to the
-  //      same classSectionId as the overdue structure — now guarded by joining
-  //      enrollments to their classSectionId before iterating.
+  // ── OVERDUE — STANDARD (structure) fees — unchanged ────────────────────────
   let totalOverdue = 0;
 
   const overdueStructures = await db
     .select({
       id: schoolFeeStructuresSchema.id,
       amount: schoolFeeStructuresSchema.amount,
-      classSectionId: schoolFeeStructuresSchema.classSectionId, // kept for cross-check
+      classSectionId: schoolFeeStructuresSchema.classSectionId,
     })
     .from(schoolFeeStructuresSchema)
     .where(
@@ -3109,13 +3168,6 @@ export async function getFeesDashboard(
       overduePaidMap.get(r.enrollmentId)!.set(r.feeStructureId, r.totalPaid);
     });
 
-    // ── FIX (Bug 1A): Fetch enrollments scoped to the same classSectionId(s)
-    // as the overdue fee structures — NOT all active enrollments school-wide.
-    //
-    // When classSectionId is provided: filter to just that section.
-    // When no classSectionId (school-wide dashboard): filter to only the
-    // class-sections that actually have overdue structures, preventing
-    // cross-section contamination.
     const overdueSectionIds = [
       ...new Set(overdueStructures.map((s: any) => s.classSectionId)),
     ];
@@ -3132,7 +3184,6 @@ export async function getFeesDashboard(
           academicYearId
             ? eq(schoolStudentEnrollmentsSchema.academicYearId, academicYearId)
             : undefined,
-          // FIX (Bug 1A): scope to only the sections that have overdue structures
           inArray(
             schoolStudentEnrollmentsSchema.classSectionId,
             overdueSectionIds
@@ -3145,16 +3196,12 @@ export async function getFeesDashboard(
       const concessionByFee =
         overdueConcessionMap.get(enrollmentId) ?? new Map();
 
-      // FIX (Bug 1B): only iterate over structures that belong to the
-      // same classSectionId as this enrollment — prevents cross-section
-      // contamination when no classSectionId filter is active.
       const enrollmentRecord = allEnrollmentsForOverdue.find(
         (e: any) => e.enrollmentId === enrollmentId
       );
       if (!enrollmentRecord) continue;
 
       for (const fee of overdueStructures) {
-        // Guard: skip if this fee structure is for a different section
         if (fee.classSectionId !== enrollmentRecord.classSectionId) continue;
 
         const conc = concessionByFee.get(fee.id) ?? null;
@@ -3165,7 +3212,6 @@ export async function getFeesDashboard(
       }
     }
 
-    // Also include enrollments with NO payments (full balance overdue)
     const enrollmentsWithPayments = new Set(overduePaidMap.keys());
 
     for (const enrollment of allEnrollmentsForOverdue) {
@@ -3175,7 +3221,6 @@ export async function getFeesDashboard(
         overdueConcessionMap.get(enrollment.enrollmentId) ?? new Map();
 
       for (const fee of overdueStructures) {
-        // FIX (Bug 1B): skip structures from other sections
         if (fee.classSectionId !== enrollment.classSectionId) continue;
 
         const conc = concessionByFee.get(fee.id) ?? null;
@@ -3184,6 +3229,106 @@ export async function getFeesDashboard(
       }
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════
+  // NEW: OVERDUE — CUSTOM (assignment) fees.
+  // Previously totalOverdue only ever counted standard fee structures — an
+  // overdue transport/hostel fee never contributed to this figure at all,
+  // school-wide or per-section. Mirrors the structure logic above, scoped
+  // through the enrollment join since assignments have no classSectionId
+  // of their own.
+  // ═══════════════════════════════════════════════════════════════════════
+
+  const overdueAssignments = await db
+    .select({
+      id: schoolStudentFeeAssignmentsSchema.id,
+      amount: schoolStudentFeeAssignmentsSchema.amount,
+    })
+    .from(schoolStudentFeeAssignmentsSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolStudentFeeAssignmentsSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    .where(
+      and(
+        academicYearId
+          ? eq(schoolStudentFeeAssignmentsSchema.academicYearId, academicYearId)
+          : undefined,
+        classSectionId
+          ? eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId)
+          : undefined,
+        eq(schoolStudentFeeAssignmentsSchema.isCancelled, false),
+        sql`${schoolStudentFeeAssignmentsSchema.dueDate} IS NOT NULL`,
+        sql`date(${schoolStudentFeeAssignmentsSchema.dueDate}) < date('now')`
+      )
+    )
+    .all();
+
+  if (overdueAssignments.length > 0) {
+    const overdueAssignmentIds = overdueAssignments.map((a: any) => a.id);
+
+    const overdueAssignmentPayments = await db
+      .select({
+        studentFeeAssignmentId: schoolFeePaymentsSchema.studentFeeAssignmentId,
+        totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+      })
+      .from(schoolFeePaymentsSchema)
+      .where(
+        and(
+          inArray(
+            schoolFeePaymentsSchema.studentFeeAssignmentId,
+            overdueAssignmentIds
+          ),
+          eq(schoolFeePaymentsSchema.isVoid, false)
+        )
+      )
+      .groupBy(schoolFeePaymentsSchema.studentFeeAssignmentId)
+      .all();
+
+    const overdueAssignmentConcessions = await db
+      .select({
+        studentFeeAssignmentId: schoolFeeConcessionsSchema.studentFeeAssignmentId,
+        concessionType: schoolFeeConcessionsSchema.concessionType,
+        concessionValue: schoolFeeConcessionsSchema.concessionValue,
+      })
+      .from(schoolFeeConcessionsSchema)
+      .where(
+        and(
+          inArray(
+            schoolFeeConcessionsSchema.studentFeeAssignmentId,
+            overdueAssignmentIds
+          ),
+          eq(schoolFeeConcessionsSchema.isActive, true)
+        )
+      )
+      .all();
+
+    const overdueAssignmentConcessionMap = new Map<number, any>(
+      overdueAssignmentConcessions.map((c: any) => [
+        c.studentFeeAssignmentId,
+        c,
+      ])
+    );
+    const overdueAssignmentPaidMap = new Map<number, number>(
+      overdueAssignmentPayments.map((r: any) => [
+        r.studentFeeAssignmentId,
+        r.totalPaid,
+      ])
+    );
+
+    for (const a of overdueAssignments) {
+      const conc = overdueAssignmentConcessionMap.get(a.id) ?? null;
+      const effectiveAmount = applyDiscount(a.amount, conc);
+      const paid = overdueAssignmentPaidMap.get(a.id) ?? 0;
+      const remaining = effectiveAmount - paid;
+      if (remaining > 0) totalOverdue += remaining;
+    }
+  }
+
+  // ── Final assembly — unchanged ─────────────────────────────────────────────
 
   const totalAssigned = assignedResult?.totalAssigned ?? 0;
   const totalConcession = Math.floor(concessionResult?.totalConcession ?? 0);
@@ -3501,22 +3646,51 @@ export async function getFeesCollectionTrend(
     .all();
 }
 
+export interface ClassSectionBreakdownRow {
+  classSectionId: number;
+  className: string;
+  sectionName: string;
+  totalAssigned: number;
+  totalCollected: number;
+  totalCustomAssigned: number;
+  totalCustomCollected: number;
+}
+
 /**
- * FIX (Bug 4): Sort comparator was broken — || with localeCompare and a
- * ternary never returned 0, so equal elements were never considered equal
- * and ordering was non-deterministic for same class names.
+ * FIX (Bug 4, carried over): two-key sort comparator is a correct explicit
+ * cascade (localeCompare returns -1|0|1, never left ambiguous).
  *
- * Also fixes the double-count bug: payments are aggregated per fee structure
- * first (Step 2), then class-section totals are assembled in JS (Step 3).
+ * FIX (new): previously this function ONLY looked at fee_structures, so:
+ *   a) any class-section with custom fees (transport/hostel) but no
+ *      standard fee structures never appeared in the table at all — the
+ *      early `if (structures.length === 0) return []` bailed before custom
+ *      fees were even queried.
+ *   b) even for sections that DID appear, custom fee totals were invisible
+ *      — the breakdown never matched the (now-fixed) dashboard totals.
+ *
+ * student_fee_assignments has no classSectionId column of its own (only
+ * enrollmentId), so the custom-fee query joins through
+ * school_student_enrollments to recover it — same pattern used in
+ * getFeesDashboard().
+ *
+ * Rows are now keyed by classSectionId (not by a name-derived string) so
+ * two different class-sections that happen to share a class+section name
+ * are never silently merged.
+ *
+ * NOTE: neither half nets out concessions (this matches the ORIGINAL
+ * standard-fee behavior — totalAssigned here is the raw billed amount, not
+ * the concession-adjusted effective amount). If you want concession-aware
+ * totals in this table too, that's a further change — just ask.
  */
 export async function getFeesClassSectionBreakdown(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   academicYearId?: number,
   classSectionId?: number
-) {
+): Promise<ClassSectionBreakdownRow[]> {
   const db = await getSchoolDB(env, schoolCode);
 
+  // ── Standard fee structures ────────────────────────────────────────────────
   const structures = await db
     .select({
       id: schoolFeeStructuresSchema.id,
@@ -3550,58 +3724,140 @@ export async function getFeesClassSectionBreakdown(
     )
     .all();
 
-  if (structures.length === 0) return [];
-
   const structureIds = structures.map((s: any) => s.id);
 
-  const paymentTotals = await db
-    .select({
-      feeStructureId: schoolFeePaymentsSchema.feeStructureId,
-      totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
-    })
-    .from(schoolFeePaymentsSchema)
-    .where(
-      and(
-        inArray(schoolFeePaymentsSchema.feeStructureId, structureIds),
-        eq(schoolFeePaymentsSchema.isVoid, false)
-      )
-    )
-    .groupBy(schoolFeePaymentsSchema.feeStructureId)
-    .all();
+  const paymentTotals =
+    structureIds.length > 0
+      ? await db
+          .select({
+            feeStructureId: schoolFeePaymentsSchema.feeStructureId,
+            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+          })
+          .from(schoolFeePaymentsSchema)
+          .where(
+            and(
+              inArray(schoolFeePaymentsSchema.feeStructureId, structureIds),
+              eq(schoolFeePaymentsSchema.isVoid, false)
+            )
+          )
+          .groupBy(schoolFeePaymentsSchema.feeStructureId)
+          .all()
+      : [];
 
   const paidByStructure = new Map<number, number>(
     paymentTotals.map((r: any) => [r.feeStructureId, r.totalPaid])
   );
 
-  const breakdownMap = new Map<
-    string,
-    {
-      className: string;
-      sectionName: string;
-      totalAssigned: number;
-      totalCollected: number;
-    }
-  >();
+  // ── Custom fee assignments (transport/hostel/etc.) ─────────────────────────
+  // No classSectionId column of their own — recovered via the enrollment join.
+  const customAssignments = await db
+    .select({
+      id: schoolStudentFeeAssignmentsSchema.id,
+      amount: schoolStudentFeeAssignmentsSchema.amount,
+      classSectionId: schoolStudentEnrollmentsSchema.classSectionId,
+      className: schoolClassesSchema.name,
+      sectionName: schoolSectionsSchema.name,
+    })
+    .from(schoolStudentFeeAssignmentsSchema)
+    .innerJoin(
+      schoolStudentEnrollmentsSchema,
+      eq(
+        schoolStudentFeeAssignmentsSchema.enrollmentId,
+        schoolStudentEnrollmentsSchema.id
+      )
+    )
+    .innerJoin(
+      schoolClassSectionsSchema,
+      eq(
+        schoolStudentEnrollmentsSchema.classSectionId,
+        schoolClassSectionsSchema.id
+      )
+    )
+    .innerJoin(
+      schoolClassesSchema,
+      eq(schoolClassSectionsSchema.classId, schoolClassesSchema.id)
+    )
+    .innerJoin(
+      schoolSectionsSchema,
+      eq(schoolClassSectionsSchema.sectionId, schoolSectionsSchema.id)
+    )
+    .where(
+      and(
+        academicYearId
+          ? eq(schoolStudentFeeAssignmentsSchema.academicYearId, academicYearId)
+          : undefined,
+        classSectionId
+          ? eq(schoolStudentEnrollmentsSchema.classSectionId, classSectionId)
+          : undefined,
+        eq(schoolStudentFeeAssignmentsSchema.isCancelled, false)
+      )
+    )
+    .all();
+
+  const customAssignmentIds = customAssignments.map((a: any) => a.id);
+
+  const customPaymentTotals =
+    customAssignmentIds.length > 0
+      ? await db
+          .select({
+            studentFeeAssignmentId: schoolFeePaymentsSchema.studentFeeAssignmentId,
+            totalPaid: sql<number>`COALESCE(SUM(${schoolFeePaymentsSchema.amountPaid}), 0)`,
+          })
+          .from(schoolFeePaymentsSchema)
+          .where(
+            and(
+              inArray(
+                schoolFeePaymentsSchema.studentFeeAssignmentId,
+                customAssignmentIds
+              ),
+              eq(schoolFeePaymentsSchema.isVoid, false)
+            )
+          )
+          .groupBy(schoolFeePaymentsSchema.studentFeeAssignmentId)
+          .all()
+      : [];
+
+  const paidByAssignment = new Map<number, number>(
+    customPaymentTotals.map((r: any) => [r.studentFeeAssignmentId, r.totalPaid])
+  );
+
+  // ── Assemble — keyed by classSectionId, standard + custom merged ──────────
+  const breakdownMap = new Map<number, ClassSectionBreakdownRow>();
 
   for (const s of structures) {
-    const key = `${s.className}::${s.sectionName}`;
-    if (!breakdownMap.has(key)) {
-      breakdownMap.set(key, {
+    if (!breakdownMap.has(s.classSectionId)) {
+      breakdownMap.set(s.classSectionId, {
+        classSectionId: s.classSectionId,
         className: s.className,
         sectionName: s.sectionName,
         totalAssigned: 0,
         totalCollected: 0,
+        totalCustomAssigned: 0,
+        totalCustomCollected: 0,
       });
     }
-    const entry = breakdownMap.get(key)!;
+    const entry = breakdownMap.get(s.classSectionId)!;
     entry.totalAssigned += s.amount;
     entry.totalCollected += paidByStructure.get(s.id) ?? 0;
   }
 
-  // FIX (Bug 4): Correct two-key sort comparator.
-  // localeCompare returns -1 | 0 | 1. The previous `|| ternary ? -1 : 1`
-  // pattern never returned 0 for equal elements, making the secondary sort
-  // non-deterministic. The correct pattern is an explicit cascade.
+  for (const a of customAssignments) {
+    if (!breakdownMap.has(a.classSectionId)) {
+      breakdownMap.set(a.classSectionId, {
+        classSectionId: a.classSectionId,
+        className: a.className,
+        sectionName: a.sectionName,
+        totalAssigned: 0,
+        totalCollected: 0,
+        totalCustomAssigned: 0,
+        totalCustomCollected: 0,
+      });
+    }
+    const entry = breakdownMap.get(a.classSectionId)!;
+    entry.totalCustomAssigned += a.amount;
+    entry.totalCustomCollected += paidByAssignment.get(a.id) ?? 0;
+  }
+
   return Array.from(breakdownMap.values()).sort((a, b) => {
     const classComp = a.className.localeCompare(b.className);
     if (classComp !== 0) return classComp;
@@ -3819,28 +4075,28 @@ export async function getFeeReceipt(
 
   const structures = structureIds.length
     ? await db
-        .select({
-          id: schoolFeeStructuresSchema.id,
-          feeType: schoolFeeStructuresSchema.feeType,
-          feeMonth: schoolFeeStructuresSchema.feeMonth,
-          amount: schoolFeeStructuresSchema.amount,
-        })
-        .from(schoolFeeStructuresSchema)
-        .where(inArray(schoolFeeStructuresSchema.id, structureIds))
-        .all()
+      .select({
+        id: schoolFeeStructuresSchema.id,
+        feeType: schoolFeeStructuresSchema.feeType,
+        feeMonth: schoolFeeStructuresSchema.feeMonth,
+        amount: schoolFeeStructuresSchema.amount,
+      })
+      .from(schoolFeeStructuresSchema)
+      .where(inArray(schoolFeeStructuresSchema.id, structureIds))
+      .all()
     : [];
 
   const assignments = assignmentIds.length
     ? await db
-        .select({
-          id: schoolStudentFeeAssignmentsSchema.id,
-          feeType: schoolStudentFeeAssignmentsSchema.feeType,
-          feeMonth: schoolStudentFeeAssignmentsSchema.feeMonth,
-          amount: schoolStudentFeeAssignmentsSchema.amount,
-        })
-        .from(schoolStudentFeeAssignmentsSchema)
-        .where(inArray(schoolStudentFeeAssignmentsSchema.id, assignmentIds))
-        .all()
+      .select({
+        id: schoolStudentFeeAssignmentsSchema.id,
+        feeType: schoolStudentFeeAssignmentsSchema.feeType,
+        feeMonth: schoolStudentFeeAssignmentsSchema.feeMonth,
+        amount: schoolStudentFeeAssignmentsSchema.amount,
+      })
+      .from(schoolStudentFeeAssignmentsSchema)
+      .where(inArray(schoolStudentFeeAssignmentsSchema.id, assignmentIds))
+      .all()
     : [];
 
   const structureMap = new Map(structures.map((s: any) => [s.id, s]));
@@ -3851,36 +4107,36 @@ export async function getFeeReceipt(
   // for receipt display, matching how the rest of the fees module treats them.
   const structureConcessions = structureIds.length
     ? await db
-        .select({
-          feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
-          concessionType: schoolFeeConcessionsSchema.concessionType,
-          concessionValue: schoolFeeConcessionsSchema.concessionValue,
-        })
-        .from(schoolFeeConcessionsSchema)
-        .where(
-          and(
-            eq(schoolFeeConcessionsSchema.enrollmentId, anchor.enrollmentId),
-            inArray(schoolFeeConcessionsSchema.feeStructureId, structureIds)
-          )
+      .select({
+        feeStructureId: schoolFeeConcessionsSchema.feeStructureId,
+        concessionType: schoolFeeConcessionsSchema.concessionType,
+        concessionValue: schoolFeeConcessionsSchema.concessionValue,
+      })
+      .from(schoolFeeConcessionsSchema)
+      .where(
+        and(
+          eq(schoolFeeConcessionsSchema.enrollmentId, anchor.enrollmentId),
+          inArray(schoolFeeConcessionsSchema.feeStructureId, structureIds)
         )
-        .all()
+      )
+      .all()
     : [];
 
   const assignmentConcessions = assignmentIds.length
     ? await db
-        .select({
-          studentFeeAssignmentId: schoolFeeConcessionsSchema.studentFeeAssignmentId,
-          concessionType: schoolFeeConcessionsSchema.concessionType,
-          concessionValue: schoolFeeConcessionsSchema.concessionValue,
-        })
-        .from(schoolFeeConcessionsSchema)
-        .where(
-          and(
-            eq(schoolFeeConcessionsSchema.enrollmentId, anchor.enrollmentId),
-            inArray(schoolFeeConcessionsSchema.studentFeeAssignmentId, assignmentIds)
-          )
+      .select({
+        studentFeeAssignmentId: schoolFeeConcessionsSchema.studentFeeAssignmentId,
+        concessionType: schoolFeeConcessionsSchema.concessionType,
+        concessionValue: schoolFeeConcessionsSchema.concessionValue,
+      })
+      .from(schoolFeeConcessionsSchema)
+      .where(
+        and(
+          eq(schoolFeeConcessionsSchema.enrollmentId, anchor.enrollmentId),
+          inArray(schoolFeeConcessionsSchema.studentFeeAssignmentId, assignmentIds)
         )
-        .all()
+      )
+      .all()
     : [];
 
   const structureConcessionMap = new Map(
@@ -3942,10 +4198,10 @@ export async function getFeeReceipt(
   const recordedByIds = [...new Set(paymentRows.map((p: any) => p.recordedBy))];
   const recordedByRows = recordedByIds.length
     ? await db
-        .select({ id: schoolUsersSchema.id, name: schoolUsersSchema.name })
-        .from(schoolUsersSchema)
-        .where(inArray(schoolUsersSchema.id, recordedByIds))
-        .all()
+      .select({ id: schoolUsersSchema.id, name: schoolUsersSchema.name })
+      .from(schoolUsersSchema)
+      .where(inArray(schoolUsersSchema.id, recordedByIds))
+      .all()
     : [];
   const recordedByName = recordedByRows[0]?.name ?? null;
 
@@ -4063,14 +4319,14 @@ export async function getPaymentsForFeeItem(
 
   const totalRowsPerBatchRaw = batchIds.length
     ? await db
-        .select({
-          batchId: schoolFeePaymentsSchema.batchId,
-          count: sql<number>`COUNT(*)`,
-        })
-        .from(schoolFeePaymentsSchema)
-        .where(inArray(schoolFeePaymentsSchema.batchId, batchIds))
-        .groupBy(schoolFeePaymentsSchema.batchId)
-        .all()
+      .select({
+        batchId: schoolFeePaymentsSchema.batchId,
+        count: sql<number>`COUNT(*)`,
+      })
+      .from(schoolFeePaymentsSchema)
+      .where(inArray(schoolFeePaymentsSchema.batchId, batchIds))
+      .groupBy(schoolFeePaymentsSchema.batchId)
+      .all()
     : [];
 
   const rowsPerBatchForThisItem = new Map<string, number>();

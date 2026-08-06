@@ -17,7 +17,21 @@ export const schoolUsersSchema = sqliteTable("school_users", {
     .notNull()
     .default(1),
   name: text("name").notNull(),
-  email: text("email").notNull().unique(),
+  /**
+   * UNIQUE per school. Lowercase letters + digits only, must start with a
+   * letter (enforced in Zod + application-level validation — SQLite has no
+   * native regex CHECK support worth relying on here). Auto-generated at
+   * creation time if the admin doesn't supply one — see
+   * utils/school/username.ts and createSchoolUser().
+   */
+  username: text("username").notNull().unique(),
+
+  // Email is now OPTIONAL — a user can log in with just username+password.
+  // NOTE: SQLite treats every NULL as distinct for UNIQUE purposes, so
+  // multiple users with email = NULL is fine; only *actual* duplicate
+  // emails are rejected.
+  email: text("email").unique(),
+  
   passwordHash: text("password_hash").notNull(),
 
   // ── PRIMARY ROLE (immutable after creation) ────────────────────────────────

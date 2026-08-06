@@ -23,7 +23,9 @@ import {
   getAttendanceSummaryForStudent,
   getAttendanceByStudentSelf,
   getAttendanceByClassSection,
+  getAttendanceAuditLog,
 } from "./services";
+import { checkCalendarStatus, declareHoliday, getCalendarEntries, getMissingAttendanceReport, getWeeklyOffDays, previewHolidayImpact, removeCalendarOverride, setWeeklyOffDays, setWorkingDayOverride } from "./calendar-service";
 
 const attendanceRouter = new Hono<SchoolEnv>();
 
@@ -33,12 +35,15 @@ attendanceRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
 // SHARED SCHEMAS
 // ─────────────────────────────────────────────────────────────────────────────
 
-/**
- * Zod enum built directly from the canonical status tuple.
- * Adding a new status to AttendanceStatus auto-expands this validator —
- * no need to update routes separately.
- */
-const attendanceStatusEnum = z.enum(ALL_ATTENDANCE_STATUSES);
+// ── Defense in depth: reject HOLIDAY at the validation layer too, not just
+//    deep inside markAttendance(). ────────────────────────────────────────
+const attendanceStatusEnum = z.enum(ALL_ATTENDANCE_STATUSES).refine(
+  (v) => v !== AttendanceStatus.HOLIDAY,
+  {
+    message:
+      "HOLIDAY is not a valid per-student status — declare it on the attendance calendar instead (the calendar endpoints), not per student.",
+  }
+);
 
 /**
  * Per-student record within a batch mark request.
@@ -141,64 +146,34 @@ attendanceRouter.get(
   }
 );
 
+
 // ─────────────────────────────────────────────────────────────────────────────
-// GET /school/attendance/class — Full Class Sheet for a Date (Teacher view)
-//
-// Permission : attendance.mark
-// Query      : classSectionId, date
-//
-// UPDATED RESPONSE SHAPE (breaking change from old shape):
-//
-//   {
-//     session: {
-//       date: "2026-05-10",
-//       classSectionId: 12,
-//       isFullyMarked: false,       ← true only when every student has a record
-//       isPartiallyMarked: true,    ← true when ≥1 but not all students are marked
-//       markedCount: 18,
-//       totalCount: 42,
-//       lastMarkedBy: {
-//         userId: 7,
-//         name: "Priya Sharma"
-//       },
-//       lastUpdatedAt: "2026-05-10T08:32:14.000Z"
-//     },
-//     students: [
-//       {
-//         enrollmentId: 101,
-//         studentId: 55,
-//         studentName: "Aarav Singh",
-//         rollNumber: "3",
-//         avatarUrl: null,
-//         attendanceRecord: {          ← null when not yet marked for this date
-//           id: 2001,
-//           status: "PRESENT",
-//           halfDaySession: null,
-//           notes: null,
-//           markedBy: 7,
-//           markedByName: "Priya Sharma",
-//           updatedAt: "2026-05-10T08:32:14.000Z"
-//         }
-//       },
-//       {
-//         enrollmentId: 102,
-//         studentId: 56,
-//         studentName: "Diya Patel",
-//         rollNumber: "4",
-//         avatarUrl: null,
-//         attendanceRecord: null       ← not yet marked — default to PRESENT on frontend
-//       },
-//       ...
-//     ]
-//   }
-//
-// Frontend contract:
-//   1. Check session.isFullyMarked / isPartiallyMarked to show the status banner.
-//   2. Students with attendanceRecord === null have not been marked yet.
-//      Default their status to PRESENT in the form before the teacher submits.
-//   3. Students with attendanceRecord !== null show their existing status.
-//      Teacher can still edit (form is pre-populated).
+// GET /school/attendance/audit — Status change history for one student
+// Permission : attendance.report
 // ─────────────────────────────────────────────────────────────────────────────
+const auditSchema = z.object({
+  studentId: z.coerce.number().int().positive(),
+  fromDate: z.string().date(),
+  toDate: z.string().date(),
+});
+
+attendanceRouter.get(
+  "/audit",
+  requirePermission("attendance.report"),
+  zValidator("query", auditSchema),
+  async (c) => {
+    try {
+      const { studentId, fromDate, toDate } = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+      const log = await getAttendanceAuditLog(c.env, schoolCode, studentId, fromDate, toDate);
+      return c.json({ log });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+
 const classAttendanceSchema = z.object({
   classSectionId: z.coerce.number().int().positive(),
   date: z.string().date(),
@@ -420,6 +395,212 @@ attendanceRouter.get(
     } catch (error: any) {
       const status = error.message?.includes("Unauthorized") ? 403 : 400;
       return c.json({ error: error.message }, status);
+    }
+  }
+);
+
+// Calendar service routes are in a separate file (calendar-service.ts) to keep this file focused on attendance marking and reporting.
+
+const declareHolidaySchema = z.object({
+  fromDate: z.string().date(),
+  toDate: z.string().date(),
+  classSectionId: z.number().int().positive().optional(), // omitted = school-wide
+  reason: z.string().min(1).max(200),
+});
+
+attendanceRouter.post(
+  "/calendar/holiday",
+  requirePermission("attendance.calendar.manage"),
+  zValidator("json", declareHolidaySchema),
+  async (c) => {
+    try {
+      const data = c.req.valid("json");
+      const user = c.get("user")!;
+      const schoolCode = c.get("schoolCode")!;
+      const result = await declareHoliday(c.env, schoolCode, data, user.id);
+      return c.json(result, 201);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// ── classSectionId now optional on the working-day schema ──────────────────
+const workingDayOverrideSchema = z.object({
+  fromDate: z.string().date(),
+  toDate: z.string().date(),
+  classSectionId: z.number().int().positive().optional(), // omitted = school-wide declaration
+  reason: z.string().min(1).max(200),
+});
+
+attendanceRouter.post(
+  "/calendar/working-day",
+  requirePermission("attendance.calendar.manage"),
+  zValidator("json", workingDayOverrideSchema),
+  async (c) => {
+    try {
+      const data = c.req.valid("json");
+      const user = c.get("user")!;
+      const schoolCode = c.get("schoolCode")!;
+      const result = await setWorkingDayOverride(c.env, schoolCode, data, user.id);
+      return c.json(result, 201);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// GET current weekly-off configuration. Read access is scoped to
+// attendance.report (same permission used for /calendar entries) rather
+// than attendance.calendar.manage, since any staff building a report or
+// viewing the calendar legitimately needs to know which days are off.
+attendanceRouter.get(
+  "/calendar/weekly-off",
+  requirePermission("attendance.report"),
+  async (c) => {
+    try {
+      const schoolCode = c.get("schoolCode")!;
+      const weeklyOffDays = await getWeeklyOffDays(c.env, schoolCode);
+      return c.json({ weeklyOffDays });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+const weeklyOffSchema = z.object({
+  // 0=Sunday ... 6=Saturday. Empty array is valid (no weekly off at all).
+  days: z.array(z.number().int().min(0).max(6)).max(7),
+});
+
+attendanceRouter.put(
+  "/calendar/weekly-off",
+  requirePermission("attendance.calendar.manage"),
+  zValidator("json", weeklyOffSchema),
+  async (c) => {
+    try {
+      const { days } = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await setWeeklyOffDays(c.env, schoolCode, days);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+attendanceRouter.delete(
+  "/calendar/:id",
+  requirePermission("attendance.calendar.manage"),
+  async (c) => {
+    try {
+      const id = Number(c.req.param("id"));
+      const schoolCode = c.get("schoolCode")!;
+      const result = await removeCalendarOverride(c.env, schoolCode, id);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+
+// ── calendar query now accepts an optional classSectionId filter ───────────
+const calendarQuerySchema = z.object({
+  fromDate: z.string().date(),
+  toDate: z.string().date(),
+  classSectionId: z.coerce.number().int().positive().optional(),
+});
+
+attendanceRouter.get(
+  "/calendar",
+  requirePermission("attendance.report"),
+  zValidator("query", calendarQuerySchema),
+  async (c) => {
+    try {
+      const { fromDate, toDate, classSectionId } = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+      const entries = await getCalendarEntries(c.env, schoolCode, fromDate, toDate, classSectionId);
+      return c.json({ entries });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/calendar/check — the mark-attendance page's gate.
+// Permission: attendance.mark (any teacher who can reach the mark page
+// needs to be able to check whether they're allowed to use it).
+// ─────────────────────────────────────────────────────────────────────────
+const calendarCheckSchema = z.object({
+  classSectionId: z.coerce.number().int().positive(),
+  date: z.string().date(),
+});
+
+attendanceRouter.get(
+  "/calendar/check",
+  requirePermission("attendance.mark"),
+  zValidator("query", calendarCheckSchema),
+  async (c) => {
+    try {
+      const { classSectionId, date } = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+      const result = await checkCalendarStatus(c.env, schoolCode, classSectionId, date);
+      return c.json(result);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+// ─────────────────────────────────────────────────────────────────────────
+// GET /school/attendance/calendar/holiday-impact — read-only preview,
+// called before declareHoliday so the UI can show a danger dialog first.
+// ─────────────────────────────────────────────────────────────────────────
+const holidayImpactSchema = z.object({
+  fromDate: z.string().date(),
+  toDate: z.string().date(),
+  classSectionId: z.coerce.number().int().positive().optional(),
+});
+
+attendanceRouter.get(
+  "/calendar/holiday-impact",
+  requirePermission("attendance.calendar.manage"),
+  zValidator("query", holidayImpactSchema),
+  async (c) => {
+    try {
+      const { fromDate, toDate, classSectionId } = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+      const preview = await previewHolidayImpact(c.env, schoolCode, fromDate, toDate, classSectionId);
+      return c.json(preview);
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
+    }
+  }
+);
+
+
+
+// ── THE ADMIN DASHBOARD ANSWER TO "did anyone forget to mark attendance" ──
+const missingAttendanceSchema = z.object({
+  fromDate: z.string().date(),
+  toDate: z.string().date(),
+  classSectionId: z.coerce.number().int().positive().optional(),
+});
+
+attendanceRouter.get(
+  "/missing",
+  requirePermission("attendance.report"),
+  zValidator("query", missingAttendanceSchema),
+  async (c) => {
+    try {
+      const { fromDate, toDate, classSectionId } = c.req.valid("query");
+      const schoolCode = c.get("schoolCode")!;
+      const missing = await getMissingAttendanceReport(c.env, schoolCode, fromDate, toDate, classSectionId);
+      return c.json({ missing });
+    } catch (error: any) {
+      return c.json({ error: error.message }, 400);
     }
   }
 );

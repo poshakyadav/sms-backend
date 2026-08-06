@@ -636,7 +636,25 @@ schoolAuthRouter.post(
 const signupSchema = z.object({
   inviteToken: z.string().uuid(),
   ownerName: z.string().min(2),
-  ownerEmail: z.string().email(),
+  // email is now optional — matches schoolUsersSchema.email being nullable.
+  ownerEmail: z.string().email().optional().or(z.literal("")),
+  // NEW: optional — owner can pick their own username. If left blank,
+  // provisionSchoolDatabase() auto-generates one from ownerName (unchanged
+  // behavior). Validated here so obviously-bad input fails fast instead of
+  // surfacing as a confusing collision/format error at provisioning time.
+  ownerUsername: z
+    .string()
+    .trim()
+    .toLowerCase()
+    .regex(
+      /^[a-z][a-z0-9]*$/,
+      "Username must start with a letter and contain only lowercase letters and numbers"
+    )
+    .min(3, "Username must be at least 3 characters")
+    .max(30, "Username must be at most 30 characters")
+    .optional()
+    .or(z.literal("")),
+
   ownerPassword: z.string().min(8),
   ownerPhone: z.string().optional(),
   ownerAlternatePhone: z.string().optional(),
@@ -762,7 +780,8 @@ schoolAuthRouter.post(
       // This data will be read by the approvals service when provisioning the school DB
       const ownerRegistrationData = JSON.stringify({
         ownerName: data.ownerName,
-        ownerEmail: data.ownerEmail,
+        ownerEmail: data.ownerEmail || "",   // "" here is fine — this is JSON in invitation.notes, not the unique-constrained DB column
+        ownerUsername: data.ownerUsername || "", // — passed through to provisioning as the preferred username base
         passwordHash, // Securely hashed — safe to store
         ownerPhone: data.ownerPhone || "",
         ownerAlternatePhone: data.ownerAlternatePhone || "",
@@ -808,49 +827,60 @@ schoolAuthRouter.post(
       });
 
       // 6. Send payment instructions email
+      // CHANGED: ownerEmail is now optional — guard the send, prefer ownerEmail,
+      // fall back to schoolEmail. If neither is present, the school code and
+      // payment link are still returned in the JSON response below, so the
+      // owner isn't blocked — they just won't get an emailed copy of it.
       const frontendUrl = getFrontendUrl(c);
       const paymentPageUrl = `${frontendUrl}/school/payment?code=${schoolCode}`;
-      const confirmEmail: BrevoSendEmailRequest = {
-        sender: {
-          email: c.env.BREVO_SENDER_EMAIL,
-          name: c.env.BREVO_SENDER_NAME,
-        },
-        to: [{ email: data.ownerEmail, name: data.ownerName }],
-        subject: "Registration received — complete your payment to activate",
-        htmlContent: `
-          <!DOCTYPE html><html lang="en"><head>
-          <style>
-            body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}
-            .c{max-width:600px;margin:32px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)}
-            .h{background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:40px 32px;text-align:center;color:white}
-            .h h1{margin:0;font-size:24px;font-weight:700}
-            .b{padding:32px}.b p{color:#374151;font-size:15px;line-height:1.6}
-            .cta{text-align:center;margin:32px 0}
-            .cta a{display:inline-block;padding:14px 36px;background:#4f46e5;color:white;text-decoration:none;border-radius:8px;font-weight:700;font-size:16px}
-            .info-box{background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:16px;margin:20px 0}
-            .f{padding:24px;border-top:1px solid #f3f4f6;text-align:center;color:#9ca3af;font-size:13px}
-          </style>
-          </head><body>
-          <div class="c">
-            <div class="h"><h1>Step 2: Complete Your Payment</h1></div>
-            <div class="b">
-              <p>Hi <strong>${data.ownerName}</strong>,</p>
-              <p>Thank you for registering <strong>${data.schoolName}</strong>! Your account details have been saved.</p>
-              <p>To activate your account, please complete the setup fee payment. Our team will verify and activate your account within 24 hours after payment confirmation.</p>
-              <div class="info-box">
-                <p style="margin:0;font-size:14px"><strong>Your School Code:</strong> ${schoolCode}</p>
-                <p style="margin:8px 0 0;font-size:13px;color:#0369a1">Keep this safe — you'll need it to log in after activation.</p>
-              </div>
-              <div class="cta"><a href="${paymentPageUrl}">Complete Payment →</a></div>
-              <p style="font-size:13px;color:#6b7280">If the button doesn't work, copy this link:<br>${paymentPageUrl}</p>
-            </div>
-            <div class="f"><p>Best regards, SMS Team</p></div>
-          </div>
-          </body></html>
-        `,
-      };
-      sendTransactionalEmail(c.env, confirmEmail).catch(console.error);
+      const notifyRecipientEmail = data.ownerEmail || data.schoolEmail || "";
 
+      if (notifyRecipientEmail) {
+        const confirmEmail: BrevoSendEmailRequest = {
+          sender: {
+            email: c.env.BREVO_SENDER_EMAIL,
+            name: c.env.BREVO_SENDER_NAME,
+          },
+          to: [{ email: notifyRecipientEmail, name: data.ownerName }],
+          subject: "Registration received — complete your payment to activate",
+          htmlContent: `
+            <!DOCTYPE html><html lang="en"><head>
+            <style>
+              body{font-family:'Segoe UI',Arial,sans-serif;background:#f4f6f9;margin:0;padding:0}
+              .c{max-width:600px;margin:32px auto;background:white;border-radius:12px;overflow:hidden;box-shadow:0 4px 20px rgba(0,0,0,.08)}
+              .h{background:linear-gradient(135deg,#4f46e5,#7c3aed);padding:40px 32px;text-align:center;color:white}
+              .h h1{margin:0;font-size:24px;font-weight:700}
+              .b{padding:32px}.b p{color:#374151;font-size:15px;line-height:1.6}
+              .cta{text-align:center;margin:32px 0}
+              .cta a{display:inline-block;padding:14px 36px;background:#4f46e5;color:white;text-decoration:none;border-radius:8px;font-weight:700;font-size:16px}
+              .info-box{background:#f0f9ff;border:1px solid #bae6fd;border-radius:8px;padding:16px;margin:20px 0}
+              .f{padding:24px;border-top:1px solid #f3f4f6;text-align:center;color:#9ca3af;font-size:13px}
+            </style>
+            </head><body>
+            <div class="c">
+              <div class="h"><h1>Step 2: Complete Your Payment</h1></div>
+              <div class="b">
+                <p>Hi <strong>${data.ownerName}</strong>,</p>
+                <p>Thank you for registering <strong>${data.schoolName}</strong>! Your account details have been saved.</p>
+                <p>To activate your account, please complete the setup fee payment. Our team will verify and activate your account within 24 hours after payment confirmation.</p>
+                <div class="info-box">
+                  <p style="margin:0;font-size:14px"><strong>Your School Code:</strong> ${schoolCode}</p>
+                  <p style="margin:8px 0 0;font-size:13px;color:#0369a1">Keep this safe — you'll need it to log in after activation.</p>
+                </div>
+                <div class="cta"><a href="${paymentPageUrl}">Complete Payment →</a></div>
+                <p style="font-size:13px;color:#6b7280">If the button doesn't work, copy this link:<br>${paymentPageUrl}</p>
+              </div>
+              <div class="f"><p>Best regards, SMS Team</p></div>
+            </div>
+            </body></html>
+          `,
+        };
+        sendTransactionalEmail(c.env, confirmEmail).catch(console.error);
+      } else {
+        console.log(
+          `ℹ️ /signup: no ownerEmail/schoolEmail provided for ${schoolCode} — skipping confirmation email.`
+        );
+      }
       return c.json({
         success: true,
         message:
@@ -874,30 +904,52 @@ schoolAuthRouter.post(
 );
 
 // ==================== LOGIN SCHEMA ====================
-const loginSchema = z.object({
-  schoolCode: z
-    .string()
-    .min(3)
-    .max(50)
-    .transform((val) => val.toUpperCase().trim()),
-  email: z
-    .string()
-    .email()
-    .transform((val) => val.toLowerCase().trim()),
-  password: z.string().min(1, "Password is required"),
+const loginSchema = z
+  .object({
+    schoolCode: z
+      .string()
+      .min(3)
+      .max(50)
+      .transform((val) => val.toUpperCase().trim()),
 
-  /**
-   * True when the user has checked "I agree to T&C and Privacy Policy"
-   * on the login form. Only required on first login (when termsAcceptedAt is NULL).
-   * Optional on subsequent logins — existing acceptance is preserved.
-   */
-  termsAccepted: z.boolean().optional(),
-});
+    // Exactly one of these two must be present — enforced below.
+    email: z
+      .string()
+      .email()
+      .transform((val) => val.toLowerCase().trim())
+      .optional(),
+
+    username: z
+      .string()
+      .transform((val) => val.trim().toLowerCase())
+      .optional(),
+
+    password: z.string().min(1, "Password is required"),
+
+    /**
+     * True when the user has checked "I agree to T&C and Privacy Policy".
+     * Only required on first login (when termsAcceptedAt is NULL).
+     */
+    termsAccepted: z.boolean().optional(),
+  })
+  .superRefine((data, ctx) => {
+    if (!data.email && !data.username) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Please provide your email or username to log in.",
+        path: ["email"],
+      });
+    }
+  });
 
 // ==================== LOGIN ====================
 schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
   try {
-    const { schoolCode, email, password, termsAccepted } = c.req.valid("json");
+    const { schoolCode, email, username, password, termsAccepted } =
+      c.req.valid("json");
+
+    // Username takes priority if a client somehow sends both.
+    const loginMethod: "username" | "email" = username ? "username" : "email";
 
     // Check onboarding status first to give meaningful errors
     const commonDb = getCommonDB(c.env);
@@ -916,8 +968,7 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         return c.json(
           {
             success: false,
-            error:
-              "Your account is not yet activated. Please complete payment first.",
+            error: "Your account is not yet activated. Please complete payment first.",
             onboardingStatus: status,
             requiresPayment: true,
           },
@@ -928,8 +979,7 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         return c.json(
           {
             success: false,
-            error:
-              "Your payment is being verified. You will be notified once activated.",
+            error: "Your payment is being verified. You will be notified once activated.",
             onboardingStatus: status,
             paymentPending: true,
           },
@@ -945,6 +995,7 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         id: schoolUsersSchema.id,
         name: schoolUsersSchema.name,
         email: schoolUsersSchema.email,
+        username: schoolUsersSchema.username,
         primaryRole: schoolUsersSchema.primaryRole,
         isActive: schoolUsersSchema.isActive,
         passwordHash: schoolUsersSchema.passwordHash,
@@ -952,41 +1003,39 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         termsAcceptedAt: schoolUsersSchema.termsAcceptedAt,
       })
       .from(schoolUsersSchema)
-      .where(eq(schoolUsersSchema.email, email))
+      .where(
+        loginMethod === "username"
+          ? eq(schoolUsersSchema.username, username!)
+          : eq(schoolUsersSchema.email, email!)
+      )
       .get();
 
+    // Generic, method-aware message — doesn't leak whether the account
+    // exists vs the password was wrong (standard anti-enumeration practice).
+    const invalidCredentialsMessage =
+      loginMethod === "username" ? "Invalid username or password" : "Invalid email or password";
+
     if (!user)
-      return c.json(
-        { success: false, error: "Invalid email or password" },
-        401
-      );
+      return c.json({ success: false, error: invalidCredentialsMessage }, 401);
     if (!user.isActive)
       return c.json({ success: false, error: "Account deactivated" }, 403);
 
     const isPasswordValid = await comparePassword(password, user.passwordHash);
     if (!isPasswordValid)
-      return c.json(
-        { success: false, error: "Invalid email or password" },
-        401
-      );
+      return c.json({ success: false, error: invalidCredentialsMessage }, 401);
 
     // ── T&C enforcement ─────────────────────────────────────────────────────
-    // If the user has never accepted T&C, they must do so now.
     const isFirstTimeAcceptance = !user.termsAcceptedAt;
-
     if (isFirstTimeAcceptance && !termsAccepted) {
       return c.json(
         {
           success: false,
-          error:
-            "You must accept the Terms & Conditions and Privacy Policy to continue.",
+          error: "You must accept the Terms & Conditions and Privacy Policy to continue.",
           requiresTermsAcceptance: true,
         },
         403
       );
     }
-
-    // If this is a first-time acceptance, record it immediately
     if (isFirstTimeAcceptance && termsAccepted) {
       await db
         .update(schoolUsersSchema)
@@ -994,26 +1043,17 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
         .where(eq(schoolUsersSchema.id, user.id));
     }
 
-    // Optimising from here
-    // === FETCH USER PERMISSIONS  ===
-    // Step 1: permissions (internally uses db.batch — 2 round trips total)
     const userPermissions = await getUserPermissionsFromDB(db, user.id);
-
-    // Step 2: primaryRole — read directly from the user row we already fetched.
-    // user.primaryRole is already on the user object from the SELECT above,
-    // so NO extra round trip needed here at all.
     const roleName = user.primaryRole ?? "";
 
-    // Step 3+4 in parallel: generate tokens AND fetch branding simultaneously.
-    // Token generation (JWT sign + refresh token DB insert) and branding read
-    // are completely independent — run them at the same time.
     const [{ access_token, refresh_token }, school] = await Promise.all([
       generateSchoolTokens(
         db,
         {
           id: user.id,
           name: user.name,
-          email: user.email,
+          email: user.email ?? undefined,
+          username: user.username,
           schoolCode,
           permissions: userPermissions,
           tokenVersion: user.tokenVersion,
@@ -1024,8 +1064,6 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
       fetchSchoolBranding(db),
     ]);
 
-    // ── Typed child shape ──────────────────────────────────────────────────
-    // Fetch children for STUDENT_PARENT — strongly typed to avoid ts(2589)
     type ChildItem = {
       studentId: number;
       studentName: string;
@@ -1043,28 +1081,22 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
       } | null;
     };
 
-    // ── Fetch children if user is a STUDENT_PARENT ──────────────
     let children: ChildItem[] | null = null;
     if (roleName === SchoolRole.STUDENT_PARENT) {
       try {
-        children = (await getParentChildren(
-          c.env,
-          schoolCode,
-          user.id
-        )) as ChildItem[];
+        children = (await getParentChildren(c.env, schoolCode, user.id)) as ChildItem[];
       } catch (err) {
         console.error("Failed to fetch parent children on login:", err);
         children = [];
       }
     }
 
-    // Explicit typed object — avoids Hono's infinite generic instantiation
     const responseBody: {
       success: boolean;
       message: string;
       access_token: string;
       refresh_token: string;
-      user: { id: number; name: string; email: string; schoolCode: string };
+      user: { id: number; name: string; email: string | null; username: string; schoolCode: string };
       children: ChildItem[] | null;
       role: string;
       requiresTermsAcceptance: boolean;
@@ -1074,7 +1106,7 @@ schoolAuthRouter.post("/login", zValidator("json", loginSchema), async (c) => {
       message: "Login successful",
       access_token,
       refresh_token,
-      user: { id: user.id, name: user.name, email: user.email, schoolCode },
+      user: { id: user.id, name: user.name, email: user.email, username: user.username, schoolCode },
       children,
       role: roleName,
       requiresTermsAcceptance: false,
@@ -1142,7 +1174,8 @@ schoolAuthRouter.post(
           {
             id: userWithPermissions.id,
             name: userWithPermissions.name,
-            email: userWithPermissions.email,
+            email: userWithPermissions.email ?? undefined,
+            username: userWithPermissions.username,
             schoolCode,
             permissions: userWithPermissions.permissions as string[],
             tokenVersion: userWithPermissions.tokenVersion,

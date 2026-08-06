@@ -1,3 +1,5 @@
+// src/utils/school/tokens.ts
+
 import { sign } from "hono/jwt";
 import { nanoid } from "nanoid";
 import { schoolRefreshTokensSchema } from "../../db/schemas/school";
@@ -25,6 +27,7 @@ export async function generateSchoolAccessToken(
     id: number;
     name: string;
     email?: string;
+    username: string; // every school user now has one, unlike email
     schoolCode: string;
     permissions: string[];
     tokenVersion: number;
@@ -36,6 +39,7 @@ export async function generateSchoolAccessToken(
     sub: user.id.toString(),
     name: user.name,
     email: user.email ?? "",
+    username: user.username,
     schoolCode: user.schoolCode,
     permissions: user.permissions, // ← Full permissions array
     tokenVersion: user.tokenVersion, // ← For instant invalidation

@@ -32,7 +32,7 @@ import { SchoolRole } from "../../../types/school-role";
 export interface ParentChild {
   studentId: number;
   studentName: string;
-  studentEmail: string;
+  studentEmail: string | null;
   studentAvatarUrl?: string;
   relationship: string;
   isPrimary: boolean;
@@ -49,7 +49,7 @@ export interface ParentChild {
 export interface ParentSearchResult {
   userId: number;
   name: string;
-  email: string;
+  email: string | null;
   phone: string;
   avatarUrl?: string;
   occupation?: string;
@@ -59,7 +59,7 @@ export interface ParentSearchResult {
 export interface StudentParentLink {
   parentUserId: number;
   parentName: string;
-  parentEmail: string;
+  parentEmail: string | null;
   parentPhone: string;
   parentAvatarUrl?: string;
   occupation?: string;
@@ -71,7 +71,7 @@ export interface StudentParentLink {
 export interface StudentSearchResult {
   id: number;
   name: string;
-  email: string;
+  email: string | null;
   avatarUrl?: string;
   rollNumber?: string;
   className?: string;

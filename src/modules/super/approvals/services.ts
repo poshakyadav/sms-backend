@@ -10,6 +10,24 @@ import { sendTransactionalEmail } from "../../../utils/sendEmail";
 import { BrevoSendEmailRequest } from "../../../types/brevo";
 import { getSchoolDB } from "../../../db/school-client";
 
+// near the top of services.ts, after the imports
+interface OwnerRegistrationData {
+  ownerName: string;
+  ownerEmail: string;
+  ownerUsername?: string;
+  passwordHash: string;
+  ownerPhone: string;
+  ownerAlternatePhone: string;
+  schoolName: string;
+  addressLineOne: string;
+  addressLineTwo: string;
+  phone: string;
+  alternatePhone: string;
+  schoolEmail: string;
+  schoolWebsite: string;
+  termsAcceptedAt?: string;
+}
+
 // School-side schemas (for provisioning the school DB)
 import {
   schoolUsersSchema,
@@ -23,6 +41,8 @@ import { seedPermissionsAndRoles } from "../../school/permissions/services";
 import { schoolSettingsService } from "../../school/settings/services";
 import { getUserPermissionsFromDB } from "../../school/auth/permission-helpers";
 import { platformPaymentsSchema } from "../../../db";
+import { isUniqueConstraintError } from "../../../utils/db-errors";
+import { buildUsernameBase, buildUsernameCandidate } from "../../../utils/school/username";
 
 // const FRONTEND_URL = "http://localhost:4200";
 
@@ -220,21 +240,7 @@ export async function activateRazorpaySchool(
   }
 
   // 4. Parse owner registration data
-  let ownerData: {
-    ownerName: string;
-    ownerEmail: string;
-    passwordHash: string;
-    ownerPhone: string;
-    ownerAlternatePhone: string;
-    schoolName: string;
-    addressLineOne: string;
-    addressLineTwo: string;
-    phone: string;
-    alternatePhone: string;
-    schoolEmail: string;
-    schoolWebsite: string;
-    termsAcceptedAt?: string;
-  } | null = null;
+  let ownerData: OwnerRegistrationData | null = null;
 
   try {
     if (invitation.notes) {
@@ -450,21 +456,7 @@ export async function approvePayment(
   if (!invitation) throw new Error("Invitation record not found");
 
   // 4. Parse stored owner registration data
-  let ownerData: {
-    ownerName: string;
-    ownerEmail: string;
-    passwordHash: string;
-    ownerPhone: string;
-    ownerAlternatePhone: string;
-    schoolName: string;
-    addressLineOne: string;
-    addressLineTwo: string;
-    phone: string;
-    alternatePhone: string;
-    schoolEmail: string;
-    schoolWebsite: string;
-    termsAcceptedAt?: string;
-  } | null = null;
+  let ownerData: OwnerRegistrationData | null = null;
 
   try {
     if (invitation.notes) {
@@ -592,21 +584,7 @@ async function provisionSchoolDatabase(
   env: any,
   schoolCode: string,
   school: any,
-  ownerData: {
-    ownerName: string;
-    ownerEmail: string;
-    passwordHash: string;
-    ownerPhone: string;
-    ownerAlternatePhone: string;
-    schoolName: string;
-    addressLineOne: string;
-    addressLineTwo: string;
-    phone: string;
-    alternatePhone: string;
-    schoolEmail: string;
-    schoolWebsite: string;
-    termsAcceptedAt?: string;
-  }
+  ownerData: OwnerRegistrationData
 ) {
   console.log(`🚀 Provisioning school DB for: ${schoolCode}`);
 
@@ -644,11 +622,22 @@ async function provisionSchoolDatabase(
     })
     .onConflictDoNothing();
 
+  // ====
   // ── Step 2: Insert the school owner user ──────────────────────────────────
+  // CHANGED: was `eq(schoolUsersSchema.email, ownerData.ownerEmail)`. That
+  // breaks now that email is optional/nullable — multiple provisioning runs
+  // with a blank email would either false-negative (never find the "existing"
+  // row) or, if ever stored as "" instead of NULL, collide on the unique
+  // index. The real invariant we're protecting is "one SCHOOL_OWNER per
+  // school DB", so check that directly instead — it works regardless of
+  // whether email was ever supplied.
   const existingUser = await schoolDb
-    .select({ id: schoolUsersSchema.id })
+    .select({
+      id: schoolUsersSchema.id,
+      termsAcceptedAt: schoolUsersSchema.termsAcceptedAt,
+    })
     .from(schoolUsersSchema)
-    .where(eq(schoolUsersSchema.email, ownerData.ownerEmail))
+    .where(eq(schoolUsersSchema.primaryRole, SchoolRole.SCHOOL_OWNER))
     .get();
 
   let userId: number;
@@ -658,40 +647,59 @@ async function provisionSchoolDatabase(
     userId = existingUser.id;
     console.log(`✅ Owner user already exists (id=${userId}), skipping insert`);
 
-    // If the existing user hasn't accepted T&C yet, backfill it now.
-    // This handles the case where provisioning ran partially before and
-    // left termsAcceptedAt as NULL.
-    if (ownerData.termsAcceptedAt) {
+    if (ownerData.termsAcceptedAt && !existingUser.termsAcceptedAt) {
       await schoolDb
         .update(schoolUsersSchema)
         .set({ termsAcceptedAt: ownerData.termsAcceptedAt })
-        .where(
-          eq(schoolUsersSchema.id, userId)
-          // Only update if still null — prevents overwriting a later acceptance
-          // Note: SQLite has no UPDATE ... WHERE col IS NULL shorthand in Drizzle,
-          // so we check in JS instead:
-        );
-      // Actually guard it properly:
+        .where(eq(schoolUsersSchema.id, userId));
     }
   } else {
-    const [newUser] = await schoolDb
-      .insert(schoolUsersSchema)
-      .values({
-        name: ownerData.ownerName,
-        email: ownerData.ownerEmail,
-        passwordHash: ownerData.passwordHash,
-        primaryRole: SchoolRole.SCHOOL_OWNER,
-        phone: ownerData.ownerPhone || "",
-        alternatePhone: ownerData.ownerAlternatePhone || "",
-        isActive: true,
-        tokenVersion: 0,
-        // Write T&C acceptance timestamp from registration time.
-        // This means the owner's first login won't trigger the checkbox.
-        termsAcceptedAt: ownerData.termsAcceptedAt ?? null,
-      })
-      .returning();
+    // ── Generate a unique username for the owner ────────────────────────────
+    // CHANGED: use the owner's chosen username as the base if they gave one
+    // during signup; otherwise fall back to deriving it from their name
+    // (unchanged behavior). buildUsernameCandidate still handles collisions.
+    const usernameBase = buildUsernameBase(
+      ownerData.ownerUsername || ownerData.ownerName
+    );
+    let newUser: typeof schoolUsersSchema.$inferSelect | undefined;
+
+    for (let attempt = 0; attempt < 5 && !newUser; attempt++) {
+      const candidateUsername = buildUsernameCandidate(usernameBase, attempt);
+      try {
+        const [inserted] = await schoolDb
+          .insert(schoolUsersSchema)
+          .values({
+            name: ownerData.ownerName,
+            username: candidateUsername,
+            // CHANGED: was `ownerData.ownerEmail` (could be ""). Store NULL
+            // when missing — the schema's unique index treats every NULL as
+            // distinct, but two rows with email = "" would collide.
+            email: ownerData.ownerEmail || null,
+            passwordHash: ownerData.passwordHash,
+            primaryRole: SchoolRole.SCHOOL_OWNER,
+            phone: ownerData.ownerPhone || "",
+            alternatePhone: ownerData.ownerAlternatePhone || "",
+            isActive: true,
+            tokenVersion: 0,
+            termsAcceptedAt: ownerData.termsAcceptedAt ?? null,
+          })
+          .returning();
+        newUser = inserted;
+      } catch (err: any) {
+        if (!isUniqueConstraintError(err, "username")) throw err;
+      }
+    }
+
+    if (!newUser) {
+      throw new Error(
+        `Could not generate a unique username for school owner during provisioning of "${schoolCode}" after multiple attempts.`
+      );
+    }
     userId = newUser.id;
+    console.log(`✅ Owner user created (id=${userId}, username=${newUser.username})`);
   }
+
+  // =====
 
   const existingStaffProfile = await schoolDb
     .select({ userId: staffSchema.userId })
@@ -832,10 +840,20 @@ async function sendActivationEmail(
     loginLink: string;
   }
 ) {
-  // Send to both the school's registered email and the owner's personal email
-  const recipients = [{ email: opts.to, name: opts.schoolName }];
+  // CHANGED: build recipients defensively instead of assuming opts.to is
+  // always a valid address — ownerEmail is now optional and this guards
+  // against sending to a blank address either way.
+  const recipients: { email: string; name: string }[] = [];
+  if (opts.to) recipients.push({ email: opts.to, name: opts.schoolName });
   if (opts.ownerEmail && opts.ownerEmail !== opts.to) {
     recipients.push({ email: opts.ownerEmail, name: opts.schoolName });
+  }
+
+  if (recipients.length === 0) {
+    console.warn(
+      `⚠️ No email recipients for activation email — school ${opts.schoolCode} has neither a school email nor an owner email on file.`
+    );
+    return;
   }
 
   const emailData: BrevoSendEmailRequest = {
@@ -880,6 +898,7 @@ async function sendActivationEmail(
   };
   await sendTransactionalEmail(env, emailData);
 }
+
 
 async function sendRejectionEmail(
   env: any,

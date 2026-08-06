@@ -90,6 +90,7 @@ const bulkHistoryQuerySchema = z.object({
   // Individual field search (used when frontend has separate inputs)
   name: z.string().max(100).optional(),
   email: z.string().max(150).optional(),
+  username: z.string().max(50).optional(),
   phone: z.string().max(20).optional(),
   admissionNumber: z.string().max(50).optional(),
   fatherName: z.string().max(150).optional(),
@@ -157,6 +158,7 @@ studentHistoryRouter.get(
         q: query.q,
         name: query.name,
         email: query.email,
+        username: query.username,
         phone: query.phone,
         admissionNumber: query.admissionNumber,
         fatherName: query.fatherName,

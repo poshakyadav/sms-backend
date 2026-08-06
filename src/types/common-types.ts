@@ -11,6 +11,7 @@ export type SchoolUserContext = {
   id: number;
   name: string;
   email: string;
+  username: string;
   schoolCode: string;
   permissions: string[]; // ← Full permissions from JWT
   tokenVersion: number; // ← For instant invalidation

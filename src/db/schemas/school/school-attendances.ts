@@ -1,6 +1,6 @@
 // src/db/schemas/school/school-attendances.ts
 
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { index, integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { schoolStudentEnrollmentsSchema } from "./school-student-enrollments";
 import { schoolUsersSchema } from "./school-users";
@@ -145,11 +145,11 @@ export const schoolAttendancesSchema = sqliteTable("attendances", {
   // ISO date string "YYYY-MM-DD"
   date: text("date").notNull(),
 
-  // One of the nine AttendanceStatus values
+  // One of the EIGHT non-present AttendanceStatus values.
+  // No default — every insert must supply an explicit exception status.
   status: text("status")
     .$type<AttendanceStatusValue>()
-    .notNull()
-    .default(AttendanceStatus.PRESENT),
+    .notNull(),
 
   // ── HALF-DAY DETAIL ───────────────────────────────────────────────────────
   // Populated only when status = HALF_DAY.
@@ -168,13 +168,25 @@ export const schoolAttendancesSchema = sqliteTable("attendances", {
     .references(() => schoolUsersSchema.id)
     .notNull(),
 
+  // who last edited this row (distinct from who created it).
+  // NULL until the first edit after initial creation.
+  updatedBy: integer("updated_by").references(() => schoolUsersSchema.id),
+
   createdAt: text("created_at")
     .default(sql`CURRENT_TIMESTAMP`)
     .notNull(),
   updatedAt: text("updated_at")
     .default(sql`CURRENT_TIMESTAMP`)
     .notNull(),
-});
+},
+  (table) => ({
+    // Fast lookup for "does this student have an exception on this date"
+    enrollmentDateIdx: index("idx_attendance_enrollment_date").on(
+      table.enrollmentId,
+      table.date
+    ),
+  })
+);
 
 export type SchoolAttendance = typeof schoolAttendancesSchema.$inferSelect;
 export type NewSchoolAttendance = typeof schoolAttendancesSchema.$inferInsert;

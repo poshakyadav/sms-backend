@@ -59,6 +59,10 @@ export * from "./school-feed-post-interactions";
 export * from "./school-notifications"; // Depends on school-users
 export * from "./school-notification-interactions"; // Depends on notifications, school-users
 export * from "./school-attendances"; // Depends on student_enrollments, school-users
+export * from "./school-attendance-sessions"; // Depends on class_sections, school-users
+export * from "./school-attendance-audit-log"; // Depends on student_enrollments, school-users
+export * from "./school-attendance-calendar"; // no deps beyond schools, school-users
+
 export * from "./school-fee-payments"; // Depends on student_enrollments, fee_structures,  school-users and nullable feeStructureId + studentFeeAssignmentId
 export * from "./school-exams"; // Depends on academic_years, class_subjects
 export * from "./school-exam-marks"; // Depends on exams, student_enrollments, school-users

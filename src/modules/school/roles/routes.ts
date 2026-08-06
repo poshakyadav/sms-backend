@@ -27,18 +27,6 @@ const rolesRouter = new Hono<SchoolEnv>();
 rolesRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
 
 // ==================== GET ALL ROLES ====================
-// rolesRouter.get("/", requirePermission("roles.manage"), async (c) => {
-//   try {
-//     const schoolCode = c.get("schoolCode")!;
-//     const roles = await getAllRoles(c.env, schoolCode);
-//     return c.json({ success: true, roles });
-//   } catch (error: any) {
-//     console.error("Get roles error:", error);
-//     return c.json({ success: false, error: error.message }, 500);
-//   }
-// });
-
-// ==================== GET ALL ROLES ====================
 // Accepts an optional ?category=staff|student|parent query param.
 // When present, only roles of that category are returned.
 // This drives the "Additional Roles" dropdown in user-form — it filters

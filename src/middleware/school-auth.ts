@@ -45,6 +45,7 @@ export const schoolTokenValidationMiddleware = createMiddleware<SchoolEnv>(
       id: parseInt(payload.sub),
       name: payload.name ?? "",
       email: payload.email ?? "",
+      username: payload.username ?? "", // mirrors generateSchoolAccessToken's payload
       schoolCode: payload.schoolCode,
       permissions: (payload.permissions || []) as string[],
       tokenVersion: payload.tokenVersion || 0,

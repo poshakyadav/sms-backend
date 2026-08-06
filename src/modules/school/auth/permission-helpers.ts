@@ -1,6 +1,4 @@
 // …/school/auth/permission-helpers.ts
-// UPDATED: getUserPermissionsFromDB now subtracts denied permissions.
-// Denials are stored in user_permission_denials and always win over grants.
 
 import { eq, inArray } from "drizzle-orm";
 import {
@@ -31,7 +29,8 @@ interface PermissionRecord {
 interface UserWithBasicInfo {
   id: number;
   name: string;
-  email: string;
+  email: string | null; // now nullable
+  username: string;
   isActive: boolean;
   tokenVersion: number;
   primaryRole: string | null;
@@ -192,6 +191,7 @@ export async function getUserWithPermissions(
           id: schoolUsersSchema.id,
           name: schoolUsersSchema.name,
           email: schoolUsersSchema.email,
+          username: schoolUsersSchema.username,
           isActive: schoolUsersSchema.isActive,
           tokenVersion: schoolUsersSchema.tokenVersion,
           primaryRole: schoolUsersSchema.primaryRole,

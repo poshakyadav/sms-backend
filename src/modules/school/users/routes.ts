@@ -13,6 +13,7 @@ import {
   assignDirectPermissionsToUser,
   assignRolesToUser,
   bulkUploadStudentAvatars,
+  changeSchoolUserUsername,
   checkUserDeletionImpact,
   createSchoolUser,
   deleteSchoolUser,
@@ -31,6 +32,7 @@ import { getSchoolDB } from "../../../db/school-client";
 import { schoolUsersSchema } from "../../../db/schemas/school";
 import { eq } from "drizzle-orm";
 import { PermissionCategory } from "../../../types/school-permissions";
+import { normalizeUsername, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, USERNAME_REGEX } from "../../../utils/school/username";
 
 const usersRouter = new Hono<SchoolEnv>();
 
@@ -136,6 +138,57 @@ usersRouter.get(
   }
 );
 
+// ==================== CHECK USERNAME AVAILABILITY ====================
+// IMPORTANT: Must be defined before GET /:id to avoid route collision.
+usersRouter.get(
+  "/check-username",
+  requirePermission(["users.create", "users.edit"]),
+  async (c) => {
+    try {
+      const raw = c.req.query("username");
+      if (!raw) {
+        return c.json(
+          { success: false, error: "username query param is required" },
+          400
+        );
+      }
+
+      const username = normalizeUsername(raw);
+
+      if (!USERNAME_REGEX.test(username)) {
+        return c.json({
+          success: true,
+          available: false,
+          message: `Username must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers.`,
+        });
+      }
+
+      const schoolCode = c.get("schoolCode")!;
+      const db = await getSchoolDB(c.env, schoolCode);
+
+      const existing = await db
+        .select({ id: schoolUsersSchema.id })
+        .from(schoolUsersSchema)
+        .where(eq(schoolUsersSchema.username, username))
+        .get();
+
+      return c.json({
+        success: true,
+        available: !existing,
+        message: existing
+          ? "This username is already taken. Please choose a different one."
+          : "Username is available.",
+      });
+    } catch (error: any) {
+      console.error("Check username error:", error);
+      return c.json(
+        { success: false, error: error.message || "Server error" },
+        500
+      );
+    }
+  }
+);
+
 // ── Bulk photo upload limits ────────────────────────────────────────────────
 const MAX_BULK_AVATAR_ITEMS = 100; // sane ceiling — largest realistic class-section is ~60
 const MAX_AVATAR_BYTES_BULK = 100 * 1024; // same 100KB ceiling as single avatar upload
@@ -148,7 +201,7 @@ const bulkAvatarStudentIdsSchema = z
     `Cannot upload more than ${MAX_BULK_AVATAR_ITEMS} photos in a single request`
   );
 
-  // ─────────────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
 // BULK PHOTO UPLOAD — class-section based
 // IMPORTANT: Defined before GET /:id and use static path segments, so no
 // collision risk, but kept here with the other pre-`/:id` routes for
@@ -587,7 +640,20 @@ const staffProfileFields = {
 const createUserBaseSchema = z.object({
   // ── Core identity ───────────────────────────────────────────────────────────
   name: z.string().min(2).max(100),
-  email: z.string().email(),
+  // Email is now OPTIONAL — a user can be created with just a username.
+  email: z.string().email().optional(),
+
+  // Optional at creation — if omitted, the service auto-generates a unique
+  // one from `name`. If provided, it must already match the format rules;
+  // availability is checked server-side (see /check-username for live UX).
+  username: z
+    .string()
+    .transform((val) => val.trim().toLowerCase())
+    .refine((val) => USERNAME_REGEX.test(val), {
+      message: `Username must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers (a-z, 0-9).`,
+    })
+    .optional(),
+
   password: z.string().min(8).max(100),
 
   // ── Role assignment ─────────────────────────────────────────────────────────
@@ -671,7 +737,7 @@ usersRouter.post(
 // newPassword and isActive are update-only additions.
 
 const updateUserSchema = createUserBaseSchema
-  .omit({ password: true, roleIds: true, primaryRoleId: true })
+  .omit({ password: true, roleIds: true, primaryRoleId: true, username: true })
   .partial()
   .extend({
     newPassword: z.string().min(8).max(100).optional(),
@@ -799,6 +865,50 @@ usersRouter.post(
   }
 );
 
+// ==================== CHANGE USERNAME ====================
+// PUT /school/users/:id/username
+const changeUsernameSchema = z.object({
+  username: z
+    .string()
+    .transform((val) => val.trim().toLowerCase())
+    .refine((val) => USERNAME_REGEX.test(val), {
+      message: `Username must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers (a-z, 0-9).`,
+    }),
+});
+
+usersRouter.put(
+  "/:id/username",
+  requirePermission(["users.create", "users.edit"]),
+  zValidator("json", changeUsernameSchema),
+  async (c) => {
+    try {
+      const id = parseInt(c.req.param("id"));
+      if (isNaN(id)) {
+        return c.json({ success: false, error: "Invalid user ID" }, 400);
+      }
+
+      const { username } = c.req.valid("json");
+      const schoolCode = c.get("schoolCode")!;
+
+      const result = await changeSchoolUserUsername(c.env, schoolCode, id, username);
+
+      return c.json({
+        success: true,
+        message: "Username updated successfully",
+        username: result.username,
+      });
+    } catch (error: any) {
+      console.error("Change username error:", error);
+      const msg: string = error.message ?? "";
+      const isTaken = msg.includes("already taken");
+      return c.json(
+        { success: false, error: msg || "Failed to update username" },
+        isTaken ? 409 : 400
+      );
+    }
+  }
+);
+
 // ==================== ASSIGN/UPDATE USER ROLES ====================
 const assignRolesSchema = z.object({
   roleIds: z
@@ -842,8 +952,8 @@ usersRouter.put(
           code: isPrimaryRoleGuard
             ? "PRIMARY_ROLE_GUARD"
             : isOwnerGuard
-            ? "LAST_OWNER_GUARD"
-            : undefined,
+              ? "LAST_OWNER_GUARD"
+              : undefined,
         },
         isPrimaryRoleGuard || isOwnerGuard ? 422 : 400
       );

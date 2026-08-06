@@ -61,6 +61,8 @@ export const SCHOOL_PERMISSIONS = {
   ATTENDANCE: {
     MARK: "attendance.mark", // Teacher marks attendance
     REPORT: "attendance.report", // Staff views class-wide report
+    CALENDER_MANAGE: "attendance.calendar.manage", // Staff manages attendance calendar (holidays, working-day overrides)
+
     // ── REMOVED from here — moved to STUDENT_PORTAL and PARENT_PORTAL below
     // attendance.student.view was incorrectly a 'staff' slug before this change.
   },
@@ -135,7 +137,7 @@ export const SCHOOL_PERMISSIONS = {
 
   FEED: {
     FEED_POST_CREATE: "feed.post.create",
-    FEED_POST_MANAGE :"feed.post.manage",
+    FEED_POST_MANAGE: "feed.post.manage",
     FEED_VIEW: "feed.view",
     FEED_REACT: "feed.react",
   },
@@ -279,6 +281,7 @@ export const STAFF_PERMISSION_SLUGS: readonly SchoolPermissionSlug[] = [
   // Attendance (staff)
   "attendance.mark",
   "attendance.report",
+  "attendance.calendar.manage",
 
   // Fees (staff)
   "fees.structures.manage",
@@ -332,6 +335,7 @@ export const STAFF_PERMISSION_SLUGS: readonly SchoolPermissionSlug[] = [
   "id-cards.view",
   "id-cards.revoke",
   "id-cards.print",
+  "id-cards.delete",
   "id-cards.templates.manage",
 
   // Teachers, Parents, Contact
@@ -396,3 +400,615 @@ export const PERMISSION_CATEGORY_MAP: Readonly<
 
 // Helper for UI grouping (Owner Permission Matrix — shows only staff slugs)
 export const PERMISSION_GROUPS = SCHOOL_PERMISSIONS;
+
+// ======
+
+// ══════════════════════════════════════════════════════════════════════════
+// PERMISSION METADATA — human-facing copy, enriched onto DB rows at read time
+// ══════════════════════════════════════════════════════════════════════════
+// This is the single source of truth for what each permission means to a
+// school admin. It is NOT persisted to the DB — `/school/permissions` and
+// any endpoint that returns permission objects merge this in by slug at
+// request time. Editing copy here takes effect on next deploy, no per-school
+// migration needed.
+//
+// Typed as Record<SchoolPermissionSlug, PermissionMeta> deliberately: if you
+// add a new slug to SCHOOL_PERMISSIONS/STAFF_PERMISSION_SLUGS/etc. and forget
+// to add an entry here, the project will not compile. That's the enforcement
+// mechanism — no separate test needed.
+
+export type PermissionRiskLevel = "low" | "medium" | "high" | "critical";
+
+export interface PermissionMeta {
+  /** Human-authored short name shown instead of the mechanical slug title-case. */
+  label: string;
+  /** One plain-English sentence: what this lets the user do. */
+  description: string;
+  /** UI hint for how carefully this should be granted. Tune to taste. */
+  riskLevel: PermissionRiskLevel;
+  /**
+   * Short labels naming the screens/features that consume this permission.
+   * Purely informational — helps a non-technical admin connect a permission
+   * to something they'd actually recognize in the app. Keep each entry to
+   * 2-4 words; this renders as small chips in the picker, not prose.
+   */
+  usedIn: string[];
+}
+
+export const PERMISSION_METADATA: Readonly < Record < SchoolPermissionSlug, PermissionMeta >
+> = {
+  // ── DASHBOARD ──────────────────────────────────────────────────────────
+  "dashboard.view": {
+    label: "View staff dashboard",
+      description: "See the school-wide staff dashboard with attendance, fee, and activity summaries.",
+        riskLevel: "low",
+          usedIn: ["Staff Dashboard"],
+  },
+
+  // ── USERS & ROLES ─────────────────────────────────────────────────────
+  "users.list": {
+    label: "View users",
+      description: "See the list of all staff, students, and parents in the school.",
+        riskLevel: "low",
+          usedIn: ["Users List"],
+  },
+  "users.create": {
+    label: "Create users",
+      description: "Add new staff, student, or parent accounts to the school.",
+        riskLevel: "medium",
+          usedIn: ["User Creation Hub"],
+  },
+  "users.edit": {
+    label: "Edit users",
+      description: "Change any user's profile details, contact info, and account status.",
+        riskLevel: "medium",
+          usedIn: ["Edit User"],
+  },
+  "users.delete": {
+    label: "Delete users",
+      description: "Permanently remove a user account and its records. This cannot be undone.",
+        riskLevel: "critical",
+          usedIn: ["Users List"],
+  },
+  "users.assign-role": {
+    label: "Assign roles",
+      description: "Change which roles a user holds, which changes what they can access.",
+        riskLevel: "high",
+          usedIn: ["Edit User — Roles"],
+  },
+  "roles.manage": {
+    label: "Manage roles",
+      description: "Create, edit, and delete custom roles, and choose which permissions each role grants.",
+        riskLevel: "critical",
+          usedIn: ["Roles Management"],
+  },
+  "permissions.manage": {
+    label: "Manage permission overrides",
+      description: "Grant or block individual permissions for a specific user, beyond their assigned roles.",
+        riskLevel: "critical",
+          usedIn: ["Edit User — Permission Overrides"],
+  },
+
+  // ── ACADEMICS ─────────────────────────────────────────────────────────
+  "academics.years.manage": {
+    label: "Manage academic years",
+      description: "Create and configure academic years for the school.",
+        riskLevel: "medium",
+          usedIn: ["Academic Years"],
+  },
+  "academics.classes.manage": {
+    label: "Manage classes",
+      description: "Create and edit the school's classes (grades).",
+        riskLevel: "medium",
+          usedIn: ["Classes"],
+  },
+  "academics.sections.manage": {
+    label: "Manage sections",
+      description: "Create and edit sections within a class.",
+        riskLevel: "medium",
+          usedIn: ["Sections"],
+  },
+  "academics.enroll": {
+    label: "Enroll students",
+      description: "Enroll students into a class-section for an academic year.",
+        riskLevel: "medium",
+          usedIn: ["Student Enrollment"],
+  },
+  "academics.unenroll": {
+    label: "Unenroll students",
+      description: "Remove a student's enrollment from a class-section.",
+        riskLevel: "high",
+          usedIn: ["Student Enrollment"],
+  },
+  "academics.subjects.manage": {
+    label: "Manage subjects",
+      description: "Create and edit the subjects taught at the school.",
+        riskLevel: "medium",
+          usedIn: ["Subjects"],
+  },
+  "academics.assign-teacher": {
+    label: "Assign teachers",
+      description: "Assign teachers to subjects and class-sections.",
+        riskLevel: "medium",
+          usedIn: ["Teacher Assignment"],
+  },
+  "academics.mappings.manage": {
+    label: "Manage subject mappings",
+      description: "Configure which subjects apply to which classes.",
+        riskLevel: "medium",
+          usedIn: ["Subject Mappings"],
+  },
+
+  // ── ATTENDANCE ────────────────────────────────────────────────────────
+  "attendance.mark": {
+    label: "Mark attendance",
+      description: "Record daily attendance for a class-section.",
+        riskLevel: "low",
+          usedIn: ["Mark Attendance"],
+  },
+  "attendance.report": {
+    label: "View attendance reports",
+      description: "See attendance summaries and reports across classes.",
+        riskLevel: "low",
+          usedIn: ["Attendance Reports"],
+  },
+  "attendance.calendar.manage": {
+    label: "Manage attendance calendar",
+      description: "Set holidays and working-day overrides used for attendance tracking.",
+        riskLevel: "medium",
+          usedIn: ["Attendance Calendar"],
+  },
+
+  // ── FEES ──────────────────────────────────────────────────────────────
+  "fees.structures.manage": {
+    label: "Manage fee structures",
+      description: "Create and edit the fee structures charged to students.",
+        riskLevel: "high",
+          usedIn: ["Fee Structures"],
+  },
+  "fees.payments.record": {
+    label: "Record fee payments",
+      description: "Record a payment received from a student against their fees.",
+        riskLevel: "high",
+          usedIn: ["Fee Payments", "Bulk Fee Assignment"],
+  },
+  "fees.report": {
+    label: "View fee reports",
+      description: "See school-wide fee collection and outstanding-balance reports.",
+        riskLevel: "medium",
+          usedIn: ["Fee Reports"],
+  },
+  "fees.ledger.view": {
+    label: "View student fee ledgers",
+      description: "See any individual student's fee payment history.",
+        riskLevel: "medium",
+          usedIn: ["Student Fee Ledger"],
+  },
+
+  // ── ASSIGNMENTS ───────────────────────────────────────────────────────
+  "assignments.create": {
+    label: "Create assignments",
+      description: "Create a new assignment for a class-section.",
+        riskLevel: "low",
+          usedIn: ["Assignments"],
+  },
+  "assignments.edit": {
+    label: "Edit assignments",
+      description: "Edit an existing assignment's details or due date.",
+        riskLevel: "low",
+          usedIn: ["Assignments"],
+  },
+  "assignments.delete": {
+    label: "Delete assignments",
+      description: "Permanently delete an assignment and its student submissions.",
+        riskLevel: "high",
+          usedIn: ["Assignments"],
+  },
+  "assignments.submissions.view": {
+    label: "View submissions",
+      description: "See student submissions for an assignment.",
+        riskLevel: "low",
+          usedIn: ["Assignment Submissions"],
+  },
+  "assignments.grade": {
+    label: "Grade assignments",
+      description: "Enter grades or feedback on student assignment submissions.",
+        riskLevel: "low",
+          usedIn: ["Assignment Grading"],
+  },
+
+  // ── EXAMS ─────────────────────────────────────────────────────────────
+  "exams.create": {
+    label: "Create exams",
+      description: "Create a new exam for a class-section.",
+        riskLevel: "medium",
+          usedIn: ["Exams"],
+  },
+  "exams.edit": {
+    label: "Edit exams",
+      description: "Edit an existing exam's details, schedule, or subjects.",
+        riskLevel: "medium",
+          usedIn: ["Exams"],
+  },
+  "exams.delete": {
+    label: "Delete exams",
+      description: "Permanently delete an exam and its recorded marks.",
+        riskLevel: "high",
+          usedIn: ["Exams"],
+  },
+  "exams.marks.enter": {
+    label: "Enter exam marks",
+      description: "Enter or update student marks for an exam.",
+        riskLevel: "medium",
+          usedIn: ["Exam Marks Entry"],
+  },
+  "exams.admit-card": {
+    label: "Generate admit cards",
+      description: "Generate exam admit cards for students.",
+        riskLevel: "low",
+          usedIn: ["Admit Cards"],
+  },
+  "exams.report-card": {
+    label: "Generate report cards",
+      description: "Generate student report cards from exam results.",
+        riskLevel: "low",
+          usedIn: ["Report Cards"],
+  },
+  "exams.admit-card.publish": {
+    label: "Publish admit cards",
+      description: "Make generated admit cards visible for students and parents to download.",
+        riskLevel: "medium",
+          usedIn: ["Admit Cards — Publish"],
+  },
+  "exams.report-card.publish": {
+    label: "Publish report cards",
+      description: "Make finalized report cards visible for students and parents to download.",
+        riskLevel: "high",
+          usedIn: ["Report Cards — Publish"],
+  },
+  "exams.templates.manage": {
+    label: "Manage exam templates",
+      description: "Configure the layout used for admit cards and report cards.",
+        riskLevel: "medium",
+          usedIn: ["Exam Templates"],
+  },
+
+  // ── NOTIFICATIONS ─────────────────────────────────────────────────────
+  "notifications.send": {
+    label: "Send notifications",
+      description: "Send notifications to students, parents, or staff.",
+        riskLevel: "medium",
+          usedIn: ["Send Notifications"],
+  },
+  "notifications.view": {
+    label: "View sent notifications",
+      description: "See the history of notifications sent by the school.",
+        riskLevel: "low",
+          usedIn: ["Notifications History"],
+  },
+
+  // ── SETTINGS ──────────────────────────────────────────────────────────
+  "settings.manage": {
+    label: "Manage school settings",
+      description: "Change core school settings such as name, contact details, and branding.",
+        riskLevel: "high",
+          usedIn: ["School Settings"],
+  },
+  "settings.theme.manage": {
+    label: "Manage school theme",
+      description: "Change the school's visual theme and appearance.",
+        riskLevel: "low",
+          usedIn: ["Theme Settings"],
+  },
+
+  // ── BILLING ───────────────────────────────────────────────────────────
+  "billing.view": {
+    label: "View billing",
+      description: "See the school's subscription status, payment history, and access expiry.",
+        riskLevel: "medium",
+          usedIn: ["Billing"],
+  },
+  "billing.manage": {
+    label: "Manage billing",
+      description: "Make payments, manage autopay, and purchase messaging bundles on the school's account.",
+        riskLevel: "critical",
+          usedIn: ["Billing — Payments & Bundles"],
+  },
+
+  // ── STUDENTS ──────────────────────────────────────────────────────────
+  "students.list": {
+    label: "View students",
+      description: "See the list of students enrolled at the school.",
+        riskLevel: "low",
+          usedIn: ["Students List"],
+  },
+  "students.profile.manage": {
+    label: "Manage student profiles",
+      description: "Edit a student's personal, academic, and UDISE+ profile details.",
+        riskLevel: "medium",
+          usedIn: ["Student Profile", "User Creation Hub"],
+  },
+  "students.bulk-upload": {
+    label: "Bulk upload students",
+      description: "Add many students at once from an Excel or CSV file.",
+        riskLevel: "medium",
+          usedIn: ["Bulk Student Upload"],
+  },
+
+  // ── ID CARDS ──────────────────────────────────────────────────────────
+  "id-cards.generate": {
+    label: "Generate ID cards",
+      description: "Generate ID cards for one or more students or staff.",
+        riskLevel: "low",
+          usedIn: ["ID Card Generation"],
+  },
+  "id-cards.view": {
+    label: "View ID cards",
+      description: "See the list of issued ID cards.",
+        riskLevel: "low",
+          usedIn: ["ID Cards"],
+  },
+  "id-cards.revoke": {
+    label: "Revoke ID cards",
+      description: "Revoke an issued ID card and mark it invalid.",
+        riskLevel: "medium",
+          usedIn: ["ID Cards"],
+  },
+  "id-cards.print": {
+    label: "Export ID cards",
+      description: "Download or print generated ID cards as PDF.",
+        riskLevel: "low",
+          usedIn: ["ID Card Export"],
+  },
+  "id-cards.delete": {
+    label: "Delete ID cards",
+      description: "Permanently delete an ID card record.",
+        riskLevel: "high",
+          usedIn: ["ID Cards"],
+  },
+  "id-cards.templates.manage": {
+    label: "Manage ID card templates",
+      description: "Create and edit the layout used for ID cards.",
+        riskLevel: "medium",
+          usedIn: ["ID Card Templates"],
+  },
+
+  // ── FEED ──────────────────────────────────────────────────────────────
+  "feed.post.create": {
+    label: "Create feed posts",
+      description: "Create a new post on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+  "feed.post.manage": {
+    label: "Manage feed posts",
+      description: "Edit or delete any post on the school feed, including posts by others.",
+        riskLevel: "medium",
+          usedIn: ["School Feed — Moderation"],
+  },
+  "feed.view": {
+    label: "View feed",
+      description: "See posts on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+  "feed.react": {
+    label: "React to feed posts",
+      description: "Like or react to posts on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+
+  // ── TEACHERS / PARENTS / CONTACT ──────────────────────────────────────
+  "teachers.profile.manage": {
+    label: "Manage teacher profiles",
+      description: "Edit a teacher's qualification, experience, and specialization details.",
+        riskLevel: "medium",
+          usedIn: ["Teacher Profile"],
+  },
+  "parents.manage": {
+    label: "Manage parent links",
+      description: "Link or unlink parent accounts to their children.",
+        riskLevel: "medium",
+          usedIn: ["Parent-Student Manager"],
+  },
+  "contact.submit": {
+    label: "Submit contact requests",
+      description: "Submit support or contact requests on behalf of the school.",
+        riskLevel: "low",
+          usedIn: ["Contact / Support"],
+  },
+
+  // ── LIBRARY / TRANSPORT ───────────────────────────────────────────────
+  "library.issue": {
+    label: "Issue library books",
+      description: "Issue a library book to a student or staff member.",
+        riskLevel: "low",
+          usedIn: ["Library"],
+  },
+  "library.return": {
+    label: "Return library books",
+      description: "Record the return of a library book.",
+        riskLevel: "low",
+          usedIn: ["Library"],
+  },
+  "transport.manage": {
+    label: "Manage transport",
+      description: "Manage transport routes and vehicle assignments.",
+        riskLevel: "medium",
+          usedIn: ["Transport"],
+  },
+
+  // ══════════════════════════════════════════════════════════════════════
+  // STUDENT PORTAL
+  // ══════════════════════════════════════════════════════════════════════
+  "dashboard.student.view": {
+    label: "View student dashboard",
+      description: "See their own dashboard with attendance, fees, and assignment summaries.",
+        riskLevel: "low",
+          usedIn: ["Student Dashboard"],
+  },
+  "students.view.own": {
+    label: "View own profile",
+      description: "See their own student profile details.",
+        riskLevel: "low",
+          usedIn: ["Student Profile"],
+  },
+  "attendance.student.view": {
+    label: "View own attendance",
+      description: "See their own attendance record.",
+        riskLevel: "low",
+          usedIn: ["Student Attendance"],
+  },
+  "fees.student.view": {
+    label: "View own fees",
+      description: "See their own fee ledger and payment history.",
+        riskLevel: "low",
+          usedIn: ["Student Fees"],
+  },
+  "assignments.student.view": {
+    label: "View own assignments",
+      description: "See assignments given to their class.",
+        riskLevel: "low",
+          usedIn: ["Student Assignments"],
+  },
+  "assignments.student.submit": {
+    label: "Submit assignments",
+      description: "Mark their own assignment as submitted.",
+        riskLevel: "low",
+          usedIn: ["Student Assignments"],
+  },
+  "exams.student.view": {
+    label: "View own marks",
+      description: "See their own exam marks and results.",
+        riskLevel: "low",
+          usedIn: ["Student Marks"],
+  },
+  "exams.student.admit-card": {
+    label: "Download own admit card",
+      description: "Download their own exam admit card.",
+        riskLevel: "low",
+          usedIn: ["Student Admit Card"],
+  },
+  "exams.student.report-card": {
+    label: "Download own report card",
+      description: "Download their own report card.",
+        riskLevel: "low",
+          usedIn: ["Student Report Card"],
+  },
+  "notifications.student.view": {
+    label: "View notifications",
+      description: "See notifications sent to them.",
+        riskLevel: "low",
+          usedIn: ["Student Notifications"],
+  },
+  "feed.student.view": {
+    label: "View feed",
+      description: "See posts on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+  "feed.student.react": {
+    label: "React to feed posts",
+      description: "Like or react to posts on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+
+  // ══════════════════════════════════════════════════════════════════════
+  // PARENT PORTAL
+  // ══════════════════════════════════════════════════════════════════════
+  "dashboard.parent.view": {
+    label: "View parent dashboard",
+      description: "See their dashboard with their child's attendance, fees, and assignment summaries.",
+        riskLevel: "low",
+          usedIn: ["Parent Dashboard"],
+  },
+  "attendance.parent.view": {
+    label: "View child's attendance",
+      description: "See their child's attendance record.",
+        riskLevel: "low",
+          usedIn: ["Child Attendance"],
+  },
+  "fees.parent.view": {
+    label: "View child's fees",
+      description: "See their child's fee summary and payment history.",
+        riskLevel: "low",
+          usedIn: ["Child Fees"],
+  },
+  "assignments.parent.view": {
+    label: "View child's assignments",
+      description: "See assignments given to their child's class.",
+        riskLevel: "low",
+          usedIn: ["Child Assignments"],
+  },
+  "exams.parent.view": {
+    label: "View child's marks",
+      description: "See their child's exam marks and results.",
+        riskLevel: "low",
+          usedIn: ["Child Marks"],
+  },
+  "exams.parent.admit-card": {
+    label: "Download child's admit card",
+      description: "Download their child's exam admit card.",
+        riskLevel: "low",
+          usedIn: ["Child Admit Card"],
+  },
+  "exams.parent.report-card": {
+    label: "Download child's report card",
+      description: "Download their child's report card.",
+        riskLevel: "low",
+          usedIn: ["Child Report Card"],
+  },
+  "notifications.parent.view": {
+    label: "View notifications",
+      description: "See notifications sent to them.",
+        riskLevel: "low",
+          usedIn: ["Parent Notifications"],
+  },
+  "feed.parent.view": {
+    label: "View feed",
+      description: "See posts on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+  "feed.parent.react": {
+    label: "React to feed posts",
+      description: "Like or react to posts on the school feed.",
+        riskLevel: "low",
+          usedIn: ["School Feed"],
+  },
+};
+
+/**
+ * Merges a permission's static metadata onto a DB row's display fields.
+ * Never persists — call this in any route/service that returns permission
+ * objects for display, right before sending the response.
+ *
+ * Falls back to a mechanically-generated label if a slug somehow reaches
+ * here without a metadata entry (shouldn't happen — the Record type above
+ * makes that a compile error for known slugs — but this guards against
+ * stale/legacy rows in an already-seeded school's DB).
+ */
+export function getPermissionMeta(slug: string): PermissionMeta {
+  const meta = (PERMISSION_METADATA as Record<string, PermissionMeta>)[slug];
+  if (meta) return meta;
+
+  console.warn(
+    `⚠️ No PERMISSION_METADATA entry for slug "${slug}" — using generated fallback copy. Add an entry in school-permissions.ts.`
+  );
+  return {
+    label: slug
+      .split(".")
+      .map((part) =>
+        part
+          .split("-")
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+          .join(" ")
+      )
+      .join(" "),
+    description: `No description written yet for "${slug}".`,
+    riskLevel: "low",
+    usedIn: [],
+  };
+}

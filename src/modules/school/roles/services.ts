@@ -13,7 +13,7 @@ import {
 } from "../../../db/schemas/school";
 import { getSchoolDB } from "../../../db/school-client";
 import { SchoolEnv } from "../../../types/common-types";
-import { PermissionCategory } from "../../../types/school-permissions";
+import { getPermissionMeta, PermissionCategory } from "../../../types/school-permissions";
 
 // ── Category label map for human-readable error messages ─────────────────────
 const CATEGORY_LABELS: Record<PermissionCategory, string> = {
@@ -65,16 +65,15 @@ async function assertPermissionsCategoryMatch(
     const slugList = wrongCategory
       .map(
         (p: { slug: string; category: string }) =>
-          `"${p.slug}" (${
-            CATEGORY_LABELS[p.category as PermissionCategory] ?? p.category
+          `"${p.slug}" (${CATEGORY_LABELS[p.category as PermissionCategory] ?? p.category
           })`
       )
       .join(", ");
 
     throw new Error(
       `Category mismatch: The following permissions do not belong to the ` +
-        `"${CATEGORY_LABELS[expectedCategory]}" category: ${slugList}. ` +
-        `Only ${CATEGORY_LABELS[expectedCategory]} permissions can be assigned to this role.`
+      `"${CATEGORY_LABELS[expectedCategory]}" category: ${slugList}. ` +
+      `Only ${CATEGORY_LABELS[expectedCategory]} permissions can be assigned to this role.`
     );
   }
 }
@@ -183,13 +182,32 @@ export async function getAllRoles(
     .all();
 
   // Group permissions by role
+  // const permissionsByRole = permissionsData.reduce(
+  //   (acc: Record<number, any[]>, perm: any) => {
+  //     if (!acc[perm.roleId]) acc[perm.roleId] = [];
+  //     acc[perm.roleId].push({
+  //       id: perm.permissionId,
+  //       slug: perm.slug,
+  //       name: perm.name,
+  //       module: perm.module,
+  //       category: perm.category,
+  //     });
+  //     return acc;
+  //   },
+  //   {} as Record<number, any[]>
+  // );
+
   const permissionsByRole = permissionsData.reduce(
     (acc: Record<number, any[]>, perm: any) => {
       if (!acc[perm.roleId]) acc[perm.roleId] = [];
+      const meta = getPermissionMeta(perm.slug);
       acc[perm.roleId].push({
         id: perm.permissionId,
         slug: perm.slug,
-        name: perm.name,
+        name: meta.label,
+        description: meta.description,
+        riskLevel: meta.riskLevel,
+        usedIn: meta.usedIn,
         module: perm.module,
         category: perm.category,
       });
@@ -246,9 +264,20 @@ export async function getRoleById(
     .where(eq(schoolRolePermissionsSchema.roleId, id))
     .all();
 
+    const enrichedPermissions = permissions.map((p) => {
+      const meta = getPermissionMeta(p.slug);
+      return {
+        ...p,
+        name: meta.label,
+        description: meta.description,
+        riskLevel: meta.riskLevel,
+        usedIn: meta.usedIn,
+      };
+    });
+
   return {
     ...role,
-    permissions,
+    permissions: enrichedPermissions,
   };
 }
 

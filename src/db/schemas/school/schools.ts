@@ -37,6 +37,25 @@ export const schoolsSchema = sqliteTable("schools", {
   stateCode: text("state_code"), // 2-digit state code per Census of India
 
   /**
+   * WEEKLY OFF DAYS — school-wide recurring non-working days.
+   * JSON array of day-of-week integers: 0=Sunday, 1=Monday, ..., 6=Saturday
+   * (matches JS Date#getUTCDay()).
+   *
+   * Applied by the attendance calendar resolver as the LOWEST-priority rule —
+   * any explicit HOLIDAY/WORKING_DAY row in attendance_calendar for a specific
+   * date still overrides this (e.g. one class-section running makeup classes
+   * on a particular Sunday).
+   *
+   * Stored as JSON text rather than a separate table: this is singleton
+   * school-wide config, not per-date exception data, so the "store
+   * exceptions only" philosophy used elsewhere in the calendar system
+   * doesn't apply here.
+   *
+   * Default: "[0]" — Sunday off, the most common convention.
+   */
+  weeklyOffDays: text("weekly_off_days").notNull().default("[0]"),
+
+  /**
    * District UDISE code — 4 digits, part of the UDISE code but stored
    * separately for easy filtering in multi-school dashboards.
    */

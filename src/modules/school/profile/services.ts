@@ -14,6 +14,13 @@ import { getSchoolDB } from "../../../db/school-client";
 import { SchoolEnv } from "../../../types/common-types";
 import { comparePassword, hashPassword } from "../../../utils/hashing";
 import { getProfileCategory } from "../../../utils/school/profile-mapping";
+import {
+  isValidUsernameFormat,
+  normalizeUsername,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+} from "../../../utils/school/username";
+import { isUniqueConstraintError } from "../../../utils/db-errors";
 
 // ==================== GET MY PROFILE ====================
 /**
@@ -34,7 +41,8 @@ export async function getMyProfile(
       // Base user fields
       id: schoolUsersSchema.id,
       name: schoolUsersSchema.name,
-      email: schoolUsersSchema.email,
+      username: schoolUsersSchema.username,
+      email: schoolUsersSchema.email, // nullable — email is now optional
       primaryRole: schoolUsersSchema.primaryRole,
       phone: schoolUsersSchema.phone,
       alternatePhone: schoolUsersSchema.alternatePhone,
@@ -103,11 +111,11 @@ export async function getMyProfile(
   // 3. Determine profile type and shape the response
   const profileType = detectProfileType(userWithProfile, userWithProfile.primaryRole ?? "");
 
-
   return {
     // Core identity
     id: userWithProfile.id,
     name: userWithProfile.name,
+    username: userWithProfile.username,
     email: userWithProfile.email,
     primaryRole: userWithProfile.primaryRole,
     phone: userWithProfile.phone,
@@ -190,6 +198,74 @@ export async function updateMyProfile(
   return { message: "Profile updated successfully" };
 }
 
+// ==================== CHANGE MY USERNAME ====================
+/**
+ * Self-service username change for the authenticated user.
+ *
+ * Mirrors changeSchoolUserUsername() in the users module (same normalize →
+ * format-check → optimistic-write → unique-constraint-catch pattern), but:
+ *   - is scoped to the CALLER's own account (no :id param, no admin permission)
+ *   - requires current password verification, matching changeMyPassword /
+ *     changeMyEmail, since the username doubles as a login credential.
+ *
+ * Deliberately does NOT bump tokenVersion — the JWT does not encode the
+ * username, so existing sessions stay valid. The user only needs the new
+ * username the next time they log in.
+ */
+export async function changeMyUsername(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number,
+  newUsername: string,
+  currentPassword: string
+): Promise<{ username: string }> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const normalized = normalizeUsername(newUsername);
+  if (!isValidUsernameFormat(normalized)) {
+    throw new Error(
+      `Invalid username. Usernames must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers.`
+    );
+  }
+
+  const user = await db
+    .select({
+      id: schoolUsersSchema.id,
+      username: schoolUsersSchema.username,
+      passwordHash: schoolUsersSchema.passwordHash,
+    })
+    .from(schoolUsersSchema)
+    .where(eq(schoolUsersSchema.id, userId))
+    .get();
+
+  if (!user) throw new Error("User not found");
+
+  const isValid = await comparePassword(currentPassword, user.passwordHash);
+  if (!isValid) {
+    throw new Error("Current password is incorrect");
+  }
+
+  if (user.username === normalized) {
+    throw new Error("New username is the same as your current username");
+  }
+
+  try {
+    await db
+      .update(schoolUsersSchema)
+      .set({ username: normalized, updatedAt: sql`CURRENT_TIMESTAMP` })
+      .where(eq(schoolUsersSchema.id, userId));
+  } catch (err: any) {
+    if (isUniqueConstraintError(err, "username")) {
+      throw new Error(
+        "This username is already taken. Please choose a different one."
+      );
+    }
+    throw err;
+  }
+
+  return { username: normalized };
+}
+
 // ==================== CHANGE MY PASSWORD ====================
 export async function changeMyPassword(
   env: SchoolEnv["Bindings"],
@@ -249,7 +325,7 @@ export async function changeMyEmail(
   const user = await db
     .select({
       id: schoolUsersSchema.id,
-      email: schoolUsersSchema.email,
+      email: schoolUsersSchema.email, // nullable — user may not have one yet
       passwordHash: schoolUsersSchema.passwordHash,
       tokenVersion: schoolUsersSchema.tokenVersion,
     })
@@ -305,12 +381,9 @@ export async function changeMyEmail(
 
 type ProfileType = "student" | "teacher" | "parent" | "staff" | "unknown";
 
-// Replace the detectProfileType function with:
 function detectProfileType(row: any, primaryRole: string): ProfileType {
-  // Use primaryRole as the authoritative source — no more heuristic detection
   const category = getProfileCategory(primaryRole);
-  
-  // Verify the profile data actually exists (handle edge cases)
+
   switch (category) {
     case "student":
       if (row.studentRollNumber !== null || row.studentAdmissionDate !== null)
@@ -327,12 +400,9 @@ function detectProfileType(row: any, primaryRole: string): ProfileType {
       if (row.staffDesignation !== null) return "staff";
       break;
   }
-  
-  // Fallback: return the category from primaryRole even if profile row is empty
-  // This handles newly created users whose profile might have only empty strings
+
   return category as ProfileType;
 }
-
 
 function buildProfileData(type: ProfileType, row: any) {
   switch (type) {

@@ -59,6 +59,7 @@ const DEFAULT_ROLE_PERMISSIONS: Record<string, PermissionSlugWithWildcard[]> = {
     "academics.mappings.manage",
     "attendance.mark",
     "attendance.report",
+    "attendance.calendar.manage",
     "fees.report",
     "fees.ledger.view",
     "exams.create",

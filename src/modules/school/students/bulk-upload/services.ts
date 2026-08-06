@@ -23,6 +23,15 @@ import {
   isValidPEN,
   isValidUDISECode,
 } from "../../../../utils/school/udise-validators";
+import { isUniqueConstraintError } from "../../../../utils/db-errors";
+import {
+  buildUsernameBase,
+  isValidUsernameFormat,
+  normalizeUsername,
+  randomUsernameSuffix,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+} from "../../../../utils/school/username";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // CONSTANTS
@@ -111,7 +120,8 @@ const RELIGION_MAP: Record<string, number> = {
 export interface BulkStudentRow {
   rowNumber: number;
   name: string;
-  email: string;
+  email?: string; // now optional — a row may have no email
+  username?: string; // optional; auto-generated (name+class+section) if omitted
   password: string;
   phone?: string;
   alternatePhone?: string;
@@ -156,10 +166,21 @@ export interface EmailConflict {
   conflictType: "DUPLICATE_IN_FILE" | "ALREADY_IN_SCHOOL";
 }
 
+/** Mirrors EmailConflict — for explicit (admin-typed) usernames that collide. */
+export interface UsernameConflict {
+  rowNumber: number;
+  name: string;
+  username: string;
+  conflictType: "DUPLICATE_IN_FILE" | "ALREADY_IN_SCHOOL";
+}
+
 export interface BulkUploadRowResult {
   rowNumber: number;
   name: string;
   email: string;
+  username?: string; // populated on SUCCESS — the only place to find an
+  // auto-generated or admin-supplied username, especially important now
+  // that a row may have no email to communicate credentials through.
   status: "SUCCESS" | "FAILED" | "SKIPPED";
   error?: string;
   userId?: number;
@@ -178,6 +199,7 @@ export interface BulkUploadResult {
   };
   results: BulkUploadRowResult[];
   emailConflicts?: EmailConflict[];
+  usernameConflicts?: UsernameConflict[];
   capacityInfo?: {
     existingStudents: number;
     addedStudents: number;
@@ -242,7 +264,7 @@ async function parseExcelBuffer(
     throw new Error(
       "Could not find the header row in the Excel file. " +
       "Make sure you are using the official student upload template and have NOT " +
-      'renamed or removed the "Name *", "Email *", or "Password *" column headers.'
+      'renamed or removed the "Name *", "Email", or "Password *" column headers.'
     );
 
   const hintRowIndex = headerRowIndex + 1;
@@ -285,6 +307,7 @@ async function parseExcelBuffer(
     name: findCol(["student name"], ["full name"], ["name"]),
     email: findCol(["email address"], ["e mail"], ["email"]),
     password: findCol(["password"], ["pass"]),
+    username: findCol(["username"], ["user name"], ["login id"], ["login"]),
     alternatePhone: findCol(
       ["alternate phone"],
       ["alt phone"],
@@ -385,10 +408,12 @@ async function parseExcelBuffer(
 
   const missing: string[] = [];
   if (colMap.name === -1 || colMap.name === snoColIndex) missing.push("Name");
-  if (colMap.email === -1 || colMap.email === snoColIndex)
-    missing.push("Email");
   if (colMap.password === -1 || colMap.password === snoColIndex)
     missing.push("Password");
+  // NOTE: Email is no longer required — it is intentionally NOT included in
+  // this required-column check. It's still detected by findCol() above (and
+  // used by isHeaderRow() to locate the header row itself), but a school
+  // with an Email column present-but-empty for every row is a valid file.
   if (missing.length > 0)
     throw new Error(
       `Missing required column${missing.length > 1 ? "s" : ""}: ${missing.join(
@@ -422,12 +447,14 @@ async function parseExcelBuffer(
     const nameVal = str(colMap.name);
     const emailVal = str(colMap.email).toLowerCase();
     const passwordVal = str(colMap.password);
-    if (!nameVal && !emailVal && !passwordVal) continue;
+    const usernameVal = str(colMap.username);
+    if (!nameVal && !emailVal && !passwordVal && !usernameVal) continue;
 
     rows.push({
       rowNumber: excelRowNumber,
       name: nameVal,
-      email: emailVal,
+      email: emailVal || undefined, // optional — undefined when blank
+      username: usernameVal ? normalizeUsername(usernameVal) : undefined,
       password: passwordVal,
       phone: str(colMap.phone) || undefined,
       alternatePhone: str(colMap.alternatePhone) || undefined,
@@ -469,10 +496,15 @@ async function parseExcelBuffer(
 function validateRow(row: BulkStudentRow): string | null {
   if (!row.name || row.name.length < 2)
     return "Name must be at least 2 characters";
-  if (!row.email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email))
+  if (row.email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(row.email))
     return "Invalid email address";
   if (!row.password || row.password.length < 8)
     return "Password must be at least 8 characters";
+  if (row.username && !isValidUsernameFormat(row.username))
+    return (
+      `Invalid username "${row.username}". Must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} ` +
+      "characters, start with a letter, and contain only lowercase letters and numbers."
+    );
   if (row.gender && !GENDER_NORMALIZER[row.gender.toLowerCase()])
     return `Invalid gender "${row.gender}". Use: Male, Female, or Transgender`;
   if (
@@ -592,6 +624,187 @@ function normaliseDateCell(raw: any): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// BULK USERNAME GENERATION
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Strips a string to lowercase ASCII alphanumerics only. Unlike
+ * buildUsernameBase(), this does NOT strip leading digits — it's used for
+ * the class/section segments of a bulk username, which are never the first
+ * character of the final string, so a leading digit there (e.g. class "2")
+ * is perfectly fine and exactly what produces the "amit2a" pattern.
+ */
+function asciiAlnumSlug(s: string): string {
+  return s
+    .toLowerCase()
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/g, "");
+}
+
+/**
+ * Builds a human-recognizable username base for a bulk-uploaded student:
+ * firstName + className + sectionName, e.g. "Amit Sharma" in Class 2 /
+ * Section A → "amit2a". Deliberately different from the single-user-create
+ * path's name+random-suffix pattern — bulk uploads benefit from a readable,
+ * predictable convention the admin can anticipate across a whole class list.
+ *
+ * The name segment goes through buildUsernameBase() (which guarantees the
+ * result starts with a letter and is never empty), so the combined string
+ * always satisfies the "must start with a letter" rule regardless of what
+ * className/sectionName contribute.
+ */
+function buildBulkStudentUsernameBase(
+  name: string,
+  className: string,
+  sectionName: string
+): string {
+  const firstWord = name.trim().split(/\s+/)[0] ?? "";
+  const namePart = buildUsernameBase(firstWord || name, 14);
+  const classPart = asciiAlnumSlug(className).slice(0, 8);
+  const sectionPart = asciiAlnumSlug(sectionName).slice(0, 4);
+
+  let combined = `${namePart}${classPart}${sectionPart}`;
+  if (combined.length < USERNAME_MIN_LENGTH) {
+    // Pathological edge case — e.g. a class/section named entirely in a
+    // script with no ASCII letters/digits. Pad rather than fail; digits at
+    // the END are fine format-wise (only a LEADING digit is disallowed).
+    combined = combined.padEnd(USERNAME_MIN_LENGTH, "0");
+  }
+  // Leave headroom for up to a 6-char random suffix if a collision forces
+  // regeneration, so the final candidate never exceeds USERNAME_MAX_LENGTH.
+  return combined.slice(0, USERNAME_MAX_LENGTH - 6);
+}
+
+interface UsernameRowState {
+  row: BulkStudentRow;
+  isExplicit: boolean;
+  base: string;
+  candidate: string;
+  finalized: boolean;
+}
+
+/**
+ * Resolves a unique username for every row in ONE pass across at most a
+ * few DB round trips total (not per-row):
+ *
+ *   Round 0: candidates are checked against a set the CALLER already fetched
+ *            as part of the SAME db.batch() call that also fetches capacity
+ *            + existing emails — zero extra round trips for the common,
+ *            no-collision case.
+ *   Round 1+: only entered if round 0 found collisions (in-file duplicates
+ *            like two "Amit"s in 2A, or a name+class+section combo that
+ *            happens to already exist) — one extra SELECT per round,
+ *            checking only the handful of regenerated candidates, not the
+ *            whole batch.
+ *
+ * Explicit (admin-typed) usernames that collide are NOT auto-regenerated —
+ * they're collected as blocking conflicts, mirroring how email conflicts
+ * already halt the whole upload. Only auto-generated candidates get the
+ * retry-with-random-suffix treatment.
+ */
+async function resolveBulkUsernames(
+  db: any,
+  rows: BulkStudentRow[],
+  className: string,
+  sectionName: string,
+  round0ExistingUsernames: Set<string>
+): Promise<{
+  finalUsernameByRow: Map<number, string>;
+  usernameConflicts: UsernameConflict[];
+}> {
+  const states: UsernameRowState[] = rows.map((row) => {
+    if (row.username) {
+      return {
+        row,
+        isExplicit: true,
+        base: row.username,
+        candidate: row.username,
+        finalized: false,
+      };
+    }
+    const base = buildBulkStudentUsernameBase(row.name, className, sectionName);
+    return { row, isExplicit: false, base, candidate: base, finalized: false };
+  });
+
+  const usernameConflicts: UsernameConflict[] = [];
+  const MAX_ROUNDS = 5;
+  let round = 0;
+
+  while (round < MAX_ROUNDS) {
+    const unresolved = states.filter((s) => !s.finalized);
+    if (unresolved.length === 0) break;
+
+    const claimed = new Map<string, UsernameRowState>();
+    states.filter((s) => s.finalized).forEach((s) => claimed.set(s.candidate, s));
+
+    let dbConflictSet: Set<string>;
+    if (round === 0) {
+      dbConflictSet = round0ExistingUsernames;
+    } else {
+      const toCheck = [...new Set(unresolved.map((s) => s.candidate))];
+      const dbRows = await db
+        .select({ username: schoolUsersSchema.username })
+        .from(schoolUsersSchema)
+        .where(
+          inArray(schoolUsersSchema.username, toCheck.length > 0 ? toCheck : ["__none__"])
+        )
+        .all();
+      dbConflictSet = new Set(dbRows.map((r: any) => r.username));
+    }
+
+    for (const state of unresolved) {
+      const inDb = dbConflictSet.has(state.candidate);
+      const inBatch = claimed.has(state.candidate);
+
+      if (!inDb && !inBatch) {
+        state.finalized = true;
+        claimed.set(state.candidate, state);
+        continue;
+      }
+
+      if (state.isExplicit) {
+        usernameConflicts.push({
+          rowNumber: state.row.rowNumber,
+          name: state.row.name,
+          username: state.candidate,
+          conflictType: inDb ? "ALREADY_IN_SCHOOL" : "DUPLICATE_IN_FILE",
+        });
+        state.finalized = true; // don't retry — this is a blocking error
+        continue;
+      }
+
+      // Auto-generated: draw a fresh random suffix and retry next round.
+      const suffixLength = round < 2 ? 4 : 6;
+      state.candidate = `${state.base}${randomUsernameSuffix(suffixLength)}`.slice(
+        0,
+        USERNAME_MAX_LENGTH
+      );
+    }
+
+    round++;
+  }
+
+  const stillUnresolved = states.filter((s) => !s.finalized);
+  if (stillUnresolved.length > 0) {
+    // Astronomically unlikely (would need repeated collisions across every
+    // round for the same row) — log and let it through with its last
+    // candidate. If it does somehow collide at insert time, the existing
+    // batch-insert-then-sequential-fallback safety net catches it as an
+    // ordinary per-row failure (see the sequential fallback branch below).
+    console.warn(
+      `[bulk-upload] ${stillUnresolved.length} row(s) could not get a confirmed-unique username after ${MAX_ROUNDS} rounds — proceeding with best-effort candidates.`
+    );
+  }
+
+  const finalUsernameByRow = new Map<number, string>(
+    states.map((s) => [s.row.rowNumber, s.candidate])
+  );
+
+  return { finalUsernameByRow, usernameConflicts };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // GET CAPACITY INFO
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -664,6 +877,7 @@ export async function getClassSectionCapacityInfo(
 
 function buildWelcomeEmail(
   row: BulkStudentRow,
+  username: string,
   className: string,
   sectionName: string,
   schoolCode: string
@@ -678,13 +892,20 @@ function buildWelcomeEmail(
           <strong>${className} – ${sectionName}</strong>.
         </p>
         <div style="background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:20px;margin:0 0 20px">
+          <p style="margin:0 0 4px;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.05em">Username</p>
+          <p style="margin:0 0 16px;color:#1e293b;font-weight:600;font-size:15px">${username}</p>
+          ${row.email
+        ? `
           <p style="margin:0 0 4px;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.05em">Login Email</p>
           <p style="margin:0 0 16px;color:#1e293b;font-weight:600;font-size:15px">${row.email}</p>
+          `
+        : ""
+      }
           <p style="margin:0 0 4px;color:#64748b;font-size:12px;text-transform:uppercase;letter-spacing:.05em">Temporary Password</p>
           <p style="margin:0;color:#1e293b;font-weight:600;font-size:15px">${row.password}</p>
         </div>
         <p style="color:#f59e0b;font-size:13px;margin:0">
-          ⚠️ Please change your password after your first login.
+          ⚠️ Please change your password after your first login. You can log in with either your username or email.
         </p>
       </div>
     `,
@@ -698,6 +919,7 @@ function buildWelcomeEmail(
 interface ResolvedStudentData {
   row: BulkStudentRow;
   passwordHash: string;
+  username: string;
   genderValue: string;
   bloodGroupValue: string;
   socialCategory: number | null;
@@ -710,7 +932,8 @@ interface ResolvedStudentData {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function resolveAllRows(
-  validRows: BulkStudentRow[]
+  validRows: BulkStudentRow[],
+  usernameByRow: Map<number, string>
 ): Promise<ResolvedStudentData[]> {
   return Promise.all(
     validRows.map(async (row) => {
@@ -718,6 +941,7 @@ async function resolveAllRows(
       return {
         row,
         passwordHash,
+        username: usernameByRow.get(row.rowNumber)!,
         genderValue: normaliseGender(row.gender),
         bloodGroupValue: normaliseBloodGroup(row.bloodGroup),
         socialCategory: row.socialCategoryRaw
@@ -813,10 +1037,27 @@ export async function bulkUploadStudents(
   const resolvedAcademicYearId = resolvedYear.id;
   const maxAllowed = classSection.capacity;
 
-  // ── 3. Capacity + email conflict — second batch round-trip ──────────────────
-  const allEmails = rows.map((r) => r.email.toLowerCase());
+  // ── 2.5. Build round-0 username candidates BEFORE the batch call, so the
+  //    DB check can be folded into the SAME round trip as capacity+email
+  //    (zero extra subrequests in the common, no-collision case). ────────────
+  const round0Candidates = [
+    ...new Set(
+      rows.map((row) =>
+        row.username
+          ? row.username
+          : buildBulkStudentUsernameBase(
+            row.name,
+            classSection.className,
+            classSection.sectionName
+          )
+      )
+    ),
+  ];
 
-  const [countResult, existingUsersResult] = await db.batch([
+  // ── 3. Capacity + email conflict + username round-0 — ONE batch round-trip ─
+  const allEmails = rows.filter((r) => r.email).map((r) => r.email!.toLowerCase());
+
+  const [countResult, existingUsersResult, existingUsernamesResult] = await db.batch([
     db
       .select({ count: sql<number>`count(*)` })
       .from(schoolStudentEnrollmentsSchema)
@@ -836,7 +1077,21 @@ export async function bulkUploadStudents(
     db
       .select({ email: schoolUsersSchema.email })
       .from(schoolUsersSchema)
-      .where(inArray(schoolUsersSchema.email, allEmails)),
+      .where(
+        inArray(
+          schoolUsersSchema.email,
+          allEmails.length > 0 ? allEmails : ["__none__"]
+        )
+      ),
+    db
+      .select({ username: schoolUsersSchema.username })
+      .from(schoolUsersSchema)
+      .where(
+        inArray(
+          schoolUsersSchema.username,
+          round0Candidates.length > 0 ? round0Candidates : ["__none__"]
+        )
+      ),
   ] as const);
 
   const existingStudents = (countResult[0]?.count ?? 0) as number;
@@ -888,11 +1143,25 @@ export async function bulkUploadStudents(
     };
   }
 
-  // ── 4. Email conflict detection ─────────────────────────────────────────────
+  // ── 4. Resolve final usernames — round 0 result feeds in from the batch
+  //    above; further rounds only run if collisions were actually found ──────
+  const existingUsernameSet = new Set(
+    existingUsernamesResult.map((u: any) => u.username)
+  );
+  const { finalUsernameByRow, usernameConflicts } = await resolveBulkUsernames(
+    db,
+    rows,
+    classSection.className,
+    classSection.sectionName,
+    existingUsernameSet
+  );
+
+  // ── 5. Email conflict detection — only rows that actually have an email ────
   const emailConflicts: EmailConflict[] = [];
   const seenEmails = new Map<string, number>();
 
   for (const row of rows) {
+    if (!row.email) continue;
     const lower = row.email.toLowerCase();
     if (seenEmails.has(lower)) {
       emailConflicts.push({
@@ -907,9 +1176,12 @@ export async function bulkUploadStudents(
   }
 
   const existingEmailSet = new Set(
-    existingUsersResult.map((u) => u.email.toLowerCase())
+    existingUsersResult
+      .map((u: any) => u.email?.toLowerCase())
+      .filter(Boolean)
   );
   for (const row of rows) {
+    if (!row.email) continue;
     if (
       existingEmailSet.has(row.email.toLowerCase()) &&
       !emailConflicts.some((c) => c.rowNumber === row.rowNumber)
@@ -923,24 +1195,48 @@ export async function bulkUploadStudents(
     }
   }
 
-  if (emailConflicts.length > 0) {
-    const inFileCount = emailConflicts.filter(
-      (c) => c.conflictType === "DUPLICATE_IN_FILE"
-    ).length;
-    const inSchoolCount = emailConflicts.filter(
-      (c) => c.conflictType === "ALREADY_IN_SCHOOL"
-    ).length;
+  // ── 6. Combined blocking response — email OR username conflicts ────────────
+  if (emailConflicts.length > 0 || usernameConflicts.length > 0) {
     const parts: string[] = [];
-    if (inSchoolCount > 0)
-      parts.push(
-        `${inSchoolCount} email${inSchoolCount !== 1 ? "s are" : " is"
-        } already registered in this school`
-      );
-    if (inFileCount > 0)
-      parts.push(
-        `${inFileCount} duplicate email${inFileCount !== 1 ? "s" : ""
-        } within the file`
-      );
+
+    if (emailConflicts.length > 0) {
+      const inFileCount = emailConflicts.filter(
+        (c) => c.conflictType === "DUPLICATE_IN_FILE"
+      ).length;
+      const inSchoolCount = emailConflicts.filter(
+        (c) => c.conflictType === "ALREADY_IN_SCHOOL"
+      ).length;
+      if (inSchoolCount > 0)
+        parts.push(
+          `${inSchoolCount} email${inSchoolCount !== 1 ? "s are" : " is"
+          } already registered in this school`
+        );
+      if (inFileCount > 0)
+        parts.push(
+          `${inFileCount} duplicate email${inFileCount !== 1 ? "s" : ""
+          } within the file`
+        );
+    }
+
+    if (usernameConflicts.length > 0) {
+      const inFileCount = usernameConflicts.filter(
+        (c) => c.conflictType === "DUPLICATE_IN_FILE"
+      ).length;
+      const inSchoolCount = usernameConflicts.filter(
+        (c) => c.conflictType === "ALREADY_IN_SCHOOL"
+      ).length;
+      if (inSchoolCount > 0)
+        parts.push(
+          `${inSchoolCount} username${inSchoolCount !== 1 ? "s are" : " is"
+          } already taken in this school`
+        );
+      if (inFileCount > 0)
+        parts.push(
+          `${inFileCount} duplicate username${inFileCount !== 1 ? "s" : ""
+          } within the file`
+        );
+    }
+
     return {
       success: false,
       message: `Upload blocked: ${parts.join(
@@ -949,16 +1245,18 @@ export async function bulkUploadStudents(
       summary: {
         totalRows: rows.length,
         successful: 0,
-        failed: emailConflicts.length,
+        failed: emailConflicts.length + usernameConflicts.length,
         skipped: 0,
         udiseWarnings: 0,
       },
       results: [],
-      emailConflicts,
+      emailConflicts: emailConflicts.length > 0 ? emailConflicts : undefined,
+      usernameConflicts:
+        usernameConflicts.length > 0 ? usernameConflicts : undefined,
     };
   }
 
-  // ── 5. Per-row validation ───────────────────────────────────────────────────
+  // ── 7. Per-row validation ───────────────────────────────────────────────────
   const rowResults: BulkUploadRowResult[] = [];
   const validRows: BulkStudentRow[] = [];
 
@@ -968,7 +1266,7 @@ export async function bulkUploadStudents(
       rowResults.push({
         rowNumber: row.rowNumber,
         name: row.name,
-        email: row.email,
+        email: row.email ?? "",
         status: "FAILED",
         error: err,
       });
@@ -992,13 +1290,14 @@ export async function bulkUploadStudents(
     };
   }
 
-  // ── 6. Parallel PBKDF2 hashing ──────────────────────────────────────────────
-  const resolved = await resolveAllRows(validRows);
+  // ── 8. Parallel PBKDF2 hashing + username attachment ────────────────────────
+  const resolved = await resolveAllRows(validRows, finalUsernameByRow);
 
-  // ── 7. Build insert payloads ────────────────────────────────────────────────
+  // ── 9. Build insert payloads ────────────────────────────────────────────────
   const userValues = resolved.map((r) => ({
     name: r.row.name,
-    email: r.row.email,
+    username: r.username,
+    email: r.row.email || null,
     passwordHash: r.passwordHash,
     primaryRole: SchoolRole.STUDENT,
     phone: r.row.phone || "",
@@ -1020,7 +1319,7 @@ export async function bulkUploadStudents(
     isActive: true,
   }));
 
-  // ── 8. Batch insert ─────────────────────────────────────────────────────────
+  // ── 10. Batch insert ─────────────────────────────────────────────────────────
   const insertedUserIds: number[] = [];
 
   try {
@@ -1083,7 +1382,8 @@ export async function bulkUploadStudents(
       rowResults.push({
         rowNumber: r.row.rowNumber,
         name: r.row.name,
-        email: r.row.email,
+        email: r.row.email ?? "",
+        username: r.username,
         status: "SUCCESS",
         userId: insertedUserIds[idx],
         udiseWarnings: r.udiseWarnings.length > 0 ? r.udiseWarnings : undefined,
@@ -1100,7 +1400,8 @@ export async function bulkUploadStudents(
           .insert(schoolUsersSchema)
           .values({
             name: r.row.name,
-            email: r.row.email,
+            username: r.username,
+            email: r.row.email || null,
             passwordHash: r.passwordHash,
             primaryRole: SchoolRole.STUDENT,
             phone: r.row.phone || "",
@@ -1164,7 +1465,8 @@ export async function bulkUploadStudents(
         rowResults.push({
           rowNumber: r.row.rowNumber,
           name: r.row.name,
-          email: r.row.email,
+          email: r.row.email ?? "",
+          username: r.username,
           status: "SUCCESS",
           userId: newUser.id,
           udiseWarnings:
@@ -1172,30 +1474,37 @@ export async function bulkUploadStudents(
         });
       } catch (rowErr: any) {
         console.error(
-          `[bulk-upload] Row ${r.row.rowNumber} (${r.row.email}) failed:`,
+          `[bulk-upload] Row ${r.row.rowNumber} (${r.username}) failed:`,
           rowErr
         );
+        const isUsernameCollision = isUniqueConstraintError(rowErr, "username");
+        const isEmailCollision = isUniqueConstraintError(rowErr, "email");
         rowResults.push({
           rowNumber: r.row.rowNumber,
           name: r.row.name,
-          email: r.row.email,
+          email: r.row.email ?? "",
           status: "FAILED",
-          error: rowErr.message || "Unknown error during processing",
+          error: isUsernameCollision
+            ? `Username "${r.username}" was taken by another request during upload. Please retry this row.`
+            : isEmailCollision
+              ? "This email was registered by another request during upload. Please retry this row."
+              : rowErr.message || "Unknown error during processing",
         });
       }
     }
   }
 
-  // ── 9. Fire-and-forget welcome emails ────────────────────────────────────────
+  // ── 11. Fire-and-forget welcome emails — only for rows that have an email ──
   const successResults = rowResults.filter((r) => r.status === "SUCCESS");
-  const resolvedByEmail = new Map(resolved.map((r) => [r.row.email, r]));
+  const resolvedByRow = new Map(resolved.map((r) => [r.row.rowNumber, r]));
 
   Promise.allSettled(
     successResults.map((result) => {
-      const r = resolvedByEmail.get(result.email);
-      if (!r) return Promise.resolve();
+      const r = resolvedByRow.get(result.rowNumber);
+      if (!r || !r.row.email) return Promise.resolve(); // no email — nothing to send
       const { subject, htmlContent } = buildWelcomeEmail(
         r.row,
+        r.username,
         classSection.className,
         classSection.sectionName,
         schoolCode
@@ -1206,12 +1515,12 @@ export async function bulkUploadStudents(
         subject,
         htmlContent,
       }).catch((err) =>
-        console.error(`Welcome email failed for ${r.row.email}:`, err)
+        console.error(`Welcome email failed for row ${r.row.rowNumber}:`, err)
       );
     })
   );
 
-  // ── 10. Final response ──────────────────────────────────────────────────────
+  // ── 12. Final response ──────────────────────────────────────────────────────
   rowResults.sort((a, b) => a.rowNumber - b.rowNumber);
 
   const successCount = rowResults.filter((r) => r.status === "SUCCESS").length;

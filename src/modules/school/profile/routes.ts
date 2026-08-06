@@ -3,16 +3,26 @@
 import { Hono } from "hono";
 import { zValidator } from "@hono/zod-validator";
 import { z } from "zod";
+import { eq } from "drizzle-orm";
 import {
   schoolJwtMiddleware,
   schoolTokenValidationMiddleware,
 } from "../../../middleware/school-auth";
 import { SchoolEnv } from "../../../types/common-types";
+import { getSchoolDB } from "../../../db/school-client";
+import { schoolUsersSchema } from "../../../db/schemas/school";
+import {
+  normalizeUsername,
+  USERNAME_MAX_LENGTH,
+  USERNAME_MIN_LENGTH,
+  USERNAME_REGEX,
+} from "../../../utils/school/username";
 import {
   getMyProfile,
   updateMyProfile,
   changeMyPassword,
   changeMyEmail,
+  changeMyUsername,
 } from "./services";
 
 const profileRouter = new Hono<SchoolEnv>();
@@ -51,6 +61,67 @@ profileRouter.get("/me", async (c) => {
   }
 });
 
+// ==================== CHECK USERNAME AVAILABILITY (SELF-SERVICE) ====================
+/**
+ * GET /school/profile/check-username?username=...
+ *
+ * Available to ALL authenticated users (no permission gate) — powers the
+ * live availability check in the "Change Username" tab of My Profile.
+ * Distinct from /school/users/check-username, which is gated by
+ * users.create/users.edit and used by staff editing OTHER users.
+ *
+ * A caller's own current username is reported as "available" so the form
+ * doesn't falsely flag their unchanged value as taken.
+ */
+profileRouter.get("/check-username", async (c) => {
+  try {
+    const raw = c.req.query("username");
+    if (!raw) {
+      return c.json(
+        { success: false, error: "username query param is required" },
+        400
+      );
+    }
+
+    const username = normalizeUsername(raw);
+
+    if (!USERNAME_REGEX.test(username)) {
+      return c.json({
+        success: true,
+        available: false,
+        message: `Username must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers.`,
+      });
+    }
+
+    const user = c.get("user")!;
+    const schoolCode = c.get("schoolCode")!;
+    const db = await getSchoolDB(c.env, schoolCode);
+
+    const existing = await db
+      .select({ id: schoolUsersSchema.id })
+      .from(schoolUsersSchema)
+      .where(eq(schoolUsersSchema.username, username))
+      .get();
+
+    // Own current username counts as "available" for the caller.
+    const available = !existing || existing.id === user.id;
+
+    return c.json({
+      success: true,
+      available,
+      message: available
+        ? "Username is available."
+        : "This username is already taken. Please choose a different one.",
+    });
+  } catch (error: any) {
+    console.error("Check username error:", error);
+    return c.json(
+      { success: false, error: error.message || "Server error" },
+      500
+    );
+  }
+});
+
 // ==================== UPDATE MY PROFILE ====================
 /**
  * PUT /school/profile/me
@@ -63,8 +134,8 @@ profileRouter.get("/me", async (c) => {
  * `users.edit` makes the update on their behalf (or they can use the
  * /school/users/:id endpoint directly).
  *
- * Password and email changes use separate, dedicated endpoints that remain
- * available to every authenticated user.
+ * Username, password, and email changes use separate, dedicated endpoints
+ * that remain available to every authenticated user.
  */
 const updateProfileSchema = z.object({
   name: z.string().min(2).max(100).optional(),
@@ -90,8 +161,6 @@ profileRouter.put("/me", zValidator("json", updateProfileSchema), async (c) => {
     const schoolCode = c.get("schoolCode")!;
 
     // ── Permission check ───────────────────────────────────────────────────
-    // Only users with `users.edit` (or wildcard `*`) may update profile data.
-    // This mirrors the same permission used on the /school/users/:id endpoint.
     const permissions: string[] = user.permissions ?? [];
     const canEdit =
       permissions.includes("*") || permissions.includes("users.edit");
@@ -120,6 +189,61 @@ profileRouter.put("/me", zValidator("json", updateProfileSchema), async (c) => {
     );
   }
 });
+
+// ==================== CHANGE USERNAME ====================
+/**
+ * PUT /school/profile/me/change-username
+ *
+ * Available to ALL authenticated school users (no special permission needed)
+ * — same self-service model as change-password and change-email. Every user
+ * owns their own username, including students and parents.
+ *
+ * Requires current password verification as a security gate, since the
+ * username is a login credential.
+ */
+const changeUsernameSchema = z.object({
+  username: z
+    .string()
+    .transform((val) => val.trim().toLowerCase())
+    .refine((val) => USERNAME_REGEX.test(val), {
+      message: `Username must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers (a-z, 0-9).`,
+    }),
+  currentPassword: z.string().min(1, "Current password is required"),
+});
+
+profileRouter.put(
+  "/me/change-username",
+  zValidator("json", changeUsernameSchema),
+  async (c) => {
+    try {
+      const user = c.get("user")!;
+      const schoolCode = c.get("schoolCode")!;
+      const { username, currentPassword } = c.req.valid("json");
+
+      const result = await changeMyUsername(
+        c.env,
+        schoolCode,
+        user.id,
+        username,
+        currentPassword
+      );
+
+      return c.json({
+        success: true,
+        message: "Username changed successfully.",
+        username: result.username,
+      });
+    } catch (error: any) {
+      console.error("Change username error:", error);
+      const msg: string = error.message ?? "";
+      const isTaken = msg.includes("already taken");
+      return c.json(
+        { success: false, error: msg || "Failed to change username" },
+        isTaken ? 409 : 400
+      );
+    }
+  }
+);
 
 // ==================== CHANGE PASSWORD ====================
 /**
@@ -179,7 +303,9 @@ profileRouter.put(
  * PUT /school/profile/me/change-email
  *
  * Available to ALL authenticated school users (no special permission needed).
- * Every user owns their own email — even students and parents.
+ * Every user owns their own email — even students and parents. Since email
+ * is now optional, this also covers a user adding an email for the first
+ * time (their current email is simply null).
  * Requires current password verification as a security gate.
  */
 const changeEmailSchema = z.object({

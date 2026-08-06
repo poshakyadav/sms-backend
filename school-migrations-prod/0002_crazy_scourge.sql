@@ -1,1 +1,0 @@
-ALTER TABLE `schools` ADD `logo_key` text DEFAULT '';

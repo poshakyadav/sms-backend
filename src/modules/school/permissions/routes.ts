@@ -9,7 +9,7 @@ import {
 import { SchoolEnv } from "../../../types/common-types";
 import { getSchoolDB } from "../../../db/school-client";
 import { schoolPermissionsSchema } from "../../../db/schemas/school";
-import { PermissionCategory } from "../../../types/school-permissions";
+import { getPermissionMeta, PermissionCategory } from "../../../types/school-permissions";
 import { eq } from "drizzle-orm";
 
 const schoolPermissionsRouter = new Hono<SchoolEnv>();
@@ -100,7 +100,22 @@ schoolPermissionsRouter.get(
             )
             .all();
 
-      return c.json({ success: true, permissions });
+      // Enrich DB rows with hand-authored label/description/risk from the
+      // static metadata map — no DB write, computed fresh on every request.
+      const enrichedPermissions = permissions.map((p) => {
+        const meta = getPermissionMeta(p.slug);
+        return {
+          ...p,
+          name: meta.label,
+          description: meta.description,
+          riskLevel: meta.riskLevel,
+          usedIn: meta.usedIn,
+        };
+      });
+
+      return c.json({ success: true, permissions: enrichedPermissions });
+
+      // return c.json({ success: true, permissions });
     } catch (error: any) {
       console.error("Get permissions error:", error);
       return c.json(

@@ -1,3 +1,5 @@
+//  .../src/modules/school/settings/routes.ts
+
 import { Hono } from "hono";
 import { SchoolEnv } from "../../../types/common-types";
 import { SchoolRole } from "../../../types/school-role";

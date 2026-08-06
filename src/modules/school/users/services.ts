@@ -32,8 +32,10 @@ import {
 } from "../../../utils/school/profile-mapping";
 import { sendTransactionalEmail } from "../../../utils/sendEmail";
 import { getUserPermissionsFromDB } from "../auth/permission-helpers";
-import { PermissionCategory } from "../../../types/school-permissions";
+import { getPermissionMeta, PermissionCategory } from "../../../types/school-permissions";
 import { deleteUserAvatar, uploadUserAvatar } from "../../../utils/school/avatar-storage";
+import { isUniqueConstraintError } from "../../../utils/db-errors";
+import { buildUsernameBase, buildUsernameCandidate, isValidUsernameFormat, normalizeUsername, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH } from "../../../utils/school/username";
 
 // Helper to get frontend URL
 const getFrontendUrlForUsers = (env: SchoolEnv["Bindings"]): string => {
@@ -75,6 +77,7 @@ const SAFE_USER_FIELDS = {
   id: schoolUsersSchema.id,
   schoolId: schoolUsersSchema.schoolId,
   name: schoolUsersSchema.name,
+  username: schoolUsersSchema.username,
   email: schoolUsersSchema.email,
   primaryRole: schoolUsersSchema.primaryRole,
   tokenVersion: schoolUsersSchema.tokenVersion,
@@ -187,7 +190,8 @@ export interface DeletionWarning {
 interface CreateUserData {
   // Core
   name: string;
-  email: string;
+  email?: string;
+  username?: string;
   password: string;
   primaryRoleId: number;
   roleIds: number[];
@@ -565,9 +569,9 @@ export async function getSchoolUsersByCategory(
           profile:
             parentUserId != null
               ? {
-                  type: "parent",
-                  data: { userId: parentUserId, occupation, address },
-                }
+                type: "parent",
+                data: { userId: parentUserId, occupation, address },
+              }
               : null,
         };
       });
@@ -876,9 +880,8 @@ export async function checkUserDeletionImpact(
 
     if (activeEnrollmentCount > 0) {
       canDelete = false;
-      blockingReason = `This student has ${activeEnrollmentCount} active enrollment${
-        activeEnrollmentCount > 1 ? "s" : ""
-      }. You must unenroll the student before deletion. Consider deactivating the account instead.`;
+      blockingReason = `This student has ${activeEnrollmentCount} active enrollment${activeEnrollmentCount > 1 ? "s" : ""
+        }. You must unenroll the student before deletion. Consider deactivating the account instead.`;
     }
 
     const enrollmentIds = enrollments.map((e: any) => e.id);
@@ -886,45 +889,45 @@ export async function checkUserDeletionImpact(
     const feePaymentsRows =
       enrollmentIds.length > 0
         ? await db
-            .select({ id: schoolFeePaymentsSchema.id })
-            .from(schoolFeePaymentsSchema)
-            .where(inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds))
-            .all()
+          .select({ id: schoolFeePaymentsSchema.id })
+          .from(schoolFeePaymentsSchema)
+          .where(inArray(schoolFeePaymentsSchema.enrollmentId, enrollmentIds))
+          .all()
         : [];
     feePaymentCount = feePaymentsRows.length;
 
     const attendanceRows =
       enrollmentIds.length > 0
         ? await db
-            .select({ id: schoolAttendancesSchema.id })
-            .from(schoolAttendancesSchema)
-            .where(inArray(schoolAttendancesSchema.enrollmentId, enrollmentIds))
-            .all()
+          .select({ id: schoolAttendancesSchema.id })
+          .from(schoolAttendancesSchema)
+          .where(inArray(schoolAttendancesSchema.enrollmentId, enrollmentIds))
+          .all()
         : [];
     attendanceCount = attendanceRows.length;
 
     const examMarkRows =
       enrollmentIds.length > 0
         ? await db
-            .select({ id: schoolExamMarksSchema.id })
-            .from(schoolExamMarksSchema)
-            .where(inArray(schoolExamMarksSchema.enrollmentId, enrollmentIds))
-            .all()
+          .select({ id: schoolExamMarksSchema.id })
+          .from(schoolExamMarksSchema)
+          .where(inArray(schoolExamMarksSchema.enrollmentId, enrollmentIds))
+          .all()
         : [];
     examMarkCount = examMarkRows.length;
 
     const submissionRows =
       enrollmentIds.length > 0
         ? await db
-            .select({ id: schoolAssignmentSubmissionsSchema.id })
-            .from(schoolAssignmentSubmissionsSchema)
-            .where(
-              inArray(
-                schoolAssignmentSubmissionsSchema.enrollmentId,
-                enrollmentIds
-              )
+          .select({ id: schoolAssignmentSubmissionsSchema.id })
+          .from(schoolAssignmentSubmissionsSchema)
+          .where(
+            inArray(
+              schoolAssignmentSubmissionsSchema.enrollmentId,
+              enrollmentIds
             )
-            .all()
+          )
+          .all()
         : [];
     submissionCount = submissionRows.length;
 
@@ -1068,143 +1071,212 @@ export async function createSchoolUser(
 ) {
   const db = await getSchoolDB(env, schoolCode);
 
-  return await db.transaction(async (tx) => {
-    // ── Guard: primaryRoleId must be in roleIds ─────────────────────────────
-    if (!data.roleIds.includes(data.primaryRoleId)) {
-      throw new Error(
-        "Primary role must be included in the assigned roles list."
-      );
-    }
+  // An explicitly-chosen username follows a different (stricter, single-
+  // attempt) path than an auto-generated one — see the retry loop below.
+  const explicitUsername = data.username ? normalizeUsername(data.username) : null;
 
-    // ── Validate role IDs ───────────────────────────────────────────────────
-    const validRoles = await tx
-      .select({ id: schoolRolesSchema.id, name: schoolRolesSchema.name })
-      .from(schoolRolesSchema)
-      .where(inArray(schoolRolesSchema.id, data.roleIds))
-      .all();
-
-    if (validRoles.length !== data.roleIds.length) {
-      throw new Error("One or more invalid role IDs provided.");
-    }
-
-    const primaryRoleRecord = validRoles.find(
-      (r) => r.id === data.primaryRoleId
+  if (explicitUsername && !isValidUsernameFormat(explicitUsername)) {
+    throw new Error(
+      `Invalid username. Usernames must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers.`
     );
-    if (!primaryRoleRecord) throw new Error("Primary role ID is invalid.");
+  }
 
-    const primaryRoleName = primaryRoleRecord.name;
-    const profileCategory = getProfileCategory(primaryRoleName);
+  const usernameBase = buildUsernameBase(data.name);
 
-    // ── Guard: unique email ─────────────────────────────────────────────────
-    const existingUser = await tx
-      .select({ id: schoolUsersSchema.id })
-      .from(schoolUsersSchema)
-      .where(eq(schoolUsersSchema.email, data.email))
-      .get();
-    if (existingUser) {
-      throw new Error(
-        "This email address is already registered in this school."
-      );
+  // Auto-generated usernames get several attempts since collision is
+  // handled reactively (see the catch block) rather than pre-checked —
+  // this keeps the hot path at exactly ONE round trip's worth of DB work
+  // per attempt, critical on Workers' free-tier subrequest budget.
+  const MAX_USERNAME_ATTEMPTS = explicitUsername ? 1 : 5;
+
+  for (let attempt = 0; attempt < MAX_USERNAME_ATTEMPTS; attempt++) {
+    const candidateUsername =
+      explicitUsername ?? buildUsernameCandidate(usernameBase, attempt);
+
+    try {
+      return await db.transaction(async (tx) => {
+        // ── Guard: primaryRoleId must be in roleIds ─────────────────────────
+        if (!data.roleIds.includes(data.primaryRoleId)) {
+          throw new Error(
+            "Primary role must be included in the assigned roles list."
+          );
+        }
+
+        // ── Validate role IDs ───────────────────────────────────────────────
+        const validRoles = await tx
+          .select({ id: schoolRolesSchema.id, name: schoolRolesSchema.name })
+          .from(schoolRolesSchema)
+          .where(inArray(schoolRolesSchema.id, data.roleIds))
+          .all();
+
+        if (validRoles.length !== data.roleIds.length) {
+          throw new Error("One or more invalid role IDs provided.");
+        }
+
+        const primaryRoleRecord = validRoles.find(
+          (r) => r.id === data.primaryRoleId
+        );
+        if (!primaryRoleRecord) throw new Error("Primary role ID is invalid.");
+
+        const primaryRoleName = primaryRoleRecord.name;
+        const profileCategory = getProfileCategory(primaryRoleName);
+
+        // ── Guard: unique email — only checked when one was actually
+        //    provided. Email is optional now; multiple NULL emails are
+        //    fine (SQLite treats every NULL as distinct for UNIQUE). ─────
+        if (data.email) {
+          const existingUser = await tx
+            .select({ id: schoolUsersSchema.id })
+            .from(schoolUsersSchema)
+            .where(eq(schoolUsersSchema.email, data.email))
+            .get();
+          if (existingUser) {
+            throw new Error(
+              "This email address is already registered in this school."
+            );
+          }
+        }
+
+        // ── Guard: explicit username availability. Auto-generated
+        //    candidates deliberately SKIP this pre-check (see the retry
+        //    loop that wraps this whole transaction) — the UNIQUE index
+        //    + catch/retry below is the enforcement mechanism for those,
+        //    saving a round trip on the hot path. ─────────────────────────
+        if (explicitUsername) {
+          const existingUsername = await tx
+            .select({ id: schoolUsersSchema.id })
+            .from(schoolUsersSchema)
+            .where(eq(schoolUsersSchema.username, explicitUsername))
+            .get();
+          if (existingUsername) {
+            throw new Error(
+              "This username is already taken. Please choose a different one."
+            );
+          }
+        }
+
+        const passwordHash = await hashPassword(data.password);
+
+        // ── Insert school_users row ───────────────────────────────────────
+        const [newUser] = await tx
+          .insert(schoolUsersSchema)
+          .values({
+            name: data.name,
+            username: candidateUsername,
+            email: data.email || null,
+            passwordHash,
+            primaryRole: primaryRoleName,
+            phone: data.phone || "",
+            alternatePhone: data.alternatePhone || "",
+            dateOfBirth: data.dateOfBirth || "",
+            gender: (data.gender as any) || "",
+            addressLineOne: data.addressLineOne || "",
+            addressLineTwo: data.addressLineTwo || "",
+            city: data.city || "",
+            state: data.state || "",
+            postalCode: data.postalCode || "",
+            bloodGroup: data.bloodGroup || "",
+            avatarUrl: data.avatarUrl || "",
+            fatherName: data.fatherName || "",
+            motherName: data.motherName || "",
+            guardianName: data.guardianName || "",
+            guardianRelation: data.guardianRelation || "",
+            tokenVersion: 0,
+          })
+          .returning();
+
+        // ── Assign roles ────────────────────────────────────────────────
+        await tx
+          .insert(schoolUserRolesSchema)
+          .values(data.roleIds.map((roleId) => ({ userId: newUser.id, roleId })));
+
+        // ── Create profile row ──────────────────────────────────────────
+        await createUserProfile(tx, newUser.id, profileCategory, primaryRoleName, data);
+
+        // ── Welcome email — only if the user actually has an email. If
+        //    not, credentials (incl. the generated username) need to be
+        //    shared with them through another channel by the admin. ──────
+        if (data.email) {
+          const emailData: BrevoSendEmailRequest = {
+            sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
+            to: [{ email: data.email, name: data.name }],
+            subject: `Welcome to ${schoolCode} — Your Account is Ready`,
+            htmlContent: `
+              <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                <h2 style="color: #1e40af;">Welcome, ${data.name}!</h2>
+                <p>Your <strong>${getProfileCategoryLabel(primaryRoleName)}</strong> account has been created.</p>
+                <table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
+                  <tr>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Username</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${candidateUsername}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Email</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${data.email}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Password</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${data.password}</td>
+                  </tr>
+                  <tr>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Primary Role</td>
+                    <td style="padding: 8px; border: 1px solid #e2e8f0;">${primaryRoleName.replace(/_/g, " ")}</td>
+                  </tr>
+                </table>
+                <p style="margin: 24px 0;">
+                  <a href="${getFrontendUrlForUsers(env)}/school/auth/login"
+                    style="background:#1e40af;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:600;">
+                    Login to Your Account
+                  </a>
+                </p>
+                <p>You can log in with either your <strong>username</strong> or your <strong>email</strong>.</p>
+                <p style="color: #dc2626;"><strong>Important:</strong> Please change your password after your first login.</p>
+              </div>
+            `,
+          };
+          await sendTransactionalEmail(env, emailData).catch((err) => {
+            console.error("Welcome email failed (non-fatal):", err);
+          });
+        } else {
+          console.log(
+            `User ${newUser.id} created with username "${candidateUsername}" and no email — share credentials via another channel.`
+          );
+        }
+
+        return {
+          user: { ...newUser, roles: validRoles, primaryRole: primaryRoleName },
+        };
+      });
+    } catch (err: any) {
+      const usernameCollision = isUniqueConstraintError(err, "username");
+
+      if (usernameCollision) {
+        if (explicitUsername) {
+          throw new Error(
+            "This username is already taken. Please choose a different one."
+          );
+        }
+        if (attempt < MAX_USERNAME_ATTEMPTS - 1) {
+          continue; // draw a fresh random candidate and retry
+        }
+        throw new Error(
+          "Could not generate a unique username after multiple attempts. Please try again."
+        );
+      }
+
+      if (isUniqueConstraintError(err, "email")) {
+        throw new Error(
+          "This email address is already registered in this school."
+        );
+      }
+
+      throw err;
     }
+  }
 
-    const passwordHash = await hashPassword(data.password);
-
-    // ── Insert school_users row (includes new guardian/parent name fields) ──
-    const [newUser] = await tx
-      .insert(schoolUsersSchema)
-      .values({
-        name: data.name,
-        email: data.email,
-        passwordHash,
-        primaryRole: primaryRoleName,
-        phone: data.phone || "",
-        alternatePhone: data.alternatePhone || "",
-        dateOfBirth: data.dateOfBirth || "",
-        gender: (data.gender as any) || "",
-        addressLineOne: data.addressLineOne || "",
-        addressLineTwo: data.addressLineTwo || "",
-        city: data.city || "",
-        state: data.state || "",
-        postalCode: data.postalCode || "",
-        bloodGroup: data.bloodGroup || "",
-        avatarUrl: data.avatarUrl || "",
-
-        // ── NEW: Guardian/parent names ──────────────────────────────────────
-        fatherName: data.fatherName || "",
-        motherName: data.motherName || "",
-        guardianName: data.guardianName || "",
-        guardianRelation: data.guardianRelation || "",
-
-        tokenVersion: 0,
-      })
-      .returning();
-
-    // ── Assign roles ────────────────────────────────────────────────────────
-    await tx
-      .insert(schoolUserRolesSchema)
-      .values(data.roleIds.map((roleId) => ({ userId: newUser.id, roleId })));
-
-    // ── Create profile row ──────────────────────────────────────────────────
-    await createUserProfile(
-      tx,
-      newUser.id,
-      profileCategory,
-      primaryRoleName,
-      data
-    );
-
-    // ── Welcome email ───────────────────────────────────────────────────────
-    const emailData: BrevoSendEmailRequest = {
-      sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
-      to: [{ email: data.email, name: data.name }],
-      subject: `Welcome to ${schoolCode} — Your Account is Ready`,
-      htmlContent: `
-        <div style="font-family: 'Segoe UI', Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-          <h2 style="color: #1e40af;">Welcome, ${data.name}!</h2>
-          <p>Your <strong>${getProfileCategoryLabel(
-            primaryRoleName
-          )}</strong> account has been created.</p>
-          <table style="border-collapse: collapse; width: 100%; margin: 16px 0;">
-            <tr>
-              <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Email</td>
-              <td style="padding: 8px; border: 1px solid #e2e8f0;">${
-                data.email
-              }</td>
-            </tr>
-            <tr>
-              <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Password</td>
-              <td style="padding: 8px; border: 1px solid #e2e8f0;">${
-                data.password
-              }</td>
-            </tr>
-            <tr>
-              <td style="padding: 8px; border: 1px solid #e2e8f0; background: #f8fafc; font-weight: 600;">Primary Role</td>
-              <td style="padding: 8px; border: 1px solid #e2e8f0;">${primaryRoleName.replace(
-                /_/g,
-                " "
-              )}</td>
-            </tr>
-          </table>
-
-          <p style="margin: 24px 0;">
-            <a href="${getFrontendUrlForUsers(env)}/school/auth/login" 
-              style="background:#1e40af;color:white;padding:12px 24px;text-decoration:none;border-radius:6px;font-weight:600;">
-              Login to Your Account
-            </a>
-          </p>
-
-          <p style="color: #dc2626;"><strong>Important:</strong> Please change your password after your first login.</p>
-        </div>
-      `,
-    };
-    await sendTransactionalEmail(env, emailData).catch((err) => {
-      console.error("Welcome email failed (non-fatal):", err);
-    });
-
-    return {
-      user: { ...newUser, roles: validRoles, primaryRole: primaryRoleName },
-    };
-  });
+  // Unreachable — every loop iteration either returns or throws — kept
+  // only to satisfy TypeScript's control-flow analysis.
+  throw new Error("Unexpected error while creating user.");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1303,26 +1375,35 @@ export async function updateSchoolUser(
     await updateUserProfile(tx, id, profileCategory, data);
 
     // ── Password-change notification email ──────────────────────────────────
+    // ── Password-change notification email ──────────────────────────────────
     if (data.newPassword) {
-      const emailData: BrevoSendEmailRequest = {
-        sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
-        to: [
-          {
-            email: data.email || existingUser.email,
-            name: data.name || existingUser.name,
-          },
-        ],
-        subject: "Your Password Has Been Updated",
-        htmlContent: `
-          <p>Hello ${data.name || existingUser.name},</p>
-          <p>Your password has been successfully updated by an administrator.</p>
-          <p>New password: <strong>${data.newPassword}</strong></p>
-          <p><em>Please log in and change it immediately for security.</em></p>
-        `,
-      };
-      await sendTransactionalEmail(env, emailData).catch((err) => {
-        console.error("Password update email failed (non-fatal):", err);
-      });
+      const recipientEmail = data.email || existingUser.email;
+
+      if (recipientEmail) {
+        const emailData: BrevoSendEmailRequest = {
+          sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
+          to: [
+            {
+              email: recipientEmail, // now narrowed to `string` inside this block
+              name: data.name || existingUser.name,
+            },
+          ],
+          subject: "Your Password Has Been Updated",
+          htmlContent: `
+        <p>Hello ${data.name || existingUser.name},</p>
+        <p>Your password has been successfully updated by an administrator.</p>
+        <p>New password: <strong>${data.newPassword}</strong></p>
+        <p><em>Please log in and change it immediately for security.</em></p>
+      `,
+        };
+        await sendTransactionalEmail(env, emailData).catch((err) => {
+          console.error("Password update email failed (non-fatal):", err);
+        });
+      } else {
+        console.log(
+          `User ${id} has no email on file — password was updated but no notification email was sent.`
+        );
+      }
     }
 
     return { message: "User updated successfully" };
@@ -1431,6 +1512,57 @@ export async function removeSchoolUserAvatar(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// CHANGE USERNAME
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Changes a user's username. Deliberately does NOT do a pre-check SELECT —
+ * relies on the UNIQUE index + catch, same reasoning as the explicit-
+ * username path in createSchoolUser: one round trip in the success case,
+ * a clean error only on genuine collision.
+ */
+export async function changeSchoolUserUsername(
+  env: SchoolEnv["Bindings"],
+  schoolCode: string,
+  userId: number,
+  newUsername: string
+): Promise<{ username: string }> {
+  const db = await getSchoolDB(env, schoolCode);
+
+  const normalized = normalizeUsername(newUsername);
+  if (!isValidUsernameFormat(normalized)) {
+    throw new Error(
+      `Invalid username. Usernames must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} characters, start with a letter, and contain only lowercase letters and numbers.`
+    );
+  }
+
+  const user = await db
+    .select({ id: schoolUsersSchema.id, username: schoolUsersSchema.username })
+    .from(schoolUsersSchema)
+    .where(eq(schoolUsersSchema.id, userId))
+    .get();
+  if (!user) throw new Error("User not found");
+
+  if (user.username === normalized) {
+    return { username: normalized }; // no-op
+  }
+
+  try {
+    await db
+      .update(schoolUsersSchema)
+      .set({ username: normalized, updatedAt: sql`CURRENT_TIMESTAMP` })
+      .where(eq(schoolUsersSchema.id, userId));
+  } catch (err: any) {
+    if (isUniqueConstraintError(err, "username")) {
+      throw new Error("This username is already taken. Please choose a different one.");
+    }
+    throw err;
+  }
+
+  return { username: normalized };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // ASSIGN ROLES TO USER
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1524,35 +1656,35 @@ export async function assignRolesToUser(
 
     const newPermissions = await getUserPermissionsFromDB(tx, userId);
     console.log(
-      `🔄 Role update for user ${userId} | primaryRole: ${
-        user.primaryRole
+      `🔄 Role update for user ${userId} | primaryRole: ${user.primaryRole
       } | new roles: ${validRoles
         .map((r) => r.name)
         .join(", ")} | permissions: ${newPermissions.length}`
     );
 
     // ── Role-update notification email ──────────────────────────────────────
-    const emailData: BrevoSendEmailRequest = {
-      sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
-      to: [{ email: user.email, name: user.name }],
-      subject: "Your Roles Have Been Updated",
-      htmlContent: `
-        <p>Hello ${user.name},</p>
-        <p>Your roles have been updated by an administrator.</p>
-        <p><strong>Primary Role (permanent):</strong> ${user.primaryRole.replace(
-          /_/g,
-          " "
-        )}</p>
-        <p><strong>All Current Roles:</strong></p>
-        <ul>${validRoles
-          .map((r) => `<li>${r.name.replace(/_/g, " ")}</li>`)
-          .join("")}</ul>
-        <p><em>Your previous sessions have been invalidated for security. Please log in again.</em></p>
-      `,
-    };
-    await sendTransactionalEmail(env, emailData).catch((err) => {
-      console.error("Role update email failed (non-fatal):", err);
-    });
+    if (user.email) {
+      const emailData: BrevoSendEmailRequest = {
+        sender: { email: env.BREVO_SENDER_EMAIL, name: env.BREVO_SENDER_NAME },
+        to: [{ email: user.email, name: user.name }], // narrowed to `string` here
+        subject: "Your Roles Have Been Updated",
+        htmlContent: `
+          <p>Hello ${user.name},</p>
+          <p>Your roles have been updated by an administrator.</p>
+          <p><strong>Primary Role (permanent):</strong> ${user.primaryRole.replace(/_/g, " ")}</p>
+          <p><strong>All Current Roles:</strong></p>
+          <ul>${validRoles.map((r) => `<li>${r.name.replace(/_/g, " ")}</li>`).join("")}</ul>
+          <p><em>Your previous sessions have been invalidated for security. Please log in again.</em></p>
+        `,
+      };
+      await sendTransactionalEmail(env, emailData).catch((err) => {
+        console.error("Role update email failed (non-fatal):", err);
+      });
+    } else {
+      console.log(
+        `User ${userId} has no email on file — roles were updated but no notification email was sent.`
+      );
+    }
 
     return {
       message: "Roles updated successfully.",
@@ -1594,13 +1726,36 @@ export async function getUserRoles(
 // GET USER DIRECT PERMISSIONS
 // ─────────────────────────────────────────────────────────────────────────────
 
+// export async function getUserDirectPermissions(
+//   env: SchoolEnv["Bindings"],
+//   schoolCode: string,
+//   userId: number
+// ) {
+//   const db = await getSchoolDB(env, schoolCode);
+//   return await db
+//     .select({
+//       id: schoolPermissionsSchema.id,
+//       slug: schoolPermissionsSchema.slug,
+//       name: schoolPermissionsSchema.name,
+//       module: schoolPermissionsSchema.module,
+//       category: schoolPermissionsSchema.category,
+//     })
+//     .from(schoolUserPermissionsSchema)
+//     .innerJoin(
+//       schoolPermissionsSchema,
+//       eq(schoolUserPermissionsSchema.permissionId, schoolPermissionsSchema.id)
+//     )
+//     .where(eq(schoolUserPermissionsSchema.userId, userId))
+//     .all();
+// }
+
 export async function getUserDirectPermissions(
   env: SchoolEnv["Bindings"],
   schoolCode: string,
   userId: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
-  return await db
+  const rows = await db
     .select({
       id: schoolPermissionsSchema.id,
       slug: schoolPermissionsSchema.slug,
@@ -1615,6 +1770,11 @@ export async function getUserDirectPermissions(
     )
     .where(eq(schoolUserPermissionsSchema.userId, userId))
     .all();
+
+  return rows.map((p) => {
+    const meta = getPermissionMeta(p.slug);
+    return { ...p, name: meta.label, description: meta.description, riskLevel: meta.riskLevel, usedIn: meta.usedIn };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1627,7 +1787,7 @@ export async function getUserDeniedPermissions(
   userId: number
 ) {
   const db = await getSchoolDB(env, schoolCode);
-  return await db
+  const rows = await db
     .select({
       id: schoolPermissionsSchema.id,
       slug: schoolPermissionsSchema.slug,
@@ -1645,6 +1805,17 @@ export async function getUserDeniedPermissions(
     )
     .where(eq(schoolUserPermissionDenialsSchema.userId, userId))
     .all();
+
+  return rows.map((p) => {
+    const meta = getPermissionMeta(p.slug);
+    return {
+      ...p,
+      name: meta.label,
+      description: meta.description,
+      riskLevel: meta.riskLevel,
+      usedIn: meta.usedIn,
+    };
+  });
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1698,8 +1869,7 @@ export async function assignDirectPermissionsToUser(
         const slugList = wrongCategory
           .map(
             (p: { slug: string; category: string }) =>
-              `"${p.slug}" (${
-                CATEGORY_LABELS[p.category as PermissionCategory] ?? p.category
+              `"${p.slug}" (${CATEGORY_LABELS[p.category as PermissionCategory] ?? p.category
               })`
           )
           .join(", ");

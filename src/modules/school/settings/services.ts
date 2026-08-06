@@ -1,3 +1,5 @@
+//  .../src/modules/school/settings/services.ts
+
 import { and, eq, sql } from "drizzle-orm";
 import {
   schoolsSchema,

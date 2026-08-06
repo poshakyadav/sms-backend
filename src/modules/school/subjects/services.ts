@@ -1,3 +1,5 @@
+// src/modules/school/subjects/services.ts
+
 import { and, eq } from "drizzle-orm";
 import {
   schoolClassesSchema,
@@ -202,11 +204,25 @@ export async function bulkUpdateSubjects(
 
   const existingById = new Map(allExisting.map((e) => [e.id, e]));
 
-  // Build lookup: name → id and code → id (excluding the row being updated)
-  // We check these per-row to detect conflicts.
   const notFound: number[] = [];
   const errors: string[] = [];
-  const updateStatements: any[] = [];
+
+  // ── Helper that builds ONE update statement ─────────────────────────────
+  // Declaring this as a small function lets TypeScript infer the *exact*
+  // final chained type (after .set().where().returning()) on its own,
+  // instead of us hand-writing Drizzle's internal generic signature —
+  // which is exactly what broke last time (ReturnType<typeof db.update>
+  // captures the builder BEFORE .set()/.where()/.returning(), not after).
+  function buildUpdateStatement(id: number, setPayload: Record<string, any>) {
+    return db
+      .update(schoolSubjectsSchema)
+      .set(setPayload)
+      .where(eq(schoolSubjectsSchema.id, id))
+      .returning();
+  }
+
+  // Now the array's element type is inferred correctly from the helper.
+  const updateStatements: ReturnType<typeof buildUpdateStatement>[] = [];
   const updatedRows: SchoolSubject[] = [];
 
   // Track names/codes chosen in THIS batch to catch intra-batch collisions
@@ -228,8 +244,6 @@ export async function bulkUpdateSubjects(
           ? null
           : s.code.trim()
         : existing.code;
-    const newDescription =
-      s.description !== undefined ? s.description : undefined; // handled below
 
     // ── Name collision check ─────────────────────────────────────────────
     const newNameLower = newName.toLowerCase();
@@ -275,13 +289,7 @@ export async function bulkUpdateSubjects(
       setPayload["description"] = s.description;
     }
 
-    updateStatements.push(
-      db
-        .update(schoolSubjectsSchema)
-        .set(setPayload)
-        .where(eq(schoolSubjectsSchema.id, s.id))
-        .returning()
-    );
+    updateStatements.push(buildUpdateStatement(s.id, setPayload));
   }
 
   if (updateStatements.length === 0) {
@@ -297,7 +305,16 @@ export async function bulkUpdateSubjects(
   }
 
   // 2. Execute all updates in one batch round trip
-  const batchResults = await db.batch(updateStatements);
+  // ── Cast target derived directly from db.batch()'s OWN parameter type
+  // (via Parameters<typeof db.batch>[0]) rather than us hand-writing the
+  // expected tuple shape. This guarantees the cast always matches whatever
+  // Drizzle's actual batch() signature is — including across version
+  // upgrades — instead of drifting out of sync with it like the previous
+  // manually-written tuple type did.
+  const batchResults = await db.batch(
+    updateStatements as unknown as Parameters<typeof db.batch>[0]
+  );
+
   for (const result of batchResults) {
     if (Array.isArray(result) && result.length > 0) {
       updatedRows.push(result[0] as SchoolSubject);
