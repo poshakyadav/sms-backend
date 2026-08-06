@@ -20,7 +20,7 @@ import {
 } from "./services";
 
 /** Hard capacity cap — enforced at both API and DB level. */
-const MAX_CAPACITY = 50;
+const MAX_CAPACITY = 100;
 
 const classSectionsRouter = new Hono<SchoolEnv>();
 
