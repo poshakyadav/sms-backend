@@ -226,6 +226,7 @@ async function fetchAttendanceCoverage(
     classSectionId: number;
     className: string;
     sectionName: string;
+    classSortOrder: number;
     totalEnrolled: number;
     markedCount: number;
   }> = await db
@@ -233,6 +234,7 @@ async function fetchAttendanceCoverage(
       classSectionId: schoolClassSectionsSchema.id,
       className: schoolClassesSchema.name,
       sectionName: schoolSectionsSchema.name,
+      classSortOrder: schoolClassesSchema.sort_order,
       // Total active students enrolled in this section
       totalEnrolled: sql<number>`
         COUNT(DISTINCT ${schoolStudentEnrollmentsSchema.id})
@@ -282,12 +284,13 @@ async function fetchAttendanceCoverage(
     .groupBy(
       schoolClassSectionsSchema.id,
       schoolClassesSchema.name,
-      schoolSectionsSchema.name
+      schoolSectionsSchema.name,
+      schoolClassesSchema.sort_order 
     )
     // Pending sections first (isMarked = false), then by class name
     .orderBy(
       sql`COUNT(DISTINCT CASE WHEN ${schoolAttendancesSchema.date} = ${today} THEN ${schoolAttendancesSchema.id} ELSE NULL END) = 0 DESC`,
-      schoolClassesSchema.name,
+      schoolClassesSchema.sort_order,
       schoolSectionsSchema.name
     )
     .all();
