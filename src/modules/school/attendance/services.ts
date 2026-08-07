@@ -95,9 +95,6 @@ export async function markAttendance(
     );
   }
 
-  // Calendar must be RESOLVED (explicit school-wide/section declaration, or
-  // covered by the weekly-off rule) before attendance can be recorded —
-  // not just "not a holiday". An un-declared working day is blocked too.
   const resolution = await resolveDayTypeDetailed(env, schoolCode, data.classSectionId, data.date);
   const isResolved = resolution.isExplicit || resolution.source === "WEEKLY_OFF";
 
@@ -106,24 +103,24 @@ export async function markAttendance(
       `The attendance calendar for ${data.date} hasn't been marked yet for this class-section. An authorized staff member must first declare this date as a Working Day or Holiday before attendance can be recorded.`
     );
   }
-  if (resolution.dayType === AttendanceStatus.HOLIDAY as any) {
-    // (kept for type narrowing safety — real check below)
-  }
   if (resolution.dayType === "HOLIDAY") {
     const scopeLabel =
       resolution.source === "SCHOOL_WIDE" ? "school-wide" :
-      resolution.source === "WEEKLY_OFF" ? "the weekly off" : "this class-section";
+        resolution.source === "WEEKLY_OFF" ? "the weekly off" : "this class-section";
     throw new Error(
       `${data.date} is declared a holiday (${scopeLabel}${resolution.reason ? " — " + resolution.reason : ""}). Override the calendar to Working Day first if attendance genuinely needs to be recorded.`
     );
   }
 
   const db = await getSchoolDB(env, schoolCode);
+  const studentIds = data.attendances.map((a) => a.studentId);
 
-  return await db.transaction(async (tx) => {
-    const studentIds = data.attendances.map((a) => a.studentId);
-
-    const enrollments = await tx
+  // ── STEP 1: fetch everything we need, in PARALLEL, up front. ─────────────
+  // This is 4 concurrent network calls instead of the ~120 sequential ones
+  // the old per-student loop made. No writes happen yet, so this is safe to
+  // parallelize freely.
+  const [enrollments, existingRows, rosterCountRow, existingSession] = await Promise.all([
+    db
       .select({
         id: schoolStudentEnrollmentsSchema.id,
         studentId: schoolStudentEnrollmentsSchema.studentId,
@@ -135,97 +132,15 @@ export async function markAttendance(
           eq(schoolStudentEnrollmentsSchema.isActive, true),
           inArray(schoolStudentEnrollmentsSchema.studentId, studentIds)
         )
-      );
-
-    const enrollmentByStudent = new Map(
-      enrollments.map((e) => [e.studentId, e.id])
-    );
-
-    let inserted = 0,
-      updated = 0,
-      cleared = 0,
-      unchanged = 0;
-
-    for (const att of data.attendances) {
-      const enrollmentId = enrollmentByStudent.get(att.studentId);
-      if (!enrollmentId) {
-        throw new Error(
-          `No active enrollment found for student ${att.studentId} in this class-section`
-        );
-      }
-
-      const existing = await tx
-        .select()
-        .from(schoolAttendancesSchema)
-        .where(
-          and(
-            eq(schoolAttendancesSchema.enrollmentId, enrollmentId),
-            eq(schoolAttendancesSchema.date, data.date)
-          )
-        )
-        .get();
-
-      const oldStatus: AttendanceStatusValue | null = existing?.status ?? null;
-      const newStatus: AttendanceStatusValue | null =
-        att.status === AttendanceStatus.PRESENT ? null : att.status;
-
-      if (oldStatus === newStatus) {
-        unchanged++;
-        continue;
-      }
-
-      if (newStatus === null) {
-        await tx
-          .delete(schoolAttendancesSchema)
-          .where(eq(schoolAttendancesSchema.id, existing!.id));
-        cleared++;
-      } else if (existing) {
-        await tx
-          .update(schoolAttendancesSchema)
-          .set({
-            status: newStatus,
-            halfDaySession: att.halfDaySession ?? null,
-            notes: att.notes ?? null,
-            updatedBy: markedBy,
-            updatedAt: sql`CURRENT_TIMESTAMP`,
-          })
-          .where(eq(schoolAttendancesSchema.id, existing.id));
-        updated++;
-      } else {
-        await tx.insert(schoolAttendancesSchema).values({
-          enrollmentId,
-          date: data.date,
-          status: newStatus,
-          halfDaySession: att.halfDaySession ?? null,
-          notes: att.notes ?? null,
-          markedBy,
-        });
-        inserted++;
-      }
-
-      await tx.insert(schoolAttendanceAuditLogSchema).values({
-        enrollmentId,
-        date: data.date,
-        oldStatus,
-        newStatus,
-        changedBy: markedBy,
-      });
-    }
-
-    const rosterCountRow = await tx
-      .select({ count: sql<number>`COUNT(*)` })
-      .from(schoolStudentEnrollmentsSchema)
-      .where(
-        and(
-          eq(schoolStudentEnrollmentsSchema.classSectionId, data.classSectionId),
-          eq(schoolStudentEnrollmentsSchema.isActive, true)
-        )
-      )
-      .get();
-    const totalStudents = rosterCountRow?.count ?? enrollments.length;
-
-    const exceptionCountRow = await tx
-      .select({ count: sql<number>`COUNT(*)` })
+      ),
+    // ALL existing attendance rows for this class-section + date, in ONE query
+    // (used to be one SELECT per student).
+    db
+      .select({
+        id: schoolAttendancesSchema.id,
+        enrollmentId: schoolAttendancesSchema.enrollmentId,
+        status: schoolAttendancesSchema.status,
+      })
       .from(schoolAttendancesSchema)
       .innerJoin(
         schoolStudentEnrollmentsSchema,
@@ -236,11 +151,18 @@ export async function markAttendance(
           eq(schoolStudentEnrollmentsSchema.classSectionId, data.classSectionId),
           eq(schoolAttendancesSchema.date, data.date)
         )
+      ),
+    db
+      .select({ count: sql<number>`COUNT(*)` })
+      .from(schoolStudentEnrollmentsSchema)
+      .where(
+        and(
+          eq(schoolStudentEnrollmentsSchema.classSectionId, data.classSectionId),
+          eq(schoolStudentEnrollmentsSchema.isActive, true)
+        )
       )
-      .get();
-    const exceptionCount = exceptionCountRow?.count ?? 0;
-
-    const existingSession = await tx
+      .get(),
+    db
       .select()
       .from(schoolAttendanceSessionsSchema)
       .where(
@@ -249,10 +171,121 @@ export async function markAttendance(
           eq(schoolAttendanceSessionsSchema.date, data.date)
         )
       )
-      .get();
+      .get(),
+  ]);
 
-    if (existingSession) {
-      await tx
+  const enrollmentByStudent = new Map(enrollments.map((e) => [e.studentId, e.id]));
+  const existingByEnrollment = new Map(existingRows.map((r) => [r.enrollmentId, r]));
+
+  // ── STEP 2: pure in-memory computation. Zero DB calls in this loop. ──────
+  let inserted = 0, updated = 0, cleared = 0, unchanged = 0;
+
+  const toInsert: (typeof schoolAttendancesSchema.$inferInsert)[] = [];
+  const deleteIds: number[] = [];
+  const pendingUpdates: {
+    id: number;
+    status: AttendanceStatusValue;
+    halfDaySession: "MORNING" | "AFTERNOON" | null;
+    notes: string | null;
+  }[] = [];
+  const auditRows: (typeof schoolAttendanceAuditLogSchema.$inferInsert)[] = [];
+
+  for (const att of data.attendances) {
+    const enrollmentId = enrollmentByStudent.get(att.studentId);
+    if (!enrollmentId) {
+      throw new Error(
+        `No active enrollment found for student ${att.studentId} in this class-section`
+      );
+    }
+
+    const existing = existingByEnrollment.get(enrollmentId);
+    const oldStatus: AttendanceStatusValue | null = existing?.status ?? null;
+    const newStatus: AttendanceStatusValue | null =
+      att.status === AttendanceStatus.PRESENT ? null : att.status;
+
+    if (oldStatus === newStatus) {
+      unchanged++;
+      continue;
+    }
+
+    if (newStatus === null) {
+      deleteIds.push(existing!.id);
+      cleared++;
+    } else if (existing) {
+      pendingUpdates.push({
+        id: existing.id,
+        status: newStatus,
+        halfDaySession: att.halfDaySession ?? null,
+        notes: att.notes ?? null,
+      });
+      updated++;
+    } else {
+      toInsert.push({
+        enrollmentId,
+        date: data.date,
+        status: newStatus,
+        halfDaySession: att.halfDaySession ?? null,
+        notes: att.notes ?? null,
+        markedBy,
+      });
+      inserted++;
+    }
+
+    auditRows.push({
+      enrollmentId,
+      date: data.date,
+      oldStatus,
+      newStatus,
+      changedBy: markedBy,
+    });
+  }
+
+  const totalStudents = rosterCountRow?.count ?? enrollments.length;
+  // Exceptions after this write = (exceptions before) - cleared + inserted.
+  // Updates don't change the count; unchanged rows aren't touched.
+  const exceptionCount = existingRows.length - cleared + inserted;
+
+  // ── STEP 3: write everything in ONE atomic batch call. ────────────────────
+  // db.batch() sends every statement in a single HTTP request to Turso and
+  // runs them all inside one implicit transaction (all-or-nothing) — unlike
+  // db.transaction(), which for libSQL-over-HTTP requires a strictly
+  // sequential round trip per statement via a server-side "baton" that has
+  // its own idle/duration timeout. A transaction open for 6+ seconds across
+  // 100+ round trips risks that timeout expiring server-side — which can
+  // silently drop the writes even though the client-side code never throws
+  // (exactly the "201 success, nothing saved" symptom you're seeing).
+  // batch() has no such risk: it's one request, done or not done.
+  const statements: any[] = [];
+
+  if (toInsert.length > 0) {
+    statements.push(db.insert(schoolAttendancesSchema).values(toInsert));
+  }
+  if (deleteIds.length > 0) {
+    statements.push(
+      db.delete(schoolAttendancesSchema).where(inArray(schoolAttendancesSchema.id, deleteIds))
+    );
+  }
+  for (const upd of pendingUpdates) {
+    statements.push(
+      db
+        .update(schoolAttendancesSchema)
+        .set({
+          status: upd.status,
+          halfDaySession: upd.halfDaySession,
+          notes: upd.notes,
+          updatedBy: markedBy,
+          updatedAt: sql`CURRENT_TIMESTAMP`,
+        })
+        .where(eq(schoolAttendancesSchema.id, upd.id))
+    );
+  }
+  if (auditRows.length > 0) {
+    statements.push(db.insert(schoolAttendanceAuditLogSchema).values(auditRows));
+  }
+
+  if (existingSession) {
+    statements.push(
+      db
         .update(schoolAttendanceSessionsSchema)
         .set({
           lastEditedBy: markedBy,
@@ -260,25 +293,31 @@ export async function markAttendance(
           totalStudents,
           exceptionCount,
         })
-        .where(eq(schoolAttendanceSessionsSchema.id, existingSession.id));
-    } else {
-      await tx.insert(schoolAttendanceSessionsSchema).values({
+        .where(eq(schoolAttendanceSessionsSchema.id, existingSession.id))
+    );
+  } else {
+    statements.push(
+      db.insert(schoolAttendanceSessionsSchema).values({
         classSectionId: data.classSectionId,
         date: data.date,
         markedBy,
         totalStudents,
         exceptionCount,
-      });
-    }
+      })
+    );
+  }
 
-    return {
-      message: `${inserted} new exception${inserted === 1 ? "" : "s"}, ${updated} updated, ${cleared} cleared to present, ${unchanged} unchanged`,
-      inserted,
-      updated,
-      cleared,
-      unchanged,
-    };
-  });
+  if (statements.length > 0) {
+    await db.batch(statements as [any, ...any[]]);
+  }
+
+  return {
+    message: `${inserted} new exception${inserted === 1 ? "" : "s"}, ${updated} updated, ${cleared} cleared to present, ${unchanged} unchanged`,
+    inserted,
+    updated,
+    cleared,
+    unchanged,
+  };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
