@@ -29,7 +29,7 @@ import {
   uploadSchoolUserAvatar,
 } from "./services";
 import { getSchoolDB } from "../../../db/school-client";
-import { schoolUsersSchema } from "../../../db/schemas/school";
+import { schoolUsersSchema, studentsSchema } from "../../../db/schemas/school";
 import { eq } from "drizzle-orm";
 import { PermissionCategory } from "../../../types/school-permissions";
 import { normalizeUsername, USERNAME_MAX_LENGTH, USERNAME_MIN_LENGTH, USERNAME_REGEX } from "../../../utils/school/username";
@@ -181,6 +181,54 @@ usersRouter.get(
       });
     } catch (error: any) {
       console.error("Check username error:", error);
+      return c.json(
+        { success: false, error: error.message || "Server error" },
+        500
+      );
+    }
+  }
+);
+
+// ==================== CHECK ADMISSION NUMBER AVAILABILITY ====================
+// IMPORTANT: Must be defined before GET /:id to avoid route collision.
+usersRouter.get(
+  "/check-admission-number",
+  requirePermission(["users.create", "users.edit"]),
+  async (c) => {
+    try {
+      const raw = c.req.query("admissionNumber")?.trim();
+      if (!raw) {
+        return c.json(
+          { success: false, error: "admissionNumber query param is required" },
+          400
+        );
+      }
+
+      // Allows the edit form to check availability while excluding the
+      // student's own current record (same pattern you'd want for email).
+      const excludeUserIdRaw = c.req.query("excludeUserId");
+      const excludeUserId = excludeUserIdRaw ? parseInt(excludeUserIdRaw) : undefined;
+
+      const schoolCode = c.get("schoolCode")!;
+      const db = await getSchoolDB(c.env, schoolCode);
+
+      const existing = await db
+        .select({ userId: studentsSchema.userId })
+        .from(studentsSchema)
+        .where(eq(studentsSchema.admissionNumber, raw))
+        .get();
+
+      const available = !existing || existing.userId === excludeUserId;
+
+      return c.json({
+        success: true,
+        available,
+        message: available
+          ? "Admission number is available."
+          : "This admission number is already assigned to another student.",
+      });
+    } catch (error: any) {
+      console.error("Check admission number error:", error);
       return c.json(
         { success: false, error: error.message || "Server error" },
         500
@@ -435,7 +483,7 @@ const commonUserFields = {
  */
 const studentProfileFields = {
   // ── Existing school-internal fields ────────────────────────────────────────
-  admissionNumber: z.string().max(50).optional(),
+  admissionNumber: z.string().trim().max(50).optional(),
   rollNumber: z.string().max(50).optional(),
   admissionDate: z.string().date().optional(),
   previousSchool: z.string().max(255).optional(),

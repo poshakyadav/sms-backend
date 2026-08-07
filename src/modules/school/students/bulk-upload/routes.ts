@@ -152,7 +152,8 @@ bulkUploadRouter.post(
        // Email OR username conflicts: 409 so Angular catchError receives them distinctly.
        if (
         (result.emailConflicts && result.emailConflicts.length > 0) ||
-        (result.usernameConflicts && result.usernameConflicts.length > 0)
+        (result.usernameConflicts && result.usernameConflicts.length > 0) || (result.admissionNumberConflicts && result.admissionNumberConflicts.length > 0)
+        
       ) {
         return c.json(result, 409);
       }

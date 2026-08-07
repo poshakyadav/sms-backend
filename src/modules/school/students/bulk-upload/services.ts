@@ -116,6 +116,11 @@ const RELIGION_MAP: Record<string, number> = {
   none: 8,
 };
 
+// ── Admission number constraints ───────────────────────────────────────────
+// Mirrors the max length enforced on the single-user-create path
+// (studentProfileFields.admissionNumber in users/routes.ts: z.string().max(50)).
+const ADMISSION_NUMBER_MAX_LENGTH = 50;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // TYPES
 // ─────────────────────────────────────────────────────────────────────────────
@@ -177,6 +182,14 @@ export interface UsernameConflict {
   conflictType: "DUPLICATE_IN_FILE" | "ALREADY_IN_SCHOOL";
 }
 
+/** Mirrors EmailConflict/UsernameConflict — for admission numbers that collide. */
+export interface AdmissionNumberConflict {
+  rowNumber: number;
+  name: string;
+  admissionNumber: string;
+  conflictType: "DUPLICATE_IN_FILE" | "ALREADY_IN_SCHOOL";
+}
+
 export interface BulkUploadRowResult {
   rowNumber: number;
   name: string;
@@ -203,6 +216,7 @@ export interface BulkUploadResult {
   results: BulkUploadRowResult[];
   emailConflicts?: EmailConflict[];
   usernameConflicts?: UsernameConflict[];
+  admissionNumberConflicts?: AdmissionNumberConflict[];
   capacityInfo?: {
     existingStudents: number;
     addedStudents: number;
@@ -508,6 +522,11 @@ function validateRow(row: BulkStudentRow): string | null {
       `Invalid username "${row.username}". Must be ${USERNAME_MIN_LENGTH}-${USERNAME_MAX_LENGTH} ` +
       "characters, start with a letter, and contain only lowercase letters and numbers."
     );
+  if (
+    row.admissionNumber &&
+    row.admissionNumber.length > ADMISSION_NUMBER_MAX_LENGTH
+  )
+    return `Admission number must be at most ${ADMISSION_NUMBER_MAX_LENGTH} characters`;
   if (row.gender && !GENDER_NORMALIZER[row.gender.toLowerCase()])
     return `Invalid gender "${row.gender}". Use: Male, Female, or Transgender`;
   if (
@@ -526,7 +545,7 @@ function validateRow(row: BulkStudentRow): string | null {
     row.socialCategoryRaw &&
     resolveSocialCategory(row.socialCategoryRaw) === null
   )
-  return `Invalid social category "${row.socialCategoryRaw}". Use 1–6 or: General, SC, ST, OBC, OBC-NCL, Minority`;
+    return `Invalid social category "${row.socialCategoryRaw}". Use 1–6 or: General, SC, ST, OBC, OBC-NCL, Minority`;
   if (row.religionRaw && resolveReligion(row.religionRaw) === null)
     return `Invalid religion "${row.religionRaw}". Use 1–8 or: Hindu, Muslim, Christian, Sikh, Buddhist, Jain, Others, No Religion`;
   return null;
@@ -1057,10 +1076,22 @@ export async function bulkUploadStudents(
     ),
   ];
 
-  // ── 3. Capacity + email conflict + username round-0 — ONE batch round-trip ─
+  // ── 3. Capacity + email conflict + username round-0 + admission numbers ────
+  //    ONE batch round-trip covers every "does this already exist" check we
+  //    need before doing any per-row validation. Admission numbers are only
+  //    checked when at least one row actually provided one — the field
+  //    stays fully optional, same as email.
   const allEmails = rows.filter((r) => r.email).map((r) => r.email!.toLowerCase());
+  const allAdmissionNumbers = rows
+    .filter((r) => r.admissionNumber)
+    .map((r) => r.admissionNumber!);
 
-  const [countResult, existingUsersResult, existingUsernamesResult] = await db.batch([
+  const [
+    countResult,
+    existingUsersResult,
+    existingUsernamesResult,
+    existingAdmissionNumbersResult,
+  ] = await db.batch([
     db
       .select({ count: sql<number>`count(*)` })
       .from(schoolStudentEnrollmentsSchema)
@@ -1093,6 +1124,15 @@ export async function bulkUploadStudents(
         inArray(
           schoolUsersSchema.username,
           round0Candidates.length > 0 ? round0Candidates : ["__none__"]
+        )
+      ),
+    db
+      .select({ admissionNumber: studentsSchema.admissionNumber })
+      .from(studentsSchema)
+      .where(
+        inArray(
+          studentsSchema.admissionNumber,
+          allAdmissionNumbers.length > 0 ? allAdmissionNumbers : ["__none__"]
         )
       ),
   ] as const);
@@ -1198,8 +1238,53 @@ export async function bulkUploadStudents(
     }
   }
 
-  // ── 6. Combined blocking response — email OR username conflicts ────────────
-  if (emailConflicts.length > 0 || usernameConflicts.length > 0) {
+  // ── 5.5. Admission number conflict detection — only rows that actually
+  //    provided one. Same two-pass shape as the email check above:
+  //    first catch duplicates WITHIN the file, then check against what
+  //    already exists in the school (fetched in step 3's batch). ─────────────
+  const admissionNumberConflicts: AdmissionNumberConflict[] = [];
+  const seenAdmissionNumbers = new Map<string, number>();
+
+  for (const row of rows) {
+    if (!row.admissionNumber) continue;
+    if (seenAdmissionNumbers.has(row.admissionNumber)) {
+      admissionNumberConflicts.push({
+        rowNumber: row.rowNumber,
+        name: row.name,
+        admissionNumber: row.admissionNumber,
+        conflictType: "DUPLICATE_IN_FILE",
+      });
+    } else {
+      seenAdmissionNumbers.set(row.admissionNumber, row.rowNumber);
+    }
+  }
+
+  const existingAdmissionSet = new Set(
+    existingAdmissionNumbersResult
+      .map((s: any) => s.admissionNumber)
+      .filter(Boolean)
+  );
+  for (const row of rows) {
+    if (!row.admissionNumber) continue;
+    if (
+      existingAdmissionSet.has(row.admissionNumber) &&
+      !admissionNumberConflicts.some((c) => c.rowNumber === row.rowNumber)
+    ) {
+      admissionNumberConflicts.push({
+        rowNumber: row.rowNumber,
+        name: row.name,
+        admissionNumber: row.admissionNumber,
+        conflictType: "ALREADY_IN_SCHOOL",
+      });
+    }
+  }
+
+  // ── 6. Combined blocking response — email, username, OR admission number ──
+  if (
+    emailConflicts.length > 0 ||
+    usernameConflicts.length > 0 ||
+    admissionNumberConflicts.length > 0
+  ) {
     const parts: string[] = [];
 
     if (emailConflicts.length > 0) {
@@ -1240,6 +1325,25 @@ export async function bulkUploadStudents(
         );
     }
 
+    if (admissionNumberConflicts.length > 0) {
+      const inFileCount = admissionNumberConflicts.filter(
+        (c) => c.conflictType === "DUPLICATE_IN_FILE"
+      ).length;
+      const inSchoolCount = admissionNumberConflicts.filter(
+        (c) => c.conflictType === "ALREADY_IN_SCHOOL"
+      ).length;
+      if (inSchoolCount > 0)
+        parts.push(
+          `${inSchoolCount} admission number${inSchoolCount !== 1 ? "s are" : " is"
+          } already assigned in this school`
+        );
+      if (inFileCount > 0)
+        parts.push(
+          `${inFileCount} duplicate admission number${inFileCount !== 1 ? "s" : ""
+          } within the file`
+        );
+    }
+
     return {
       success: false,
       message: `Upload blocked: ${parts.join(
@@ -1248,7 +1352,10 @@ export async function bulkUploadStudents(
       summary: {
         totalRows: rows.length,
         successful: 0,
-        failed: emailConflicts.length + usernameConflicts.length,
+        failed:
+          emailConflicts.length +
+          usernameConflicts.length +
+          admissionNumberConflicts.length,
         skipped: 0,
         udiseWarnings: 0,
       },
@@ -1256,6 +1363,10 @@ export async function bulkUploadStudents(
       emailConflicts: emailConflicts.length > 0 ? emailConflicts : undefined,
       usernameConflicts:
         usernameConflicts.length > 0 ? usernameConflicts : undefined,
+      admissionNumberConflicts:
+        admissionNumberConflicts.length > 0
+          ? admissionNumberConflicts
+          : undefined,
     };
   }
 
@@ -1482,6 +1593,10 @@ export async function bulkUploadStudents(
         );
         const isUsernameCollision = isUniqueConstraintError(rowErr, "username");
         const isEmailCollision = isUniqueConstraintError(rowErr, "email");
+        const isAdmissionCollision = isUniqueConstraintError(
+          rowErr,
+          "admission_number"
+        );
         rowResults.push({
           rowNumber: r.row.rowNumber,
           name: r.row.name,
@@ -1491,7 +1606,9 @@ export async function bulkUploadStudents(
             ? `Username "${r.username}" was taken by another request during upload. Please retry this row.`
             : isEmailCollision
               ? "This email was registered by another request during upload. Please retry this row."
-              : rowErr.message || "Unknown error during processing",
+              : isAdmissionCollision
+                ? `Admission number "${r.row.admissionNumber}" was taken by another request during upload. Please retry this row.`
+                : rowErr.message || "Unknown error during processing",
         });
       }
     }

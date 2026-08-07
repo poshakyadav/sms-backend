@@ -1,4 +1,4 @@
-import { integer, sqliteTable, text } from "drizzle-orm/sqlite-core";
+import { integer, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
 import { sql } from "drizzle-orm";
 import { schoolUsersSchema } from "./school-users";
 import { schoolsSchema } from "./schools";
@@ -133,6 +133,14 @@ export const studentsSchema = sqliteTable("students", {
    * Unique per school. Printed on TC, fee receipts, admit cards.
    * UDISE+ includes this in the student record export.
    */
+  /**
+     * School's own admission/registration number.
+     * Unique per school — enforced by idx_students_admission_number_unique
+     * below AND by an app-level pre-check in services.ts (see
+     * createSchoolUser / updateSchoolUser / bulkUploadStudents).
+     * NULL is allowed and multiple NULLs do not conflict (SQLite treats
+     * every NULL as distinct under a UNIQUE index).
+     */
   admissionNumber: text("admission_number"), // unique per school, enforced in code
 
   /**
@@ -346,7 +354,16 @@ export const studentsSchema = sqliteTable("students", {
    * Visible only to school staff with appropriate permissions.
    */
   medicalInfo: text("medical_info"),
-});
+},
+(table) => ({
+  // Enforces the "unique per school" promise the old comment made but
+  // never actually implemented at the DB level. NULLs are exempt, so
+  // students with no admission number yet don't conflict with each other.
+  admissionNumberUnique: uniqueIndex("idx_students_admission_number_unique").on(
+    table.admissionNumber
+  ),
+})
+);
 
 export type Student = typeof studentsSchema.$inferSelect;
 export type NewStudent = typeof studentsSchema.$inferInsert;

@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX `idx_students_admission_number_unique` ON `students` (`admission_number`);

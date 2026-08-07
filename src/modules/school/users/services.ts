@@ -1121,6 +1121,21 @@ export async function createSchoolUser(
         const primaryRoleName = primaryRoleRecord.name;
         const profileCategory = getProfileCategory(primaryRoleName);
 
+        // ── Guard: unique admission number — only checked for students, and
+        //    only when one was actually provided (it stays optional). ──────────
+        if (profileCategory === "student" && data.admissionNumber) {
+          const existingAdmission = await tx
+            .select({ userId: studentsSchema.userId })
+            .from(studentsSchema)
+            .where(eq(studentsSchema.admissionNumber, data.admissionNumber))
+            .get();
+          if (existingAdmission) {
+            throw new Error(
+              `Admission number "${data.admissionNumber}" is already assigned to another student in this school.`
+            );
+          }
+        }
+
         // ── Guard: unique email — only checked when one was actually
         //    provided. Email is optional now; multiple NULL emails are
         //    fine (SQLite treats every NULL as distinct for UNIQUE). ─────
@@ -1270,6 +1285,12 @@ export async function createSchoolUser(
         );
       }
 
+      if (isUniqueConstraintError(err, "admission_number")) {
+        throw new Error(
+          "This admission number is already assigned to another student in this school."
+        );
+      }
+
       throw err;
     }
   }
@@ -1307,6 +1328,8 @@ export async function updateSchoolUser(
 
     if (!existingUser) throw new Error("User not found.");
 
+    const profileCategory = getProfileCategory(existingUser.primaryRole);
+
     // ── Guard: email uniqueness ─────────────────────────────────────────────
     if (data.email && data.email !== existingUser.email) {
       const emailTaken = await tx
@@ -1320,6 +1343,30 @@ export async function updateSchoolUser(
         )
         .get();
       if (emailTaken) throw new Error("This email address is already in use.");
+    }
+
+    // ── Guard: admission number uniqueness (students only) ─────────────
+    if (
+      profileCategory === "student" &&
+      data.admissionNumber !== undefined &&
+      data.admissionNumber !== null &&
+      data.admissionNumber !== ""
+    ) {
+      const admissionTaken = await tx
+        .select({ userId: studentsSchema.userId })
+        .from(studentsSchema)
+        .where(
+          and(
+            eq(studentsSchema.admissionNumber, data.admissionNumber),
+            sql`${studentsSchema.userId} != ${id}`
+          )
+        )
+        .get();
+      if (admissionTaken) {
+        throw new Error(
+          `Admission number "${data.admissionNumber}" is already assigned to another student.`
+        );
+      }
     }
 
     // ── Build school_users update payload ───────────────────────────────────
@@ -1371,7 +1418,7 @@ export async function updateSchoolUser(
       .where(eq(schoolUsersSchema.id, id));
 
     // ── Update profile table ────────────────────────────────────────────────
-    const profileCategory = getProfileCategory(existingUser.primaryRole);
+
     await updateUserProfile(tx, id, profileCategory, data);
 
     // ── Password-change notification email ──────────────────────────────────
@@ -2112,10 +2159,19 @@ async function updateUserProfile(
         updateData.udiseVerified = data.udiseVerified;
 
       if (Object.keys(updateData).length > 0) {
-        await tx
-          .update(studentsSchema)
-          .set(updateData)
-          .where(eq(studentsSchema.userId, userId));
+        try {
+          await tx
+            .update(studentsSchema)
+            .set(updateData)
+            .where(eq(studentsSchema.userId, userId));
+        } catch (err: any) {
+          if (isUniqueConstraintError(err, "admission_number")) {
+            throw new Error(
+              "This admission number is already assigned to another student."
+            );
+          }
+          throw err;
+        }
       }
       break;
     }
