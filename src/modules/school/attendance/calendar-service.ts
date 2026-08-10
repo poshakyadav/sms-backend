@@ -363,12 +363,13 @@ export async function declareHoliday(
 export async function setWorkingDayOverride(
     env: SchoolEnv["Bindings"],
     schoolCode: string,
-    data: { fromDate: string; toDate: string; classSectionId?: number; reason: string },
+    data: { fromDate: string; toDate: string; classSectionId?: number; reason?: string },
     createdBy: number
 ) {
     const db = await getSchoolDB(env, schoolCode);
     const scope = data.classSectionId ?? SCHOOL_WIDE_CALENDAR_SCOPE;
     const dates = enumerateDates(data.fromDate, data.toDate);
+    const reason = data.reason?.trim() || "Marked as working day"; // never store blank text
 
     if (dates.length > 366) {
         throw new Error("Date range too large — set working days in spans of one year or less");
@@ -397,7 +398,7 @@ export async function setWorkingDayOverride(
                     classSectionId: scope,
                     date,
                     dayType: CalendarDayType.WORKING_DAY,
-                    reason: data.reason,
+                    reason,
                     createdBy,
                 });
             }

@@ -27,6 +27,40 @@ import {
 } from "./services";
 import { checkCalendarStatus, declareHoliday, getCalendarEntries, getMissingAttendanceReport, getWeeklyOffDays, previewHolidayImpact, removeCalendarOverride, setWeeklyOffDays, setWorkingDayOverride } from "./calendar-service";
 
+// Structural type, not the ZodError class — @hono/zod-validator's hook
+// types its error param against Zod v4's core $ZodError. path is
+// PropertyKey[] (string | number | symbol) there, not just string | number,
+// so this has to match exactly or TS won't narrow it down for us.
+interface ZodErrorLike {
+  issues: Array<{ path: PropertyKey[]; message: string }>;
+}
+
+function formatZodError(error: ZodErrorLike): string {
+  const first = error.issues[0];
+  if (!first) return "Invalid request data";
+  // .map(String) not .join() directly — Array.join() does an implicit
+  // ToString on each element, which throws a TypeError at runtime for
+  // symbol path segments. String(x) handles symbols safely.
+  const path = first.path.map(String).join(".");
+  return path ? `${path}: ${first.message}` : first.message;
+}
+
+function validateJson<T extends z.ZodTypeAny>(schema: T) {
+  return zValidator("json", schema, (result, c) => {
+    if (!result.success) {
+      return c.json({ error: formatZodError(result.error) }, 400);
+    }
+  });
+}
+
+function validateQuery<T extends z.ZodTypeAny>(schema: T) {
+  return zValidator("query", schema, (result, c) => {
+    if (!result.success) {
+      return c.json({ error: formatZodError(result.error) }, 400);
+    }
+  });
+}
+
 const attendanceRouter = new Hono<SchoolEnv>();
 
 attendanceRouter.use("*", schoolJwtMiddleware, schoolTokenValidationMiddleware);
@@ -430,13 +464,13 @@ const workingDayOverrideSchema = z.object({
   fromDate: z.string().date(),
   toDate: z.string().date(),
   classSectionId: z.number().int().positive().optional(), // omitted = school-wide declaration
-  reason: z.string().min(1).max(200),
+  reason: z.string().max(200).optional(),
 });
 
 attendanceRouter.post(
   "/calendar/working-day",
   requirePermission("attendance.calendar.manage"),
-  zValidator("json", workingDayOverrideSchema),
+  validateJson(workingDayOverrideSchema),  
   async (c) => {
     try {
       const data = c.req.valid("json");
